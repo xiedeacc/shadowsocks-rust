@@ -122,6 +122,40 @@ pub struct RoutingSnapshot {
     pub persistent: RuleLists,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleUpdateStatus {
+    Idle,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RuleUpdateProgress {
+    pub status: RuleUpdateStatus,
+    pub current_source: Option<String>,
+    pub completed_files: usize,
+    pub total_files: usize,
+    pub remaining_files: usize,
+    pub percent: u8,
+    pub message: Option<String>,
+}
+
+impl Default for RuleUpdateProgress {
+    fn default() -> Self {
+        Self {
+            status: RuleUpdateStatus::Idle,
+            current_source: None,
+            completed_files: 0,
+            total_files: 0,
+            remaining_files: 0,
+            percent: 0,
+            message: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct CompiledRules {
     direct_ip: Vec<IpNet>,
@@ -142,6 +176,7 @@ struct RoutingInner {
     domain_conflicts: VecDeque<ConflictEvent>,
     connections: VecDeque<ConnectionEvent>,
     dns: VecDeque<DnsEvent>,
+    update_progress: RuleUpdateProgress,
 }
 
 #[derive(Clone, Debug)]
@@ -172,6 +207,7 @@ impl RoutingState {
             domain_conflicts: VecDeque::new(),
             connections: VecDeque::new(),
             dns: VecDeque::new(),
+            update_progress: RuleUpdateProgress::default(),
         };
         detect_conflicts(&mut inner, RuleLayer::Persistent);
         Ok(Self {
@@ -237,36 +273,92 @@ impl RoutingState {
             let inner = self.inner.read().await;
             inner.sources.clone()
         };
+        let all_sources: Vec<String> = sources
+            .geoip_sources
+            .iter()
+            .chain(sources.geosite_sources.iter())
+            .chain(sources.direct_domain_sources.iter())
+            .chain(sources.bypass_domain_sources.iter())
+            .cloned()
+            .collect();
+        let total_files = all_sources.len();
+        self.set_update_progress(RuleUpdateProgress {
+            status: RuleUpdateStatus::Running,
+            current_source: None,
+            completed_files: 0,
+            total_files,
+            remaining_files: total_files,
+            percent: 0,
+            message: Some("starting".to_owned()),
+        })
+        .await;
 
         let mut direct_ip = Vec::new();
         let mut bypass_ip = Vec::new();
         let mut direct_domain = Vec::new();
         let mut bypass_domain = Vec::new();
+        let mut completed_files = 0usize;
 
         for source in &sources.geoip_sources {
-            let bytes = download_source(source).await?;
+            self.mark_source_started(source, completed_files, total_files).await;
+            let bytes = match download_source(source).await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    self.mark_update_failed(source, completed_files, total_files, &err).await;
+                    return Err(err);
+                }
+            };
             if parse_geoip_dat(&bytes, &mut direct_ip, &mut bypass_ip).is_err() {
                 let text = String::from_utf8_lossy(&bytes);
                 direct_ip.extend(parse_text_rules(&text));
             }
+            completed_files += 1;
+            self.mark_source_completed(source, completed_files, total_files).await;
         }
 
         for source in &sources.geosite_sources {
-            let bytes = download_source(source).await?;
+            self.mark_source_started(source, completed_files, total_files).await;
+            let bytes = match download_source(source).await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    self.mark_update_failed(source, completed_files, total_files, &err).await;
+                    return Err(err);
+                }
+            };
             if parse_geosite_dat(&bytes, &mut direct_domain, &mut bypass_domain).is_err() {
                 let text = String::from_utf8_lossy(&bytes);
                 direct_domain.extend(parse_text_rules(&text));
             }
+            completed_files += 1;
+            self.mark_source_completed(source, completed_files, total_files).await;
         }
 
         for source in &sources.direct_domain_sources {
-            let bytes = download_source(source).await?;
+            self.mark_source_started(source, completed_files, total_files).await;
+            let bytes = match download_source(source).await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    self.mark_update_failed(source, completed_files, total_files, &err).await;
+                    return Err(err);
+                }
+            };
             direct_domain.extend(parse_text_rules(&String::from_utf8_lossy(&bytes)));
+            completed_files += 1;
+            self.mark_source_completed(source, completed_files, total_files).await;
         }
 
         for source in &sources.bypass_domain_sources {
-            let bytes = download_source(source).await?;
+            self.mark_source_started(source, completed_files, total_files).await;
+            let bytes = match download_source(source).await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    self.mark_update_failed(source, completed_files, total_files, &err).await;
+                    return Err(err);
+                }
+            };
             bypass_domain.extend(parse_text_rules(&String::from_utf8_lossy(&bytes)));
+            completed_files += 1;
+            self.mark_source_completed(source, completed_files, total_files).await;
         }
 
         let lists = normalize_rule_lists(RuleLists {
@@ -281,7 +373,66 @@ impl RoutingState {
         inner.persistent_raw = lists;
         inner.persistent = compile_rules(&inner.persistent_raw);
         detect_conflicts(&mut inner, RuleLayer::Persistent);
+        inner.update_progress = RuleUpdateProgress {
+            status: RuleUpdateStatus::Completed,
+            current_source: None,
+            completed_files,
+            total_files,
+            remaining_files: 0,
+            percent: 100,
+            message: Some("completed".to_owned()),
+        };
         Ok(())
+    }
+
+    pub async fn update_progress(&self) -> RuleUpdateProgress {
+        self.inner.read().await.update_progress.clone()
+    }
+
+    async fn set_update_progress(&self, progress: RuleUpdateProgress) {
+        self.inner.write().await.update_progress = progress;
+    }
+
+    async fn mark_source_started(&self, source: &str, completed_files: usize, total_files: usize) {
+        let percent = progress_percent(completed_files, total_files);
+        self.set_update_progress(RuleUpdateProgress {
+            status: RuleUpdateStatus::Running,
+            current_source: Some(source.to_owned()),
+            completed_files,
+            total_files,
+            remaining_files: total_files.saturating_sub(completed_files),
+            percent,
+            message: Some("downloading".to_owned()),
+        })
+        .await;
+    }
+
+    async fn mark_source_completed(&self, source: &str, completed_files: usize, total_files: usize) {
+        let percent = progress_percent(completed_files, total_files);
+        self.set_update_progress(RuleUpdateProgress {
+            status: RuleUpdateStatus::Running,
+            current_source: Some(source.to_owned()),
+            completed_files,
+            total_files,
+            remaining_files: total_files.saturating_sub(completed_files),
+            percent,
+            message: Some("downloaded".to_owned()),
+        })
+        .await;
+    }
+
+    async fn mark_update_failed(&self, source: &str, completed_files: usize, total_files: usize, err: &io::Error) {
+        let percent = progress_percent(completed_files, total_files);
+        self.set_update_progress(RuleUpdateProgress {
+            status: RuleUpdateStatus::Failed,
+            current_source: Some(source.to_owned()),
+            completed_files,
+            total_files,
+            remaining_files: total_files.saturating_sub(completed_files),
+            percent,
+            message: Some(err.to_string()),
+        })
+        .await;
     }
 
     pub async fn domestic_dns(&self) -> Vec<String> {
@@ -501,6 +652,14 @@ fn parse_ip_net(value: &str) -> Option<IpNet> {
         return Some(net);
     }
     value.parse::<IpAddr>().ok().map(IpNet::from)
+}
+
+fn progress_percent(completed_files: usize, total_files: usize) -> u8 {
+    if total_files == 0 {
+        100
+    } else {
+        ((completed_files.saturating_mul(100)) / total_files).min(100) as u8
+    }
 }
 
 fn normalize_rule_lists(lists: RuleLists) -> RuleLists {

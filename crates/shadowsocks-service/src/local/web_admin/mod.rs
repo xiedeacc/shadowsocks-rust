@@ -146,8 +146,16 @@ impl WebAdminHandler {
                 Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
             }
             (Method::POST, "/api/rules/update") => {
-                self.routing_state.update_from_sources().await?;
-                Ok(json_response(StatusCode::OK, &self.routing_state.snapshot().await))
+                let routing_state = self.routing_state.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = routing_state.update_from_sources().await {
+                        log::warn!("failed to update route rules from sources: {}", err);
+                    }
+                });
+                Ok(json_response(StatusCode::ACCEPTED, &serde_json::json!({ "ok": true })))
+            }
+            (Method::GET, "/api/rules/update-progress") => {
+                Ok(json_response(StatusCode::OK, &self.routing_state.update_progress().await))
             }
             (Method::GET, "/api/dns") => Ok(json_response(
                 StatusCode::OK,
@@ -303,6 +311,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .row input{margin:0}
     .row button{margin:0;white-space:nowrap}
     .hint{color:var(--muted);font-size:12px}
+    .progress-box{margin:12px auto 0;max-width:760px;text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;box-shadow:0 1px 2px #10203312}
+    .progress-bar{height:10px;background:var(--soft);border-radius:999px;overflow:hidden;margin:8px 0}
+    .progress-fill{height:100%;width:0;background:var(--brand)}
     @media(max-width:1100px){.generated-layout{grid-template-columns:1fr}}
     @media(max-width:900px){.basic-layout,.rules-layout,.temporal-layout{grid-template-columns:1fr}#clientConfig,#rulesJson,#generatedFileContent{height:420px;max-height:420px}}
   </style>
@@ -312,11 +323,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <button onclick="show('basic')">Basic Config</button>
     <button onclick="show('rules')">Rules</button>
     <button onclick="show('temporal')">Temporal Rules</button>
-    <button onclick="show('routeConfig')">Generated Route Config</button>
-    <button onclick="show('ip')">IP Conflicts</button>
-    <button onclick="show('domain')">Domain Conflicts</button>
     <button onclick="show('connections')">Connections</button>
     <button onclick="show('dns')">DNS</button>
+    <button onclick="show('routeConfig')">Generated Route Config</button>
   </nav>
 
   <section id="basic" class="tab active">
@@ -376,7 +385,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <h3 class="card-title">Bypass Domain Sources</h3><fieldset><div id="bypass_domain_sources"></div><button onclick="addSource('bypass_domain_sources')">Add</button></fieldset>
         <button onclick="loadRules()">Reload</button>
         <button onclick="saveRules()">Save Sources</button>
-        <button onclick="updateRules()">Download and Generate Persistent Files</button>
       </div>
     </div>
   </section>
@@ -399,6 +407,33 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
   </section>
 
+  <section id="connections" class="tab">
+    <h2>Connections</h2>
+    <h3 class="card-title">Recent Connections</h3>
+    <div id="connOut" class="scroll-panel"></div>
+    <h3 class="card-title">IP Conflicts</h3>
+    <div id="ipOut"></div>
+  </section>
+  <section id="dns" class="tab">
+    <h2>DNS</h2>
+    <div class="grid">
+      <div>
+        <h3 class="card-title">Domestic DNS</h3>
+        <fieldset><div id="domestic_dns"></div><button onclick="addSource('domestic_dns')">Add</button></fieldset>
+      </div>
+      <div>
+        <h3 class="card-title">Foreign DNS</h3>
+        <fieldset><div id="foreign_dns"></div><button onclick="addSource('foreign_dns')">Add</button></fieldset>
+      </div>
+    </div>
+    <button onclick="loadRules()">Reload DNS Config</button>
+    <button onclick="saveRules()">Save DNS Config</button>
+    <h3 class="card-title">Recent DNS</h3>
+    <div id="dnsOut"></div>
+    <h3 class="card-title">Domain Conflicts</h3>
+    <div id="domainOut"></div>
+  </section>
+
   <section id="routeConfig" class="tab">
     <h2>Generated Route Config</h2>
     <div class="generated-layout">
@@ -419,27 +454,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <textarea id="generatedFileContent" readonly></textarea>
       </div>
     </div>
-  </section>
-
-  <section id="ip" class="tab"><h2>IP Conflicts</h2><div id="ipOut"></div></section>
-  <section id="domain" class="tab"><h2>Domain Conflicts</h2><div id="domainOut"></div></section>
-  <section id="connections" class="tab"><h2>Recent Connections</h2><div id="connOut" class="scroll-panel"></div></section>
-  <section id="dns" class="tab">
-    <h2>DNS</h2>
-    <div class="grid">
-      <div>
-        <h3 class="card-title">Domestic DNS</h3>
-        <fieldset><div id="domestic_dns"></div><button onclick="addSource('domestic_dns')">Add</button></fieldset>
-      </div>
-      <div>
-        <h3 class="card-title">Foreign DNS</h3>
-        <fieldset><div id="foreign_dns"></div><button onclick="addSource('foreign_dns')">Add</button></fieldset>
-      </div>
+    <div style="text-align:center;margin-top:20px">
+      <button onclick="updateRules()">Download and Generate Persistent Files</button>
     </div>
-    <button onclick="loadRules()">Reload DNS Config</button>
-    <button onclick="saveRules()">Save DNS Config</button>
-    <h3 class="card-title">Recent DNS</h3>
-    <div id="dnsOut"></div>
+    <div id="ruleUpdateProgress" class="progress-box">
+      <div><strong>Status:</strong> <span id="progressStatus">idle</span></div>
+      <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+      <div><strong>Current source:</strong> <span id="progressSource">-</span></div>
+      <div><strong>Progress:</strong> <span id="progressPercent">0%</span>, <strong>remaining files:</strong> <span id="progressRemaining">0</span></div>
+      <div class="hint" id="progressMessage"></div>
+    </div>
   </section>
 
   <script>
@@ -514,7 +538,31 @@ const INDEX_HTML: &str = r#"<!doctype html>
       await api('/api/temp-rules',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(tempRules())});
       await loadRules();
     }
-    async function updateRules(){await saveRules();rulesSnapshot=await api('/api/rules/update',{method:'POST'});await loadRules()}
+    let progressTimer=null;
+    function renderProgress(p){
+      progressStatus.textContent=p.status||'idle';
+      progressSource.textContent=p.current_source||'-';
+      progressPercent.textContent=(p.percent||0)+'%';
+      progressRemaining.textContent=p.remaining_files??0;
+      progressMessage.textContent=p.message||'';
+      progressFill.style.width=(p.percent||0)+'%';
+    }
+    async function pollUpdateProgress(){
+      let p=await api('/api/rules/update-progress');
+      renderProgress(p);
+      if(p.status==='completed'||p.status==='failed'||p.status==='idle'){
+        if(progressTimer){clearInterval(progressTimer);progressTimer=null}
+        await loadRules();
+      }
+    }
+    async function updateRules(){
+      await saveRules();
+      renderProgress({status:'running',current_source:'starting',percent:0,remaining_files:0,message:'starting'});
+      await api('/api/rules/update',{method:'POST'});
+      if(progressTimer)clearInterval(progressTimer);
+      progressTimer=setInterval(()=>pollUpdateProgress().catch(e=>{progressMessage.textContent=e.message}),1000);
+      await pollUpdateProgress();
+    }
     ['tmp_direct_ip','tmp_direct_domain','tmp_bypass_ip','tmp_bypass_domain'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateRulesJson),0));
 
     function table(rows,cols){if(!rows.length)return '<p class="hint">No data</p>';return '<table><thead><tr>'+cols.map(c=>'<th>'+c[0]+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+String(c[1](r)??'')+'</td>').join('')+'</tr>').join('')+'</tbody></table>'}
@@ -522,7 +570,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function renderConflicts(id,path){let rows=await api(path);document.getElementById(id).innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Kind',r=>r.kind],['Value',r=>r.value],['Layer',r=>r.layer]])}
     async function renderConnections(){let rows=await api('/api/activity/connections');connOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Source',r=>r.source_ip+':'+r.source_port],['Destination',r=>(r.destination_ip||r.destination_domain)+':'+r.destination_port],['Protocol',r=>r.protocol],['Decision',r=>r.decision]])}
     async function renderDns(){let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>r.domain],['Type',r=>r.query_type],['Results',r=>(r.results||[]).join('<br>')],['Resolver',r=>r.resolver]])}
-    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='rules'||id==='temporal'||id==='routeConfig')await loadRules();if(id==='ip')await renderConflicts('ipOut','/api/conflicts/ip');if(id==='domain')await renderConflicts('domainOut','/api/conflicts/domain');if(id==='connections')await renderConnections();if(id==='dns'){await loadRules();await renderDns()}}catch(e){alert(e.message)}}
+    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='rules'||id==='temporal'||id==='routeConfig')await loadRules();if(id==='connections'){await renderConnections();await renderConflicts('ipOut','/api/conflicts/ip')}if(id==='dns'){await loadRules();await renderDns();await renderConflicts('domainOut','/api/conflicts/domain')}}catch(e){alert(e.message)}}
     document.querySelector("nav button[onclick=\"show('basic')\"]").classList.add('active');
     loadClientConfig();
   </script>
