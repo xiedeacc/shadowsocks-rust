@@ -26,6 +26,8 @@ use crate::{
 
 #[cfg(feature = "local-fake-dns")]
 use super::fake_dns::manager::FakeDnsManager;
+#[cfg(feature = "local-web-admin")]
+use super::routing::{RouteDecision, RoutingState};
 
 /// Local Service Context
 #[derive(Clone)]
@@ -49,6 +51,9 @@ pub struct ServiceContext {
 
     #[cfg(feature = "local-fake-dns")]
     fake_dns_manager: Arc<RwLock<Vec<Arc<FakeDnsManager>>>>,
+
+    #[cfg(feature = "local-web-admin")]
+    routing_state: Option<RoutingState>,
 }
 
 impl Default for ServiceContext {
@@ -74,6 +79,8 @@ impl ServiceContext {
             ))),
             #[cfg(feature = "local-fake-dns")]
             fake_dns_manager: Arc::new(RwLock::new(Vec::new())),
+            #[cfg(feature = "local-web-admin")]
+            routing_state: None,
         }
     }
 
@@ -117,6 +124,16 @@ impl ServiceContext {
         self.acl.as_deref()
     }
 
+    #[cfg(feature = "local-web-admin")]
+    pub fn set_routing_state(&mut self, routing_state: RoutingState) {
+        self.routing_state = Some(routing_state);
+    }
+
+    #[cfg(feature = "local-web-admin")]
+    pub fn routing_state(&self) -> Option<&RoutingState> {
+        self.routing_state.as_ref()
+    }
+
     /// Set outbound proxy chain (connection to SS server routes through these proxies)
     pub fn set_outbound_proxies(&mut self, proxies: Vec<OutboundProxy>) {
         self.outbound_client = if proxies.is_empty() {
@@ -154,6 +171,13 @@ impl ServiceContext {
 
     /// Check if target should be bypassed
     pub async fn check_target_bypassed(&self, addr: &Address) -> bool {
+        #[cfg(feature = "local-web-admin")]
+        if let Some(routing_state) = self.routing_state.as_ref()
+            && let Some(decision) = routing_state.route_address(addr).await
+        {
+            return decision.is_bypassed();
+        }
+
         match self.acl {
             None => false,
             Some(ref acl) => {
@@ -177,6 +201,16 @@ impl ServiceContext {
     /// Add a record to the reverse lookup cache
     #[cfg(feature = "local-dns")]
     pub async fn add_to_reverse_lookup_cache(&self, addr: IpAddr, forward: bool) {
+        #[cfg(feature = "local-web-admin")]
+        if let Some(routing_state) = self.routing_state.as_ref() {
+            let decision = if forward {
+                RouteDecision::Proxy
+            } else {
+                RouteDecision::Direct
+            };
+            let _ = routing_state.add_dns_results(decision, "", &[addr]).await;
+        }
+
         let is_exception = forward
             != match self.acl {
                 // Proxy everything by default

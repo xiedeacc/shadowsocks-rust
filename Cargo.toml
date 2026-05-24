@@ -163,6 +163,8 @@ local-fake-dns = ["local", "shadowsocks-service/local-fake-dns", "ipnet"]
 # sslocal support online URL (SIP008 Online Configuration Delivery)
 # https://shadowsocks.org/doc/sip008.html
 local-online-config = ["local", "shadowsocks-service/local-online-config"]
+# Enable embedded web admin for routing rules and DNS split
+local-web-admin = ["local", "local-dns", "shadowsocks-service/local-web-admin"]
 
 # ssurl support outline (ssconf) URL
 utility-url-outline = ["reqwest"]

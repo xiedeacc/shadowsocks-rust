@@ -118,7 +118,7 @@ impl HttpService {
             // Connect to Shadowsocks' remote
             //
             // FIXME: What STATUS should I return for connection error?
-            let (mut stream, server_opt) = match connect_host(self.context, &host, Some(&self.balancer)).await {
+            let (mut stream, server_opt) = match connect_host(self.context.clone(), &host, Some(&self.balancer)).await {
                 Ok(s) => s,
                 Err(err) => {
                     error!("failed to CONNECT host: {}, error: {}", host, err);
@@ -132,6 +132,18 @@ impl HttpService {
                 host,
                 if stream.is_bypassed() { "bypassed" } else { "proxied" }
             );
+
+            #[cfg(feature = "local-web-admin")]
+            if let Some(routing_state) = self.context.routing_state() {
+                let decision = if stream.is_bypassed() {
+                    crate::local::routing::RouteDecision::Direct
+                } else {
+                    crate::local::routing::RouteDecision::Proxy
+                };
+                routing_state
+                    .record_connection(self.peer_addr, &host, "tcp", decision)
+                    .await;
+            }
 
             let client_addr = self.peer_addr;
             tokio::spawn(async move {

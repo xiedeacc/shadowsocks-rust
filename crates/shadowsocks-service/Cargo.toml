@@ -95,6 +95,8 @@ local-online-config = [
     "brotli",
     "zstd",
 ]
+# Enable embedded web admin for routing rules, DNS split, and recent activity.
+local-web-admin = ["local", "local-dns", "http", "http-body-util", "hyper"]
 
 # Enable Stream Cipher Protocol
 # WARN: Stream Cipher Protocol is proved to be insecure

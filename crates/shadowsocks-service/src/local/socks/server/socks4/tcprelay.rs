@@ -91,14 +91,15 @@ impl Socks4TcpHandler {
         }
 
         let target_addr = target_addr.into();
+        let context = self.context.clone();
         let mut server_opt = None;
         let server_result = if self.balancer.is_empty() {
-            AutoProxyClientStream::connect_bypassed(self.context, &target_addr).await
+            AutoProxyClientStream::connect_bypassed(context.clone(), &target_addr).await
         } else {
             let server = self.balancer.best_tcp_server();
 
             let r = AutoProxyClientStream::connect_with_opts(
-                self.context,
+                context.clone(),
                 &server,
                 &target_addr,
                 server.connect_opts_ref(),
@@ -141,6 +142,20 @@ impl Socks4TcpHandler {
 
         // UNWRAP.
         let mut stream = stream.into_inner();
+
+        #[cfg(feature = "local-web-admin")]
+        if let Some(routing_state) = context.routing_state() {
+            use crate::local::{net::AutoProxyIo, routing::RouteDecision};
+
+            let decision = if remote.is_bypassed() {
+                RouteDecision::Direct
+            } else {
+                RouteDecision::Proxy
+            };
+            routing_state
+                .record_connection(peer_addr, &target_addr, "tcp", decision)
+                .await;
+        }
 
         match server_opt {
             Some(server) => {

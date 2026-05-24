@@ -22,20 +22,15 @@ use shadowsocks::{
     net::{AddrFamily, ConnectOpts, TcpStream as ShadowTcpStream, UdpSocket as ShadowUdpSocket},
     relay::{
         Address,
-        udprelay::{
-            MAXIMUM_UDP_PAYLOAD_SIZE, ProxySocket,
-            options::UdpSocketControlData,
-            proxy_socket::UdpSocketType,
-        },
+        udprelay::{MAXIMUM_UDP_PAYLOAD_SIZE, ProxySocket, options::UdpSocketControlData, proxy_socket::UdpSocketType},
     },
 };
 
 use crate::{
     local::{context::ServiceContext, loadbalancing::PingBalancer},
     net::{
-        MonProxySocket, OutboundProxyDatagram, TcpDialer,
-        UDP_ASSOCIATION_KEEP_ALIVE_CHANNEL_SIZE, UDP_ASSOCIATION_SEND_CHANNEL_SIZE,
-        packet_window::PacketWindowFilter,
+        MonProxySocket, OutboundProxyDatagram, TcpDialer, UDP_ASSOCIATION_KEEP_ALIVE_CHANNEL_SIZE,
+        UDP_ASSOCIATION_SEND_CHANNEL_SIZE, packet_window::PacketWindowFilter,
     },
 };
 
@@ -47,10 +42,7 @@ async fn create_proxied_socket(
     svr_cfg: &ServerConfig,
     connect_opts: &ConnectOpts,
 ) -> io::Result<ProxiedSocket> {
-    let use_chain = context
-        .outbound_client()
-        .map(|c| c.supports_udp())
-        .unwrap_or(false);
+    let use_chain = context.outbound_client().map(|c| c.supports_udp()).unwrap_or(false);
 
     if use_chain {
         let client = context
@@ -65,8 +57,7 @@ async fn create_proxied_socket(
         let datagram = client
             .associate_udp(&context.context(), &dialer, connect_opts, target)
             .await?;
-        let proxy_socket =
-            ProxySocket::from_socket(UdpSocketType::Client, context.context(), svr_cfg, datagram);
+        let proxy_socket = ProxySocket::from_socket(UdpSocketType::Client, context.context(), svr_cfg, datagram);
         let mon = MonProxySocket::from_socket(proxy_socket, context.flow_stat());
         Ok(ProxiedSocket::Chained(mon))
     } else {
@@ -97,22 +88,14 @@ enum ProxiedSocket {
 }
 
 impl ProxiedSocket {
-    async fn send_with_ctrl(
-        &self,
-        addr: &Address,
-        control: &UdpSocketControlData,
-        data: &[u8],
-    ) -> io::Result<()> {
+    async fn send_with_ctrl(&self, addr: &Address, control: &UdpSocketControlData, data: &[u8]) -> io::Result<()> {
         match self {
             Self::Direct(s) => s.send_with_ctrl(addr, control, data).await,
             Self::Chained(s) => s.send_with_ctrl(addr, control, data).await,
         }
     }
 
-    async fn recv_with_ctrl(
-        &self,
-        buf: &mut [u8],
-    ) -> io::Result<(usize, Address, Option<UdpSocketControlData>)> {
+    async fn recv_with_ctrl(&self, buf: &mut [u8]) -> io::Result<(usize, Address, Option<UdpSocketControlData>)> {
         match self {
             Self::Direct(s) => s.recv_with_ctrl(buf).await,
             Self::Chained(s) => s.recv_with_ctrl(buf).await,
@@ -516,6 +499,18 @@ where
         // Check if target should be bypassed. If so, send packets directly.
         let bypassed = self.balancer.is_empty() || self.context.check_target_bypassed(target_addr).await;
 
+        #[cfg(feature = "local-web-admin")]
+        if let Some(routing_state) = self.context.routing_state() {
+            let decision = if bypassed {
+                crate::local::routing::RouteDecision::Direct
+            } else {
+                crate::local::routing::RouteDecision::Proxy
+            };
+            routing_state
+                .record_connection(self.peer_addr, target_addr, "udp", decision)
+                .await;
+        }
+
         trace!(
             "udp relay {} -> {} ({}) with {} bytes",
             self.peer_addr,
@@ -655,12 +650,7 @@ where
                 let server = self.balancer.best_udp_server();
                 let svr_cfg = server.server_config();
 
-                let proxied = create_proxied_socket(
-                    self.context.as_ref(),
-                    svr_cfg,
-                    server.connect_opts_ref(),
-                )
-                .await?;
+                let proxied = create_proxied_socket(self.context.as_ref(), svr_cfg, server.connect_opts_ref()).await?;
 
                 self.proxied_socket.insert(proxied)
             }

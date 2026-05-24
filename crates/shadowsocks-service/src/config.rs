@@ -410,6 +410,14 @@ struct SSConfig {
     #[cfg(feature = "local-online-config")]
     #[serde(skip_serializing_if = "Option::is_none")]
     online_config: Option<SSOnlineConfig>,
+
+    #[cfg(feature = "local-web-admin")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    web_admin: Option<SSWebAdminConfig>,
+
+    #[cfg(feature = "local-web-admin")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route_rules: Option<SSRouteRulesConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -605,6 +613,36 @@ struct SSOnlineConfig {
     update_interval: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_plugins: Option<Vec<String>>,
+}
+
+#[cfg(feature = "local-web-admin")]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+struct SSWebAdminConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    listen: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_config_path: Option<PathBuf>,
+}
+
+#[cfg(feature = "local-web-admin")]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+struct SSRouteRulesConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rules_dir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    geoip_sources: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    geosite_sources: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direct_domain_sources: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bypass_domain_sources: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    domestic_dns: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    foreign_dns: Option<Vec<String>>,
 }
 
 /// Server config type
@@ -1498,6 +1536,73 @@ pub struct OnlineConfig {
     pub allowed_plugins: Option<Vec<String>>,
 }
 
+#[cfg(feature = "local-web-admin")]
+pub const DEFAULT_GEOIP_SOURCE: &str =
+    "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat";
+#[cfg(feature = "local-web-admin")]
+pub const DEFAULT_GEOSITE_SOURCE: &str =
+    "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat";
+#[cfg(feature = "local-web-admin")]
+pub const DEFAULT_DIRECT_DOMAIN_SOURCES: &[&str] = &[
+    "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt",
+    "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/china-list.txt",
+    "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/apple-cn.txt",
+    "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/google-cn.txt",
+];
+#[cfg(feature = "local-web-admin")]
+pub const DEFAULT_BYPASS_DOMAIN_SOURCES: &[&str] = &[
+    "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt",
+    "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt",
+];
+
+#[cfg(feature = "local-web-admin")]
+#[derive(Clone, Debug)]
+pub struct WebAdminConfig {
+    pub listen: SocketAddr,
+    pub token: Option<String>,
+    pub client_config_path: PathBuf,
+}
+
+#[cfg(feature = "local-web-admin")]
+impl Default for WebAdminConfig {
+    fn default() -> Self {
+        Self {
+            listen: "127.0.0.1:9090"
+                .parse()
+                .expect("valid default web admin listen address"),
+            token: None,
+            client_config_path: PathBuf::from("/etc/shadowsocks-rust/shadowsocks-client.json"),
+        }
+    }
+}
+
+#[cfg(feature = "local-web-admin")]
+#[derive(Clone, Debug)]
+pub struct RouteRulesConfig {
+    pub rules_dir: PathBuf,
+    pub geoip_sources: Vec<String>,
+    pub geosite_sources: Vec<String>,
+    pub direct_domain_sources: Vec<String>,
+    pub bypass_domain_sources: Vec<String>,
+    pub domestic_dns: Vec<String>,
+    pub foreign_dns: Vec<String>,
+}
+
+#[cfg(feature = "local-web-admin")]
+impl Default for RouteRulesConfig {
+    fn default() -> Self {
+        Self {
+            rules_dir: PathBuf::from("/etc/shadowsocks-rust/rules"),
+            geoip_sources: vec![DEFAULT_GEOIP_SOURCE.to_owned()],
+            geosite_sources: vec![DEFAULT_GEOSITE_SOURCE.to_owned()],
+            direct_domain_sources: DEFAULT_DIRECT_DOMAIN_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
+            bypass_domain_sources: DEFAULT_BYPASS_DOMAIN_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
+            domestic_dns: vec!["223.5.5.5:53".to_owned(), "119.29.29.29:53".to_owned()],
+            foreign_dns: vec!["8.8.8.8:53".to_owned(), "1.1.1.1:53".to_owned()],
+        }
+    }
+}
+
 /// Configuration
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -1606,6 +1711,12 @@ pub struct Config {
     /// https://shadowsocks.org/doc/sip008.html
     #[cfg(feature = "local-online-config")]
     pub online_config: Option<OnlineConfig>,
+
+    #[cfg(feature = "local-web-admin")]
+    pub web_admin: Option<WebAdminConfig>,
+
+    #[cfg(feature = "local-web-admin")]
+    pub route_rules: RouteRulesConfig,
 }
 
 /// Configuration parsing error kind
@@ -1731,6 +1842,12 @@ impl Config {
 
             #[cfg(feature = "local-online-config")]
             online_config: None,
+
+            #[cfg(feature = "local-web-admin")]
+            web_admin: None,
+
+            #[cfg(feature = "local-web-admin")]
+            route_rules: RouteRulesConfig::default(),
         }
     }
 
@@ -2647,6 +2764,53 @@ impl Config {
             });
         }
 
+        #[cfg(feature = "local-web-admin")]
+        {
+            if let Some(web_admin) = config.web_admin {
+                let mut parsed = WebAdminConfig::default();
+                if let Some(listen) = web_admin.listen {
+                    parsed.listen = listen.parse().map_err(|err| {
+                        Error::new(
+                            ErrorKind::Invalid,
+                            "invalid web_admin listen address",
+                            Some(format!("{listen}: {err}")),
+                        )
+                    })?;
+                }
+                parsed.token = web_admin.token;
+                if let Some(client_config_path) = web_admin.client_config_path {
+                    parsed.client_config_path = client_config_path;
+                }
+                nconfig.web_admin = Some(parsed);
+            }
+
+            if let Some(route_rules) = config.route_rules {
+                let mut parsed = RouteRulesConfig::default();
+                if let Some(rules_dir) = route_rules.rules_dir {
+                    parsed.rules_dir = rules_dir;
+                }
+                if let Some(sources) = route_rules.geoip_sources {
+                    parsed.geoip_sources = sources;
+                }
+                if let Some(sources) = route_rules.geosite_sources {
+                    parsed.geosite_sources = sources;
+                }
+                if let Some(sources) = route_rules.direct_domain_sources {
+                    parsed.direct_domain_sources = sources;
+                }
+                if let Some(sources) = route_rules.bypass_domain_sources {
+                    parsed.bypass_domain_sources = sources;
+                }
+                if let Some(dns) = route_rules.domestic_dns {
+                    parsed.domestic_dns = dns;
+                }
+                if let Some(dns) = route_rules.foreign_dns {
+                    parsed.foreign_dns = dns;
+                }
+                nconfig.route_rules = parsed;
+            }
+        }
+
         Ok(nconfig)
     }
 
@@ -3415,6 +3579,27 @@ impl fmt::Display for Config {
                 config_url: online_config.config_url.clone(),
                 update_interval: online_config.update_interval.as_ref().map(Duration::as_secs),
                 allowed_plugins: online_config.allowed_plugins.clone(),
+            });
+        }
+
+        #[cfg(feature = "local-web-admin")]
+        {
+            if let Some(ref web_admin) = self.web_admin {
+                jconf.web_admin = Some(SSWebAdminConfig {
+                    listen: Some(web_admin.listen.to_string()),
+                    token: web_admin.token.clone(),
+                    client_config_path: Some(web_admin.client_config_path.clone()),
+                });
+            }
+
+            jconf.route_rules = Some(SSRouteRulesConfig {
+                rules_dir: Some(self.route_rules.rules_dir.clone()),
+                geoip_sources: Some(self.route_rules.geoip_sources.clone()),
+                geosite_sources: Some(self.route_rules.geosite_sources.clone()),
+                direct_domain_sources: Some(self.route_rules.direct_domain_sources.clone()),
+                bypass_domain_sources: Some(self.route_rules.bypass_domain_sources.clone()),
+                domestic_dns: Some(self.route_rules.domestic_dns.clone()),
+                foreign_dns: Some(self.route_rules.foreign_dns.clone()),
             });
         }
 

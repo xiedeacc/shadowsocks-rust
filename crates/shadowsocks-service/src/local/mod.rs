@@ -37,6 +37,11 @@ use self::socks::{Socks, SocksBuilder};
 use self::tun::{Tun, TunBuilder};
 #[cfg(feature = "local-tunnel")]
 use self::tunnel::{Tunnel, TunnelBuilder};
+#[cfg(feature = "local-web-admin")]
+use self::{
+    routing::RoutingState,
+    web_admin::{WebAdmin, WebAdminBuilder},
+};
 
 pub mod context;
 #[cfg(feature = "local-dns")]
@@ -51,12 +56,16 @@ pub mod net;
 pub mod online_config;
 #[cfg(feature = "local-redir")]
 pub mod redir;
+#[cfg(feature = "local-web-admin")]
+pub mod routing;
 pub mod socks;
 #[cfg(feature = "local-tun")]
 pub mod tun;
 #[cfg(feature = "local-tunnel")]
 pub mod tunnel;
 pub mod utils;
+#[cfg(feature = "local-web-admin")]
+pub mod web_admin;
 
 /// Default TCP Keep Alive timeout
 ///
@@ -85,6 +94,8 @@ pub struct Server {
     flow_stat: Arc<FlowStat>,
     #[cfg(feature = "local-online-config")]
     online_config: Option<OnlineConfigService>,
+    #[cfg(feature = "local-web-admin")]
+    web_admin: Option<WebAdmin>,
 }
 
 impl Server {
@@ -178,6 +189,13 @@ impl Server {
             context.set_acl(Arc::new(acl));
         }
 
+        #[cfg(feature = "local-web-admin")]
+        let routing_state = {
+            let routing_state = RoutingState::load(config.route_rules.clone()).await?;
+            context.set_routing_state(routing_state.clone());
+            routing_state
+        };
+
         context.set_security_config(&config.security);
 
         if !config.outbound_proxy.is_empty() {
@@ -265,6 +283,11 @@ impl Server {
                     }
                     Some(builder.build().await?)
                 }
+            },
+            #[cfg(feature = "local-web-admin")]
+            web_admin: match config.web_admin {
+                None => None,
+                Some(web_admin) => Some(WebAdminBuilder::new(web_admin, routing_state.clone()).build().await?),
             },
         };
 
@@ -591,6 +614,11 @@ impl Server {
         #[cfg(feature = "local-online-config")]
         if let Some(online_config) = self.online_config {
             vfut.push(ServerHandle(tokio::spawn(online_config.run())));
+        }
+
+        #[cfg(feature = "local-web-admin")]
+        if let Some(web_admin) = self.web_admin {
+            vfut.push(ServerHandle(tokio::spawn(web_admin.run())));
         }
 
         let (res, ..) = future::select_all(vfut).await;

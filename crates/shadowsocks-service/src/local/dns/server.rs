@@ -36,6 +36,8 @@ use shadowsocks::{
     relay::{Address, udprelay::MAXIMUM_UDP_PAYLOAD_SIZE},
 };
 
+#[cfg(feature = "local-web-admin")]
+use crate::local::routing::RouteDecision;
 use crate::{
     acl::AccessControl,
     local::{
@@ -584,6 +586,49 @@ fn check_name_in_proxy_list(acl: &AccessControl, name: &Name) -> Option<bool> {
     }
 }
 
+#[cfg(feature = "local-web-admin")]
+fn parse_local_dns_addr(addr: &str) -> io::Result<NameServerAddr> {
+    addr.parse().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid local DNS address {addr}: {err}"),
+        )
+    })
+}
+
+#[cfg(feature = "local-web-admin")]
+fn parse_remote_dns_addr(addr: &str) -> io::Result<Address> {
+    if let Ok(ip) = addr.parse::<IpAddr>() {
+        return Ok(Address::SocketAddress(SocketAddr::new(ip, 53)));
+    }
+    if let Ok(saddr) = addr.parse::<SocketAddr>() {
+        return Ok(Address::SocketAddress(saddr));
+    }
+    if addr.find(':').is_some() {
+        addr.parse::<Address>().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid remote DNS address {addr}: {err}"),
+            )
+        })
+    } else {
+        Ok(Address::DomainNameAddress(addr.to_owned(), 53))
+    }
+}
+
+#[cfg(feature = "local-web-admin")]
+fn collect_answer_ips(message: &Message) -> Vec<IpAddr> {
+    message
+        .answers
+        .iter()
+        .filter_map(|rec| match rec.data {
+            RData::A(ip) => Some(IpAddr::V4(Ipv4Addr::from(ip))),
+            RData::AAAA(ip) => Some(IpAddr::V6(Ipv6Addr::from(ip))),
+            _ => None,
+        })
+        .collect()
+}
+
 /// given the query, determine whether remote/local query should be used, or inconclusive
 fn should_forward_by_query(context: &ServiceContext, balancer: &PingBalancer, query: &Query) -> Option<bool> {
     // No server was configured, then always resolve with local
@@ -793,6 +838,52 @@ impl DnsClient {
     ) -> (io::Result<Message>, bool) {
         // Start querying name servers
         debug!("DNS lookup {:?} {}", query.query_type(), query.name());
+
+        #[cfg(feature = "local-web-admin")]
+        if let Some(routing_state) = self.context.routing_state()
+            && query.query_class() == DNSClass::IN
+            && query.query_type() != RecordType::PTR
+        {
+            let domain = query.name().to_ascii();
+            if let Some(decision) = routing_state.route_domain(&domain).await {
+                let response = match decision {
+                    RouteDecision::Direct => {
+                        let local_addr = match routing_state
+                            .domestic_dns()
+                            .await
+                            .into_iter()
+                            .find_map(|addr| parse_local_dns_addr(&addr).ok())
+                        {
+                            Some(addr) => addr,
+                            None => local_addr.clone(),
+                        };
+                        self.lookup_local(query, &local_addr).await
+                    }
+                    RouteDecision::Proxy => {
+                        let remote_addr = match routing_state
+                            .foreign_dns()
+                            .await
+                            .into_iter()
+                            .find_map(|addr| parse_remote_dns_addr(&addr).ok())
+                        {
+                            Some(addr) => addr,
+                            None => remote_addr.clone(),
+                        };
+                        self.lookup_remote(query, &remote_addr).await
+                    }
+                };
+                if let Ok(ref msg) = response {
+                    let ips = collect_answer_ips(msg);
+                    if !ips.is_empty() {
+                        let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
+                    }
+                    routing_state
+                        .record_dns(domain, query.query_type().to_string(), ips, decision)
+                        .await;
+                }
+                return (response, matches!(decision, RouteDecision::Proxy));
+            }
+        }
 
         match should_forward_by_query(&self.context, &self.balancer, query) {
             Some(true) => {
