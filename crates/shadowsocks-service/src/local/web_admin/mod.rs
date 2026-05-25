@@ -331,6 +331,7 @@ impl WebAdminHandler {
                 Ok(json_response(StatusCode::OK, &self.routing_state.recent_dns().await))
             }
             (Method::GET, "/api/sys/status") => Ok(json_response(StatusCode::OK, &self.sys_status().await)),
+            (Method::GET, "/api/sys/platform") => Ok(json_response(StatusCode::OK, &platform_info())),
             (Method::POST, "/api/sys/debug-url") => {
                 let payload: DebugUrlPayload = read_json(req).await?;
                 Ok(json_response(StatusCode::OK, &self.debug_url(payload.url).await?))
@@ -371,7 +372,7 @@ impl WebAdminHandler {
 
     async fn sys_status(&self) -> serde_json::Value {
         let (ip_conflicts, domain_conflicts) = self.routing_state.direct_bypass_file_conflicts().await;
-        let mut status = nft_status();
+        let mut status = system_status();
         if let Some(object) = status.as_object_mut() {
             object.insert("ip_conflicts".to_owned(), serde_json::json!(ip_conflicts));
             object.insert("domain_conflicts".to_owned(), serde_json::json!(domain_conflicts));
@@ -412,7 +413,10 @@ impl WebAdminHandler {
         let connections = self.routing_state.recent_connections(&self.server_filters()).await;
         let transparent_connection = connections.iter().find(|event| {
             event.timestamp >= started_at
-                && event.decision == crate::local::routing::ConnectionDecision::Redir
+                && matches!(
+                    event.decision,
+                    crate::local::routing::ConnectionDecision::Redir | crate::local::routing::ConnectionDecision::Tun
+                )
                 && event
                     .destination_ip
                     .is_some_and(|ip| resolved_ips.iter().any(|resolved| *resolved == ip))
@@ -497,13 +501,52 @@ struct DebugCurlResult {
 fn restart_service_after_response() {
     thread::spawn(|| {
         std::thread::sleep(Duration::from_millis(300));
+        #[cfg(windows)]
+        if let Err(err) = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "Restart-Service -Name ssservice -ErrorAction Stop",
+            ])
+            .status()
+        {
+            log::warn!("failed to restart ssservice after config save: {}", err);
+        }
+        #[cfg(not(windows))]
         if let Err(err) = Command::new("systemctl").args(["restart", "shadowsocks-client.service"]).status() {
             log::warn!("failed to restart shadowsocks-client.service after config save: {}", err);
         }
     });
 }
 
-fn nft_status() -> serde_json::Value {
+fn platform_info() -> serde_json::Value {
+    serde_json::json!({
+        "target_os": std::env::consts::OS,
+        "transparent_backend": transparent_backend(),
+        "service_name": service_name(),
+    })
+}
+
+fn service_name() -> &'static str {
+    if cfg!(windows) {
+        "ssservice"
+    } else {
+        "shadowsocks-client.service"
+    }
+}
+
+fn transparent_backend() -> &'static str {
+    if cfg!(windows) {
+        "tun"
+    } else {
+        "redir"
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn system_status() -> serde_json::Value {
     let install_command = "sudo apt update && sudo apt install -y nftables";
     match Command::new("nft").arg("--version").output() {
         Ok(output) if output.status.success() => {
@@ -534,6 +577,45 @@ fn nft_status() -> serde_json::Value {
             "error": err.to_string(),
         }),
     }
+}
+
+#[cfg(windows)]
+fn system_status() -> serde_json::Value {
+    let service_installed = Command::new("sc")
+        .args(["query", service_name()])
+        .status()
+        .is_ok_and(|status| status.success());
+    let adapter_output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-NetAdapter -Name shadowsocks-tun -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Status",
+        ])
+        .output();
+    let tun_adapter_status = adapter_output
+        .ok()
+        .and_then(|output| output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+        .filter(|status| !status.is_empty());
+    serde_json::json!({
+        "platform": "windows",
+        "transparent_backend": "tun",
+        "tun_supported": true,
+        "service_installed": service_installed,
+        "service_name": service_name(),
+        "tun_adapter": "shadowsocks-tun",
+        "tun_adapter_status": tun_adapter_status,
+        "install_command": r#".\deploy\scripts\deploy_windows.ps1 -InstallDir D:\software\shadowsocks"#,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn system_status() -> serde_json::Value {
+    serde_json::json!({
+        "platform": std::env::consts::OS,
+        "transparent_backend": transparent_backend(),
+        "tun_supported": cfg!(any(target_os = "ios", target_os = "macos", target_os = "android", target_os = "freebsd")),
+        "install_command": "",
+    })
 }
 
 fn is_lan_admin_peer(ip: IpAddr) -> bool {
@@ -587,7 +669,7 @@ fn run_debug_curl(url: &str) -> io::Result<DebugCurlResult> {
             "--max-time",
             "6",
             "-o",
-            "/dev/null",
+            null_device(),
             "-w",
             "%{http_code}",
             url,
@@ -610,6 +692,10 @@ fn run_debug_curl(url: &str) -> io::Result<DebugCurlResult> {
         exit_code: output.status.code(),
         error: (!error.is_empty()).then_some(error),
     })
+}
+
+fn null_device() -> &'static str {
+    if cfg!(windows) { "NUL" } else { "/dev/null" }
 }
 
 fn unix_now() -> u64 {
@@ -806,6 +892,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="form-line"><label>Mode</label><select id="redirMode"><option>tcp_only</option><option>tcp_and_udp</option></select></div>
           <div class="form-line"><label>TCP Redir</label><select id="tcpRedir"><option>redirect</option><option>tproxy</option></select></div>
           <div class="form-line"><label>UDP Redir</label><select id="udpRedir"><option>tproxy</option></select></div>
+          <div class="form-line tun-field"><label>TUN Name</label><input id="tunName" placeholder="shadowsocks-tun"></div>
+          <div class="form-line tun-field"><label>TUN Address</label><input id="tunAddress" placeholder="10.255.0.1/24"></div>
+          <div class="form-line tun-field"><label>TUN Destination</label><input id="tunDestination" placeholder="10.255.0.2/24"></div>
         </fieldset>
         <h3 class="card-title">DNS Listener</h3>
         <fieldset>
@@ -969,12 +1058,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
   </section>
 
   <script>
-    let currentConfigPath='', currentRawConfig={}, rulesSnapshot={};
+    let currentConfigPath='', currentRawConfig={}, rulesSnapshot={}, servicePlatform=null;
     const routeSourceKeys=['geoip_sources','geosite_sources','direct_domain_sources','bypass_domain_sources'];
     const dnsKeys=['domestic_dns','foreign_dns','dns_cache_capacity','dns_cache_ttl_seconds','dns_cache_refresh_enabled','dns_cache_refresh_batch_size','dns_intercept_mode','dns_listen_address','dns_listen_port'];
     const sourceKeys=[...routeSourceKeys,...dnsKeys];
     function token(){return new URLSearchParams(location.search).get('token')||''}
     async function api(path,opt={}){opt.headers=Object.assign({'x-admin-token':token()},opt.headers||{});let r=await fetch(path,opt);let j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}
+    async function platform(){if(!servicePlatform)servicePlatform=await api('/api/sys/platform');return servicePlatform}
+    function isWindowsService(){return servicePlatform&&servicePlatform.target_os==='windows'}
     let activeTab='basic', activityTimer=null;
     function updateNavIndicator(){
       let active=document.querySelector('nav button.active'), indicator=document.querySelector('.nav-indicator'), tabs=document.querySelector('.nav-tabs');
@@ -1000,13 +1091,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function firstServer(){return (currentRawConfig.servers||[])[0]||{}}
     function setSelect(id,value){let el=document.getElementById(id); if([...el.options].some(o=>o.value===value)){el.value=value}else{el.value=el.options[0].value}}
     function renderBasic(){
-      let socks=firstLocal('socks'), http=firstLocal('http'), redir=firstLocal('redir'), dns=firstLocal('dns'), server=firstServer();
+      let socks=firstLocal('socks'), http=firstLocal('http'), redir=firstLocal('redir'), tun=firstLocal('tun'), dns=firstLocal('dns'), server=firstServer();
       let routeRules=currentRawConfig.route_rules||{};
       setSelect('socksBind',socks.local_address||'127.0.0.1'); socksPort.value=socks.local_port||1080;
       setSelect('httpBind',http.local_address||'127.0.0.1'); httpPort.value=http.local_port||1081;
-      redirEnable.checked=!!redir.protocol;
+      redirEnable.checked=!!(redir.protocol||tun.protocol);
       setSelect('redirBind',redir.local_address||'0.0.0.0'); redirPort.value=redir.local_port||12345;
-      setSelect('redirMode',redir.mode||'tcp_and_udp'); setSelect('tcpRedir',redir.tcp_redir||'redirect'); setSelect('udpRedir',redir.udp_redir||'tproxy');
+      setSelect('redirMode',redir.mode||tun.mode||'tcp_and_udp'); setSelect('tcpRedir',redir.tcp_redir||'redirect'); setSelect('udpRedir',redir.udp_redir||'tproxy');
+      tunName.value=tun.tun_interface_name||'shadowsocks-tun';
+      tunAddress.value=tun.tun_interface_address||'10.255.0.1/24';
+      tunDestination.value=tun.tun_interface_destination||'10.255.0.2/24';
+      document.querySelectorAll('.tun-field').forEach(e=>e.style.display=isWindowsService()?'grid':'none');
       dnsEnable.checked=!!dns.protocol;
       setSelect('dnsBind',dns.local_address||'0.0.0.0'); dnsPort.value=dns.local_port||1053;
       renderDnsList('dnsDomesticList',routeRules.domestic_dns||[(dns.local_dns_address||'223.5.5.5')+':'+(dns.local_dns_port||53)]);
@@ -1026,14 +1121,18 @@ const INDEX_HTML: &str = r#"<!doctype html>
         {local_address:httpBind.value,local_port:num(httpPort.value,1081),protocol:'http'}
       ];
       if(redirEnable.checked){
-        locals.push({local_address:redirBind.value,local_port:num(redirPort.value,12345),protocol:'redir',mode:redirMode.value,tcp_redir:tcpRedir.value,udp_redir:udpRedir.value});
+        if(isWindowsService()){
+          locals.push({protocol:'tun',mode:redirMode.value,tun_interface_name:tunName.value.trim()||'shadowsocks-tun',tun_interface_address:tunAddress.value.trim()||'10.255.0.1/24',tun_interface_destination:tunDestination.value.trim()||'10.255.0.2/24'});
+        }else{
+          locals.push({local_address:redirBind.value,local_port:num(redirPort.value,12345),protocol:'redir',mode:redirMode.value,tcp_redir:tcpRedir.value,udp_redir:udpRedir.value});
+        }
       }
       let routeRules=Object.assign({},currentRawConfig.route_rules||{});
       routeRules.dns_cache_capacity=num(dnsCacheCapacity.value,100000);
       routeRules.dns_cache_ttl_seconds=num(dnsCacheTtl.value,604800);
       routeRules.dns_cache_refresh_enabled=dnsCacheRefreshEnabled.checked;
       routeRules.dns_cache_refresh_batch_size=num(dnsCacheRefreshBatch.value,500);
-      routeRules.dns_intercept_mode=dnsInterceptMode.value;
+      routeRules.dns_intercept_mode=isWindowsService()&&dnsInterceptMode.value==='firewall'?'tun':dnsInterceptMode.value;
       routeRules.dns_listen_address=dnsBind.value;
       routeRules.dns_listen_port=num(dnsPort.value,1053);
       let domesticDns=readDns('dnsDomesticList');
@@ -1066,6 +1165,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function readDns(containerId){return [...document.querySelectorAll('#'+containerId+' input')].map(i=>i.value.trim()).filter(Boolean)}
     function renderDnsList(containerId,values){document.getElementById(containerId).innerHTML='';(values||[]).forEach(v=>dnsRow(containerId,v));if(!(values||[]).length)dnsRow(containerId,'')}
     async function loadClientConfig(){
+      await platform();
       let r=await api('/api/client-config'); currentConfigPath=r.path; configPath.textContent=r.path;
       try{currentRawConfig=r.parsed||(r.content?JSON.parse(r.content):{})}catch(e){currentRawConfig={locals:[],servers:[]}}
       currentRawConfig.locals=currentRawConfig.locals||[];
@@ -1075,7 +1175,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function saveClientConfig(){updateClientJson(); await api('/api/client-config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:clientConfig.value})}); configPath.textContent=currentConfigPath+' saved, restarting service...'}
     async function restartService(){await api('/api/restart',{method:'POST'}); configPath.textContent='restarting service...'}
-    ['socksBind','socksPort','httpBind','httpPort','redirEnable','redirBind','redirPort','redirMode','tcpRedir','udpRedir','dnsEnable','dnsBind','dnsPort','dnsCacheCapacity','dnsCacheTtl','dnsCacheRefreshEnabled','dnsCacheRefreshBatch','dnsInterceptMode','serverHost','serverPort','method','serverSecret','timeout','plugin','pluginOpts'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
+    ['socksBind','socksPort','httpBind','httpPort','redirEnable','redirBind','redirPort','redirMode','tcpRedir','udpRedir','tunName','tunAddress','tunDestination','dnsEnable','dnsBind','dnsPort','dnsCacheCapacity','dnsCacheTtl','dnsCacheRefreshEnabled','dnsCacheRefreshBatch','dnsInterceptMode','serverHost','serverPort','method','serverSecret','timeout','plugin','pluginOpts'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
 
     function sourceRow(key,value=''){let div=document.createElement('div');div.className='row';div.innerHTML=`<input value="${value.replaceAll('"','&quot;')}"><button type="button">Remove</button>`;div.querySelector('button').onclick=()=>{div.remove();updateRulesJson()};div.querySelector('input').oninput=updateRulesJson;document.getElementById(key).appendChild(div)}
     function addSource(key){sourceRow(key);updateRulesJson()}
@@ -1174,7 +1274,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function renderUnhitDns(){let rows=await api('/api/activity/unhit-dns');unhitDnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>r.domain]])}
     async function renderDns(){let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']])}
     async function renderRouteConflicts(){await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip')}
-    async function renderSys(){let s=await api('/api/sys/status');let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);sysStatusOut.innerHTML=`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p><p><strong>Ubuntu install command:</strong></p><pre>${s.install_command}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}<h3 class="card-title">direct_ip.txt / bypass_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / bypass_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
+    async function renderSys(){let s=await api('/api/sys/status');let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p><p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body+`<h3 class="card-title">direct_ip.txt / bypass_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / bypass_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
     async function debugUrlCheck(){let url=debugUrl.value.trim();if(!url){debugUrlOut.innerHTML='<p class="hint">Enter a URL first</p>';return}debugUrlOut.innerHTML='<p class="hint">Running debug, timeout 6s...</p>';let r=await api('/api/sys/debug-url',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url})});debugUrlOut.innerHTML=table([r],[['URL',x=>x.url],['Bypass Domain',x=>x.bypass_domain?'yes':'no'],['DNS Intercepted',x=>x.dns_intercepted?'yes':'no'],['DNS Cache',x=>x.dns_cache_hit?'hit':'miss'],['Resolved IPs',x=>(x.resolved_ips||[]).join('<br>')||'-'],['Transparent Port',x=>x.transparent_port_received?'received':'not received'],['Response',x=>x.response_received?'received':'none'],['HTTP',x=>x.http_code||'-'],['Error',x=>x.curl_error||'-']])}
     async function debugIpCheck(){let query=debugIp.value.trim();if(!query){debugIpOut.innerHTML='<p class="hint">Enter an IP or CIDR first</p>';return}let r=await api('/api/sys/debug-ip',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query})});debugIpOut.innerHTML=table([r],[['Query',x=>x.query],['Valid',x=>x.valid?'yes':'no'],['bypass_ip.txt',x=>x.bypass_file?'yes':'no'],['bypass Matches',x=>(x.bypass_file_matches||[]).join('<br>')||'-'],['NFT Checked',x=>x.nft_checked?'yes':'no'],['NFT bypass',x=>x.nft_bypass?'yes':'no'],['NFT Matches',x=>(x.nft_matches||[]).join('<br>')||'-'],['Error',x=>x.error||x.nft_error||'-']])}
     function syncDnsRefreshToBasic(){dnsCacheRefreshEnabled.checked=dnsCacheRefreshEnabledDns.checked;dnsCacheRefreshBatch.value=dnsCacheRefreshBatchDns.value;updateClientJson()}

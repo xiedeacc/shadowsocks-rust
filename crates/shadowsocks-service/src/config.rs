@@ -1557,6 +1557,10 @@ pub const DEFAULT_GEOIP_SOURCE: &str =
 pub const DEFAULT_GEOSITE_SOURCE: &str =
     "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat";
 #[cfg(feature = "local-web-admin")]
+#[cfg(windows)]
+pub const DEFAULT_DEPLOY_DIR: &str = r"D:\software\shadowsocks";
+#[cfg(feature = "local-web-admin")]
+#[cfg(not(windows))]
 pub const DEFAULT_DEPLOY_DIR: &str = "/usr/local/shadowsocks";
 #[cfg(feature = "local-web-admin")]
 pub const DEFAULT_DIRECT_DOMAIN_SOURCES: &[&str] = &[
