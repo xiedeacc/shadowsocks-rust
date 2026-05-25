@@ -319,7 +319,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <title>shadowsocks-rust routing admin</title>
   <style>
     :root{--bg:#eef3f8;--panel:#ffffff;--ink:#102033;--muted:#667589;--line:#c8d3df;--brand:#1f5f8b;--brand2:#17486c;--soft:#e4eef7}
-    body{font-family:system-ui,sans-serif;margin:0;padding:24px;background:var(--bg);color:var(--ink);line-height:1.4}
+    html,body{height:100%}
+    body{font-family:system-ui,sans-serif;margin:0;padding:24px;background:var(--bg);color:var(--ink);line-height:1.4;box-sizing:border-box;overflow:hidden}
     h1{margin:0 0 6px;color:var(--brand2)}
     nav{padding:0;margin:0 0 16px;background:transparent;border:0;box-shadow:none}
     nav button{margin:0 8px 0 0;background:var(--soft);color:var(--brand2)}
@@ -337,38 +338,44 @@ const INDEX_HTML: &str = r#"<!doctype html>
     table{border-collapse:collapse;width:100%;margin-top:10px}
     th,td{border:1px solid var(--line);padding:7px;text-align:left;vertical-align:top;background:var(--panel)}
     th{background:var(--soft);color:var(--brand2)}
-    .scroll-panel{height:548px;overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:0 1px 2px #10203312}
-    .section-scroll{height:300px}
+    .scroll-panel{overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:0 1px 2px #10203312}
+    .section-scroll{height:auto;min-height:0;flex:1}
     .scroll-panel table{margin-top:0}
     .scroll-panel th{position:sticky;top:0;z-index:1}
     .conflict-table{table-layout:fixed}
-    .conflict-table th:nth-child(1),.conflict-table td:nth-child(1){width:34%}
-    .conflict-table th:nth-child(2),.conflict-table td:nth-child(2){width:16%}
-    .conflict-table th:nth-child(3),.conflict-table td:nth-child(3){width:13%}
-    .conflict-table th:nth-child(4),.conflict-table td:nth-child(4){width:25%}
-    .conflict-table th:nth-child(5),.conflict-table td:nth-child(5){width:12%}
+    .conflict-table th:nth-child(1),.conflict-table td:nth-child(1){width:38%}
+    .conflict-table th:nth-child(2),.conflict-table td:nth-child(2){width:17%}
+    .conflict-table th:nth-child(3),.conflict-table td:nth-child(3){width:32%}
+    .conflict-table th:nth-child(4),.conflict-table td:nth-child(4){width:13%}
     .conflict-table td{word-break:break-word}
     pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto}
-    .tab{display:none}.tab.active{display:block}
+    .tab{display:none;height:calc(100vh - 88px);min-height:0;overflow:hidden}.tab.active{display:block}
+    #basic.tab.active,#routeConfig.tab.active{display:flex;flex-direction:column}
     .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
-    .activity-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}
-    .activity-card{min-width:0}
-    .basic-layout{display:grid;grid-template-columns:minmax(380px,540px) 1fr;gap:18px;align-items:start}
-    .route-rules-layout{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:18px;align-items:start;margin-top:18px}
+    .activity-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(3,minmax(0,1fr));gap:16px;align-items:stretch;height:100%;min-height:0}
+    .activity-card{min-width:0;min-height:0;display:flex;flex-direction:column}
+    .basic-layout{display:grid;grid-template-columns:minmax(380px,540px) 1fr;gap:18px;align-items:stretch;height:calc(100% - 46px);min-height:0}
+    .basic-form-panel{overflow:auto;min-height:0}
+    .basic-json-panel{display:flex;flex-direction:column;min-height:0}
+    .basic-json-panel textarea{flex:1}
+    .basic-actions{margin-top:8px}
+    .route-rules-layout{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:18px;align-items:start;margin-top:8px;min-height:0}
     .form-line{display:grid;grid-template-columns:150px 1fr;gap:10px;align-items:center;margin:4px 0}
     .form-line label{margin:0;font-size:13px}
     .form-line input[type=checkbox]{width:16px;height:16px;margin:0;justify-self:start}
-    #clientConfig,#rulesJson{min-height:0;height:548px;max-height:548px;overflow:auto;resize:vertical;font-size:13px}
+    #clientConfig{min-height:0;height:auto;max-height:none;overflow:auto;resize:vertical;font-size:13px}
+    #rulesJson{min-height:100px;height:auto;max-height:none;overflow:auto;resize:vertical;font-size:13px;flex:1}
+    #routeConfig .route-rules-layout textarea{height:clamp(56px,8vh,96px);min-height:56px;resize:vertical}
     .row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;margin:4px 0}
     .row input{margin:0}
     .row button{margin:0;white-space:nowrap}
     .hint{color:var(--muted);font-size:12px}
-    .progress-box{margin:12px auto 0;max-width:760px;text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;box-shadow:0 1px 2px #10203312}
+    .progress-box{margin:8px auto 0;max-width:760px;max-height:120px;overflow:auto;text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;box-shadow:0 1px 2px #10203312}
     .progress-bar{height:10px;background:var(--soft);border-radius:999px;overflow:hidden;margin:8px 0}
     .progress-fill{height:100%;width:0;background:var(--brand)}
     .progress-completed{white-space:pre-line;margin-top:8px}
-    @media(max-width:1100px){.activity-grid,.route-rules-layout{grid-template-columns:1fr}}
-    @media(max-width:900px){.basic-layout{grid-template-columns:1fr}#clientConfig,#rulesJson{height:420px;max-height:420px}}
+    @media(max-width:1100px){.activity-grid,.route-rules-layout{grid-template-columns:1fr}.activity-grid{grid-template-rows:repeat(6,minmax(0,1fr))}}
+    @media(max-width:900px){.basic-layout{grid-template-columns:1fr}#clientConfig,#rulesJson{height:auto;max-height:none}}
   </style>
 </head>
 <body>
@@ -379,10 +386,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
   </nav>
 
   <section id="basic" class="tab active">
-    <h2>Basic Config</h2>
     <p class="hint" id="configPath"></p>
     <div class="basic-layout">
-      <div>
+      <div class="basic-form-panel">
         <h3 class="card-title">SOCKS Local</h3>
         <fieldset>
           <div class="form-line"><label>Bind Address</label><select id="socksBind"><option>127.0.0.1</option><option>0.0.0.0</option></select></div>
@@ -415,18 +421,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="form-line"><label>Plugin Path</label><input id="plugin"></div>
           <div class="form-line"><label>Plugin Options</label><input id="pluginOpts"></div>
         </fieldset>
-        <button onclick="loadClientConfig()">Reload</button>
-        <button onclick="saveClientConfig()">Save Generated JSON</button>
       </div>
-      <div>
+      <div class="basic-json-panel">
         <h3 class="card-title">Generated JSON</h3>
         <textarea id="clientConfig"></textarea>
       </div>
     </div>
+    <div class="basic-actions">
+      <button onclick="loadClientConfig()">Reload</button>
+      <button onclick="saveClientConfig()">Save Generated JSON</button>
+    </div>
   </section>
 
   <section id="connections" class="tab">
-    <h2>Connections</h2>
     <div class="activity-grid">
       <div class="activity-card">
         <h3 class="card-title">Recent DNS</h3>
@@ -456,44 +463,24 @@ const INDEX_HTML: &str = r#"<!doctype html>
   </section>
 
   <section id="routeConfig" class="tab">
-    <h2>Generated Route Config</h2>
-    <div class="grid">
-      <div>
-        <h3 class="card-title">Domestic DNS</h3>
-        <fieldset><div id="domestic_dns"></div><button onclick="addSource('domestic_dns')">Add</button></fieldset>
-      </div>
-      <div>
-        <h3 class="card-title">Foreign DNS</h3>
-        <fieldset><div id="foreign_dns"></div><button onclick="addSource('foreign_dns')">Add</button></fieldset>
-      </div>
-    </div>
-    <button onclick="loadRules()">Reload DNS Config</button>
-    <button onclick="saveRules()">Save DNS Config</button>
-    <h3 class="card-title">Generated JSON</h3>
+    <h3 class="card-title">Rules</h3>
     <textarea id="rulesJson"></textarea>
-    <div class="route-rules-layout">
-      <div>
-        <h3 class="card-title">Rule Sources</h3>
-        <h3 class="card-title">geoip Sources</h3><fieldset><div id="geoip_sources"></div><button onclick="addSource('geoip_sources')">Add</button></fieldset>
-        <h3 class="card-title">geosite Sources</h3><fieldset><div id="geosite_sources"></div><button onclick="addSource('geosite_sources')">Add</button></fieldset>
-        <h3 class="card-title">Direct Domain Sources</h3><fieldset><div id="direct_domain_sources"></div><button onclick="addSource('direct_domain_sources')">Add</button></fieldset>
-        <h3 class="card-title">Bypass Domain Sources</h3><fieldset><div id="bypass_domain_sources"></div><button onclick="addSource('bypass_domain_sources')">Add</button></fieldset>
-        <button onclick="loadRules()">Reload Sources</button>
-        <button onclick="saveRules()">Save Sources</button>
-      </div>
-      <div>
-        <h3 class="card-title">Temporary Lists</h3>
-        <fieldset>
-          <label>Direct IP<textarea id="tmp_direct_ip"></textarea></label>
-          <label>Direct Domain<textarea id="tmp_direct_domain"></textarea></label>
-          <label>Bypass IP<textarea id="tmp_bypass_ip"></textarea></label>
-          <label>Bypass Domain<textarea id="tmp_bypass_domain"></textarea></label>
-          <p class="hint">一行一个配置，无需分隔符</p>
-        </fieldset>
-        <button onclick="loadRules()">Reload Temporary Lists</button>
-        <button onclick="saveRules()">Save Temporary Lists</button>
-      </div>
+    <div>
+      <button onclick="loadRules()">Reload Rules</button>
+      <button onclick="saveRules()">Save Rules</button>
     </div>
+    <h3 class="card-title">Temporary Lists</h3>
+    <div class="route-rules-layout">
+      <fieldset>
+        <label>Direct IP<textarea id="tmp_direct_ip"></textarea></label>
+        <label>Direct Domain<textarea id="tmp_direct_domain"></textarea></label>
+      </fieldset>
+      <fieldset>
+        <label>Bypass IP<textarea id="tmp_bypass_ip"></textarea></label>
+        <label>Bypass Domain<textarea id="tmp_bypass_domain"></textarea></label>
+      </fieldset>
+    </div>
+    <p class="hint">Temporary lists have priority over generated direct/bypass files. 一行一个配置，无需分隔符。</p>
     <div style="text-align:center;margin-top:20px">
       <button onclick="updateRules()">Download and Generate Persistent Files</button>
     </div>
@@ -569,17 +556,23 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function readSource(key){return [...document.querySelectorAll('#'+key+' input')].map(i=>i.value.trim()).filter(Boolean)}
     function renderSource(key,values){document.getElementById(key).innerHTML='';(values||[]).forEach(v=>sourceRow(key,v));if(!(values||[]).length)sourceRow(key,'')}
     function tempRules(){return {direct_ip:lines(tmp_direct_ip.value),direct_domain:lines(tmp_direct_domain.value),bypass_ip:lines(tmp_bypass_ip.value),bypass_domain:lines(tmp_bypass_domain.value)}}
-    function sourcesFromForm(){let s={};sourceKeys.forEach(k=>s[k]=readSource(k));return s}
-    function updateRulesJson(){rulesJson.value=JSON.stringify({sources:sourcesFromForm(),temporary:tempRules()},null,2)}
+    function sourcesFromForm(){return (rulesSnapshot&&rulesSnapshot.sources)||{}}
+    function updateRulesJson(snapshot=rulesSnapshot){rulesJson.value=JSON.stringify({sources:(snapshot&&snapshot.sources)||{}},null,2)}
+    function rulesPayloadFromJson(){
+      let payload=JSON.parse(rulesJson.value||'{}');
+      let sources=Object.assign({},(rulesSnapshot&&rulesSnapshot.sources)||{},payload.sources||{});
+      let temporary=tempRules();
+      return {sources,temporary};
+    }
     async function loadRules(){
       rulesSnapshot=await api('/api/config/rules'); let tmp=await api('/api/temp-rules');
-      sourceKeys.forEach(k=>{let el=document.getElementById(k); if(el)renderSource(k,(rulesSnapshot.sources||{})[k]||[])});
       setLines('tmp_direct_ip',tmp.direct_ip);setLines('tmp_direct_domain',tmp.direct_domain);setLines('tmp_bypass_ip',tmp.bypass_ip);setLines('tmp_bypass_domain',tmp.bypass_domain);
-      updateRulesJson();
+      updateRulesJson(rulesSnapshot);
     }
     async function saveRules(){
-      await api('/api/config/rules',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(sourcesFromForm())});
-      await api('/api/temp-rules',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(tempRules())});
+      let payload=rulesPayloadFromJson();
+      await api('/api/config/rules',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(payload.sources)});
+      await api('/api/temp-rules',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(payload.temporary)});
       await loadRules();
     }
     let progressTimer=null;
@@ -608,21 +601,24 @@ const INDEX_HTML: &str = r#"<!doctype html>
       progressTimer=setInterval(()=>pollUpdateProgress().catch(e=>{progressMessage.textContent=e.message}),1000);
       await pollUpdateProgress();
     }
-    ['tmp_direct_ip','tmp_direct_domain','tmp_bypass_ip','tmp_bypass_domain'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateRulesJson),0));
-
     function table(rows,cols,cls=''){if(!rows.length)return '<p class="hint">No data</p>';return `<table class="${cls}"><thead><tr>`+cols.map(c=>'<th>'+c[0]+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+String(c[1](r)??'')+'</td>').join('')+'</tr>').join('')+'</tbody></table>'}
     function fmtTime(ts){return ts?new Date(ts*1000).toLocaleString():''}
-    async function setManualIp(cidr,region){await api('/api/manual-ip',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({cidr,region})});await renderConflicts('ipOut','/api/conflicts/ip')}
-    async function setManualDomain(domain,region){await api('/api/manual-domain',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({domain,region})});await renderConflicts('domainOut','/api/conflicts/domain')}
+    let manualSelectEditing=false;
+    function beginManualSelectEdit(){manualSelectEditing=true}
+    function endManualSelectEdit(){setTimeout(()=>{manualSelectEditing=false},400)}
+    async function setManualIp(cidr,region){manualSelectEditing=false;await api('/api/manual-ip',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({cidr,region})});await renderConflicts('ipOut','/api/conflicts/ip',{force:true})}
+    async function setManualDomain(domain,region){manualSelectEditing=false;await api('/api/manual-domain',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({domain,region})});await renderConflicts('domainOut','/api/conflicts/domain',{force:true})}
     function manualSelect(row,manual,onchange){
       let regions=['direct','bypass'];
       let selected=manual[row.value]||'';
-      return `<select onchange="${onchange}('${row.value}',this.value)"><option value="">Auto</option>${regions.map(region=>`<option value="${region}"${region===selected?' selected':''}>${region}</option>`).join('')}</select>`;
+      return `<select onpointerdown="beginManualSelectEdit()" onfocus="beginManualSelectEdit()" onblur="endManualSelectEdit()" onchange="${onchange}('${row.value}',this.value)"><option value="">Auto</option>${regions.map(region=>`<option value="${region}"${region===selected?' selected':''}>${region}</option>`).join('')}</select>`;
     }
-    async function renderConflicts(id,path){
+    async function renderConflicts(id,path,opt={}){
+      if(manualSelectEditing&&!opt.force)return;
       let rows=await api(path);
+      if(manualSelectEditing&&!opt.force)return;
       let manual={};
-      let cols=[['Value',r=>r.value],['Layer',r=>r.layer]];
+      let cols=[['Value',r=>r.value]];
       if(id==='ipOut'){
         (await api('/api/manual-ip')).forEach(rule=>manual[rule.cidr]=rule.region);
         cols.push(['Regions',r=>(r.regions||[]).join(', ')],['Sources',r=>(r.sources||[]).join(', ')],['Select',r=>manualSelect(r,manual,'setManualIp')]);

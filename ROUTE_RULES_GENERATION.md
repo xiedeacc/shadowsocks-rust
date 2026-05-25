@@ -27,21 +27,40 @@ blocked.example bypass
 8.8.8.8/32 bypass
 ```
 
-Manual rules have the highest priority when they match a generated rule.
+Manual rules are used only while generating the persistent rule files. They are not checked directly
+by runtime routing. This means `manual_domain.txt` wins over `apple-cn.txt`, `google-cn.txt`,
+`gfw.txt`, and `china-list.txt` during generation, and its result is materialized into the generated
+files.
+
+Temporary rules configured in the web UI are runtime-only rules. They only have priority over the
+generated persistent files. Runtime priority is:
+
+1. Temporary rules
+2. Generated `direct_domain.txt`, `bypass_domain.txt`, `direct_ip.txt`, and `bypass_ip.txt`
 
 ## Domain Generation
 
-`apple-cn.txt`, `china-list.txt`, and `google-cn.txt` are direct-domain sources. Domains from these
-files are added to `direct_domain.txt` unless a matching `manual_domain.txt` entry says `bypass`.
-In that case the domain is written to `bypass_domain.txt` and a Domain Conflict is recorded with
-the source file and `manual_domain.txt`.
+Domain source priority is:
+
+1. `manual_domain.txt`
+2. `apple-cn.txt` and `google-cn.txt`
+3. `gfw.txt`
+4. `china-list.txt`
+
+`apple-cn.txt`, `google-cn.txt`, and `china-list.txt` are direct-domain sources, but they do not have
+the same priority. `apple-cn.txt` and `google-cn.txt` are higher priority than `gfw.txt`, while
+`china-list.txt` is lower priority than `gfw.txt`.
 
 `gfw.txt` is a bypass-domain source. Domains from this file are added to `bypass_domain.txt` unless
-a higher-priority direct source or manual rule overrides it.
+`manual_domain.txt`, `apple-cn.txt`, or `google-cn.txt` overrides it.
 
-If a domain appears in both a direct-domain source and `gfw.txt`, direct wins. The domain is
-automatically written to `manual_domain.txt` as `direct`, and one Domain Conflict is recorded. The
-conflict sources include the direct source file, `gfw.txt`, and `manual_domain.txt`.
+If a domain appears in `apple-cn.txt` or `google-cn.txt` and also in `gfw.txt`, direct wins. The
+domain is automatically written to `manual_domain.txt` as `direct`, and one Domain Conflict is
+recorded. The conflict sources include the direct source file, `gfw.txt`, and `manual_domain.txt`.
+
+If a domain appears in `china-list.txt` and `gfw.txt` with no manual rule, `gfw.txt` wins and the
+domain is written to `bypass_domain.txt`. A Domain Conflict is still recorded with `china-list.txt`
+and `gfw.txt` as sources.
 
 If `manual_domain.txt` conflicts with `gfw.txt`, the manual decision wins and a Domain Conflict is
 recorded. If the manual entry was auto-created because a direct source conflicted with `gfw.txt`,

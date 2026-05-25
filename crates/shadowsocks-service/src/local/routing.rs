@@ -27,9 +27,9 @@ const MANUAL_IP_FILE: &str = "manual_ip.txt";
 const MANUAL_DOMAIN_FILE: &str = "manual_domain.txt";
 const IP_METADATA_FILE: &str = "ip_metadata.txt";
 const DOMAIN_METADATA_FILE: &str = "domain_metadata.txt";
-const GEOIP_TEXT_FILE: &str = "geoip.txt";
 const SOURCE_DIR: &str = "source";
 const SOURCE_TEMP_DIR: &str = "temp";
+const HIGH_PRIORITY_DIRECT_DOMAIN_SOURCES: [&str; 2] = ["apple-cn.txt", "google-cn.txt"];
 const GENERATED_RULE_FILES: [&str; 4] = [DIRECT_IP_FILE, DIRECT_DOMAIN_FILE, BYPASS_IP_FILE, BYPASS_DOMAIN_FILE];
 const REMOVED_SOURCE_FILES: [&str; 2] = ["direct-list.txt", "proxy-list.txt"];
 const MAX_EVENTS: usize = 4096;
@@ -92,7 +92,6 @@ pub struct ConflictEvent {
     pub timestamp: u64,
     pub kind: ConflictKind,
     pub value: String,
-    pub layer: String,
     pub regions: Vec<String>,
     pub sources: Vec<String>,
 }
@@ -107,12 +106,6 @@ pub struct ManualIpRule {
 pub struct ManualDomainRule {
     pub domain: String,
     pub region: String,
-}
-
-#[derive(Clone, Debug)]
-struct CompiledManualIpRule {
-    net: IpNet,
-    region: String,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -215,10 +208,10 @@ struct RoutingInner {
     persistent_raw: RuleLists,
     manual_ip_raw: Vec<ManualIpRule>,
     manual_domain_raw: Vec<ManualDomainRule>,
+    manual_ip_modified: Option<SystemTime>,
+    manual_domain_modified: Option<SystemTime>,
     temporary: CompiledRules,
     persistent: CompiledRules,
-    manual_ip: Vec<CompiledManualIpRule>,
-    manual_domain: Vec<ManualDomainRule>,
     ip_regions: HashMap<String, BTreeSet<String>>,
     ip_sources: HashMap<String, BTreeSet<String>>,
     domain_regions: HashMap<String, BTreeSet<String>>,
@@ -253,9 +246,10 @@ impl RoutingState {
         let persistent = compile_rules(&persistent_raw);
         let manual_ip_raw = read_manual_ip_rules(&config.rules_dir)?;
         write_manual_ip_rules(&config.rules_dir, &manual_ip_raw)?;
-        let manual_ip = compile_manual_ip_rules(&manual_ip_raw);
+        let manual_ip_modified = file_modified(&config.rules_dir.join(MANUAL_IP_FILE))?;
         let manual_domain_raw = read_manual_domain_rules(&config.rules_dir)?;
         write_manual_domain_rules(&config.rules_dir, &manual_domain_raw)?;
+        let manual_domain_modified = file_modified(&config.rules_dir.join(MANUAL_DOMAIN_FILE))?;
         let (ip_regions, ip_sources) = read_rule_metadata(&config.rules_dir.join(IP_METADATA_FILE))?;
         let (domain_regions, domain_sources) = read_rule_metadata(&config.rules_dir.join(DOMAIN_METADATA_FILE))?;
         let temporary_raw = RuleLists::default();
@@ -266,11 +260,11 @@ impl RoutingState {
             temporary_raw,
             persistent_raw,
             manual_ip_raw,
-            manual_domain: manual_domain_raw.clone(),
+            manual_ip_modified,
             manual_domain_raw,
+            manual_domain_modified,
             temporary,
             persistent,
-            manual_ip,
             ip_regions,
             ip_sources,
             domain_regions,
@@ -317,10 +311,16 @@ impl RoutingState {
     }
 
     pub async fn manual_ip_rules(&self) -> Vec<ManualIpRule> {
+        if let Err(err) = self.refresh_manual_rules_from_disk().await {
+            warn!("failed to refresh manual IP rules: {}", err);
+        }
         self.inner.read().await.manual_ip_raw.clone()
     }
 
     pub async fn manual_domain_rules(&self) -> Vec<ManualDomainRule> {
+        if let Err(err) = self.refresh_manual_rules_from_disk().await {
+            warn!("failed to refresh manual domain rules: {}", err);
+        }
         self.inner.read().await.manual_domain_raw.clone()
     }
 
@@ -337,7 +337,9 @@ impl RoutingState {
         let cidr = cidr.trim();
         inner.manual_ip_raw.retain(|rule| rule.cidr != cidr);
         write_manual_ip_rules(&inner.rules_dir, &inner.manual_ip_raw)?;
-        inner.manual_ip = compile_manual_ip_rules(&inner.manual_ip_raw);
+        inner.manual_ip_modified = file_modified(&inner.rules_dir.join(MANUAL_IP_FILE))?;
+        apply_manual_ip_metadata(&mut inner);
+        rebuild_conflicts(&mut inner);
         Ok(())
     }
 
@@ -354,7 +356,9 @@ impl RoutingState {
         let domain = normalize_domain(domain);
         inner.manual_domain_raw.retain(|rule| rule.domain != domain);
         write_manual_domain_rules(&inner.rules_dir, &inner.manual_domain_raw)?;
-        inner.manual_domain = inner.manual_domain_raw.clone();
+        inner.manual_domain_modified = file_modified(&inner.rules_dir.join(MANUAL_DOMAIN_FILE))?;
+        apply_manual_domain_metadata(&mut inner);
+        rebuild_conflicts(&mut inner);
         Ok(())
     }
 
@@ -385,15 +389,12 @@ impl RoutingState {
     }
 
     pub async fn update_from_sources(&self) -> io::Result<()> {
-        let (sources, rules_dir, manual_ip_raw, mut manual_domain_raw) = {
+        let (sources, rules_dir) = {
             let inner = self.inner.read().await;
-            (
-                inner.sources.clone(),
-                inner.rules_dir.clone(),
-                inner.manual_ip_raw.clone(),
-                inner.manual_domain_raw.clone(),
-            )
+            (inner.sources.clone(), inner.rules_dir.clone())
         };
+        let mut manual_ip_raw = read_manual_ip_rules(&rules_dir)?;
+        let mut manual_domain_raw = read_manual_domain_rules(&rules_dir)?;
         let source_dir = rules_dir.join(SOURCE_DIR);
         let total_files = total_update_steps(&sources);
         if self.update_progress().await.status != RuleUpdateStatus::Running {
@@ -438,7 +439,6 @@ impl RoutingState {
                 &downloaded.display_name,
                 &mut ip_regions,
                 &mut ip_sources,
-                Some(&rules_dir.join(GEOIP_TEXT_FILE)),
             )
             .is_err()
             {
@@ -544,7 +544,7 @@ impl RoutingState {
         }
 
         let (resolved_direct_ip, resolved_bypass_ip) =
-            resolve_ip_rules(&mut ip_regions, &mut ip_sources, &manual_ip_raw);
+            resolve_ip_rules(&mut ip_regions, &mut ip_sources, &mut manual_ip_raw);
         direct_ip.extend(resolved_direct_ip);
         bypass_ip.extend(resolved_bypass_ip);
         let domain_resolution = resolve_domain_rules(
@@ -556,6 +556,9 @@ impl RoutingState {
         );
         let direct_domain = domain_resolution.direct_domain;
         let bypass_domain = domain_resolution.bypass_domain;
+        if write_manual_ip_rules(&rules_dir, &manual_ip_raw).is_err() {
+            warn!("failed to persist manual IP rules after geoip conflict resolution");
+        }
         if domain_resolution.manual_changed {
             write_manual_domain_rules(&rules_dir, &manual_domain_raw)?;
         }
@@ -593,9 +596,9 @@ impl RoutingState {
         let completed_messages = self.completed_messages();
         let mut inner = self.inner.write().await;
         inner.manual_ip_raw = manual_ip_raw;
-        inner.manual_ip = compile_manual_ip_rules(&inner.manual_ip_raw);
+        inner.manual_ip_modified = file_modified(&inner.rules_dir.join(MANUAL_IP_FILE))?;
         inner.manual_domain_raw = manual_domain_raw;
-        inner.manual_domain = inner.manual_domain_raw.clone();
+        inner.manual_domain_modified = file_modified(&inner.rules_dir.join(MANUAL_DOMAIN_FILE))?;
         inner.persistent_raw = lists;
         inner.persistent = persistent;
         inner.ip_regions = ip_regions;
@@ -874,11 +877,46 @@ impl RoutingState {
     }
 
     pub async fn ip_conflicts(&self) -> Vec<ConflictEvent> {
+        if let Err(err) = self.refresh_manual_rules_from_disk().await {
+            warn!("failed to refresh manual rules for IP conflicts: {}", err);
+        }
         self.inner.read().await.ip_conflicts.iter().cloned().collect()
     }
 
     pub async fn domain_conflicts(&self) -> Vec<ConflictEvent> {
+        if let Err(err) = self.refresh_manual_rules_from_disk().await {
+            warn!("failed to refresh manual rules for domain conflicts: {}", err);
+        }
         self.inner.read().await.domain_conflicts.iter().cloned().collect()
+    }
+
+    async fn refresh_manual_rules_from_disk(&self) -> io::Result<()> {
+        let mut inner = self.inner.write().await;
+        let mut changed = false;
+
+        let manual_ip_path = inner.rules_dir.join(MANUAL_IP_FILE);
+        let manual_ip_modified = file_modified(&manual_ip_path)?;
+        if manual_ip_modified != inner.manual_ip_modified {
+            inner.manual_ip_raw = read_manual_ip_rules(&inner.rules_dir)?;
+            inner.manual_ip_modified = manual_ip_modified;
+            apply_manual_ip_metadata(&mut inner);
+            changed = true;
+        }
+
+        let manual_domain_path = inner.rules_dir.join(MANUAL_DOMAIN_FILE);
+        let manual_domain_modified = file_modified(&manual_domain_path)?;
+        if manual_domain_modified != inner.manual_domain_modified {
+            inner.manual_domain_raw = read_manual_domain_rules(&inner.rules_dir)?;
+            inner.manual_domain_modified = manual_domain_modified;
+            apply_manual_domain_metadata(&mut inner);
+            changed = true;
+        }
+
+        if changed {
+            rebuild_conflicts(&mut inner);
+        }
+
+        Ok(())
     }
 
     pub async fn recent_connections(&self) -> Vec<ConnectionEvent> {
@@ -907,10 +945,6 @@ impl RoutingState {
 }
 
 fn route_ip_inner(inner: &mut RoutingInner, ip: &IpAddr) -> Option<RouteDecision> {
-    if let Some(rule) = inner.manual_ip.iter().find(|rule| rule.net.contains(ip)) {
-        return Some(decision_for_region(&rule.region));
-    }
-
     let temp_direct = rules_match_ip(&inner.temporary.direct_ip, ip);
     let temp_proxy = rules_match_ip(&inner.temporary.bypass_ip, ip);
     if temp_direct && temp_proxy {
@@ -949,14 +983,6 @@ fn route_ip_inner(inner: &mut RoutingInner, ip: &IpAddr) -> Option<RouteDecision
 
 fn route_domain_inner(inner: &mut RoutingInner, domain: &str) -> Option<RouteDecision> {
     let domain = normalize_domain(domain);
-    if let Some(rule) = inner
-        .manual_domain
-        .iter()
-        .find(|rule| domain_matches_rule(&rule.domain, &domain))
-    {
-        return Some(decision_for_region(&rule.region));
-    }
-
     let temp_direct = rules_match_domain(&inner.temporary.direct_domain, &domain);
     let temp_proxy = rules_match_domain(&inner.temporary.bypass_domain, &domain);
     if temp_direct && temp_proxy {
@@ -1001,7 +1027,7 @@ fn rebuild_conflicts(inner: &mut RoutingInner) {
         let regions = inner
             .ip_regions
             .get(&rule)
-            .map(|regions| regions.iter().cloned().collect())
+            .map(display_ip_conflict_regions)
             .unwrap_or_default();
         let sources = inner
             .ip_sources
@@ -1010,7 +1036,7 @@ fn rebuild_conflicts(inner: &mut RoutingInner) {
             .unwrap_or_default();
         push_event(
             &mut inner.ip_conflicts,
-            new_conflict_event_with_metadata(ConflictKind::Ip, rule, "persistent".to_owned(), regions, sources),
+            new_conflict_event_with_metadata(ConflictKind::Ip, rule, regions, sources),
         );
     }
 
@@ -1027,7 +1053,7 @@ fn rebuild_conflicts(inner: &mut RoutingInner) {
             .unwrap_or_default();
         push_event(
             &mut inner.domain_conflicts,
-            new_conflict_event_with_metadata(ConflictKind::Domain, rule, "persistent".to_owned(), regions, sources),
+            new_conflict_event_with_metadata(ConflictKind::Domain, rule, regions, sources),
         );
     }
 }
@@ -1060,7 +1086,7 @@ fn ip_regions_conflict(regions: &BTreeSet<String>) -> bool {
     }
     let geo_regions = regions
         .iter()
-        .filter(|region| region.as_str() != "direct" && region.as_str() != "bypass")
+        .filter(|region| is_country_region(region))
         .collect::<Vec<_>>();
     if geo_regions.len() > 1 {
         return true;
@@ -1069,6 +1095,19 @@ fn ip_regions_conflict(regions: &BTreeSet<String>) -> bool {
         return true;
     }
     has_manual_direct && geo_regions.iter().any(|region| region.as_str() != "cn")
+}
+
+fn display_ip_conflict_regions(regions: &BTreeSet<String>) -> Vec<String> {
+    regions
+        .iter()
+        .filter(|region| matches!(region.as_str(), "direct" | "bypass") || is_country_region(region))
+        .cloned()
+        .collect()
+}
+
+fn is_country_region(region: &str) -> bool {
+    let bytes = region.as_bytes();
+    bytes.len() == 2 && bytes.iter().all(u8::is_ascii_lowercase)
 }
 
 fn warn_if_domain_conflict(inner: &mut RoutingInner, domain: &str, layer: RuleLayer) {
@@ -1081,53 +1120,36 @@ fn warn_if_domain_conflict(inner: &mut RoutingInner, domain: &str, layer: RuleLa
 }
 
 fn push_conflict(inner: &mut RoutingInner, kind: ConflictKind, value: String, layer: RuleLayer) {
-    let event = new_conflict_event(kind, value, layer_label(layer).to_owned());
+    let _ = layer;
+    let event = new_conflict_event(kind, value);
     match kind {
         ConflictKind::Ip => push_event(&mut inner.ip_conflicts, event),
         ConflictKind::Domain => push_event(&mut inner.domain_conflicts, event),
     }
 }
 
-fn new_conflict_event(kind: ConflictKind, value: String, layer: String) -> ConflictEvent {
-    new_conflict_event_with_metadata(kind, value, layer, Vec::new(), Vec::new())
+fn new_conflict_event(kind: ConflictKind, value: String) -> ConflictEvent {
+    new_conflict_event_with_metadata(kind, value, Vec::new(), Vec::new())
 }
 
 fn new_conflict_event_with_metadata(
     kind: ConflictKind,
     value: String,
-    layer: String,
     regions: Vec<String>,
     sources: Vec<String>,
 ) -> ConflictEvent {
-    warn!("routing rule conflict {:?} {:?}: {}", kind, layer, value);
+    warn!("routing rule conflict {:?}: {}", kind, value);
     ConflictEvent {
         timestamp: now(),
         kind,
         value,
-        layer,
         regions,
         sources,
     }
 }
 
-fn layer_label(layer: RuleLayer) -> &'static str {
-    match layer {
-        RuleLayer::Temporary => "temporary",
-        RuleLayer::Persistent => "persistent",
-        RuleLayer::Dns => "dns",
-    }
-}
-
 fn rules_match_ip(rules: &[IpNet], ip: &IpAddr) -> bool {
     rules.iter().any(|net| net.contains(ip))
-}
-
-fn decision_for_region(region: &str) -> RouteDecision {
-    if region.eq_ignore_ascii_case("direct") || region.eq_ignore_ascii_case("cn") {
-        RouteDecision::Direct
-    } else {
-        RouteDecision::Proxy
-    }
 }
 
 fn rules_match_domain(rules: &HashSet<String>, domain: &str) -> bool {
@@ -1408,24 +1430,14 @@ fn normalize_manual_decision(value: &str) -> Option<String> {
     }
 }
 
-fn compile_manual_ip_rules(rules: &[ManualIpRule]) -> Vec<CompiledManualIpRule> {
-    rules
-        .iter()
-        .filter_map(|rule| {
-            Some(CompiledManualIpRule {
-                net: parse_ip_net(&rule.cidr)?,
-                region: rule.region.clone(),
-            })
-        })
-        .collect()
-}
-
 fn set_manual_ip_rule_inner(inner: &mut RoutingInner, rule: ManualIpRule) -> io::Result<()> {
     inner.manual_ip_raw.retain(|existing| existing.cidr != rule.cidr);
     inner.manual_ip_raw.push(rule);
     inner.manual_ip_raw.sort_unstable_by(|a, b| a.cidr.cmp(&b.cidr));
     write_manual_ip_rules(&inner.rules_dir, &inner.manual_ip_raw)?;
-    inner.manual_ip = compile_manual_ip_rules(&inner.manual_ip_raw);
+    inner.manual_ip_modified = file_modified(&inner.rules_dir.join(MANUAL_IP_FILE))?;
+    apply_manual_ip_metadata(inner);
+    rebuild_conflicts(inner);
     Ok(())
 }
 
@@ -1436,8 +1448,74 @@ fn set_manual_domain_rule_inner(inner: &mut RoutingInner, rule: ManualDomainRule
     inner.manual_domain_raw.push(rule);
     inner.manual_domain_raw.sort_unstable_by(|a, b| a.domain.cmp(&b.domain));
     write_manual_domain_rules(&inner.rules_dir, &inner.manual_domain_raw)?;
-    inner.manual_domain = inner.manual_domain_raw.clone();
+    inner.manual_domain_modified = file_modified(&inner.rules_dir.join(MANUAL_DOMAIN_FILE))?;
+    apply_manual_domain_metadata(inner);
+    rebuild_conflicts(inner);
     Ok(())
+}
+
+fn apply_manual_ip_metadata(inner: &mut RoutingInner) {
+    for regions in inner.ip_regions.values_mut() {
+        regions.remove("direct");
+        regions.remove("bypass");
+    }
+    for sources in inner.ip_sources.values_mut() {
+        sources.remove(MANUAL_IP_FILE);
+    }
+
+    for rule in &inner.manual_ip_raw {
+        let Some(rule) = normalize_manual_ip_rule(rule.clone()) else {
+            continue;
+        };
+        inner
+            .ip_regions
+            .entry(rule.cidr.clone())
+            .or_default()
+            .insert(rule.region);
+        inner
+            .ip_sources
+            .entry(rule.cidr)
+            .or_default()
+            .insert(MANUAL_IP_FILE.to_owned());
+    }
+}
+
+fn apply_manual_domain_metadata(inner: &mut RoutingInner) {
+    for sources in inner.domain_sources.values_mut() {
+        sources.remove(MANUAL_DOMAIN_FILE);
+    }
+
+    let domain_sources = inner.domain_sources.clone();
+    inner.domain_regions.clear();
+    for (domain, sources) in domain_sources {
+        for source in sources {
+            inner
+                .domain_regions
+                .entry(domain.clone())
+                .or_default()
+                .insert(domain_region_for_source(&source).to_owned());
+        }
+    }
+
+    for rule in &inner.manual_domain_raw {
+        let Some(rule) = normalize_manual_domain_rule(rule.clone()) else {
+            continue;
+        };
+        inner
+            .domain_regions
+            .entry(rule.domain.clone())
+            .or_default()
+            .insert(rule.region);
+        inner
+            .domain_sources
+            .entry(rule.domain)
+            .or_default()
+            .insert(MANUAL_DOMAIN_FILE.to_owned());
+    }
+}
+
+fn domain_region_for_source(source: &str) -> &'static str {
+    if source == "gfw.txt" { "bypass" } else { "direct" }
 }
 
 fn read_lines(path: impl AsRef<Path>) -> io::Result<Vec<String>> {
@@ -1475,6 +1553,14 @@ fn ensure_file(path: impl AsRef<Path>) -> io::Result<()> {
         write_lines_atomic(path, &[])?;
     }
     Ok(())
+}
+
+fn file_modified(path: &Path) -> io::Result<Option<SystemTime>> {
+    match fs::metadata(path) {
+        Ok(metadata) => metadata.modified().map(Some),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 struct DownloadedSource {
@@ -1599,20 +1685,17 @@ fn parse_geoip_dat(
     source_name: &str,
     ip_regions: &mut HashMap<String, BTreeSet<String>>,
     ip_sources: &mut HashMap<String, BTreeSet<String>>,
-    text_output: Option<&Path>,
 ) -> io::Result<()> {
     let entries = read_len_fields(bytes, 1)?;
     if entries.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "empty geoip.dat"));
     }
-    let mut text_lines = Vec::new();
     for entry in entries {
         let country = read_string_fields(entry, 1)
             .into_iter()
             .next()
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let mut cidrs = Vec::new();
         for cidr in read_len_fields(entry, 2)? {
             let ip = read_bytes_fields(cidr, 1).into_iter().next().unwrap_or_default();
             let prefix = read_varint_fields(cidr, 2).into_iter().next().unwrap_or(0);
@@ -1631,14 +1714,7 @@ fn parse_geoip_dat(
                 .entry(cidr.clone())
                 .or_default()
                 .insert(source_name.to_owned());
-            cidrs.push(cidr);
         }
-        text_lines.push(format!("[{country}]"));
-        text_lines.extend(cidrs.iter().cloned());
-        text_lines.push(String::new());
-    }
-    if let Some(path) = text_output {
-        write_lines_atomic(path, &text_lines)?;
     }
     Ok(())
 }
@@ -1727,13 +1803,33 @@ fn record_domain_metadata(
 fn resolve_ip_rules(
     ip_regions: &mut HashMap<String, BTreeSet<String>>,
     ip_sources: &mut HashMap<String, BTreeSet<String>>,
-    manual_rules: &[ManualIpRule],
+    manual_rules: &mut Vec<ManualIpRule>,
 ) -> (Vec<String>, Vec<String>) {
-    let manual = manual_rules
+    let mut manual = manual_rules
         .iter()
         .filter_map(|rule| normalize_manual_ip_rule(rule.clone()))
         .map(|rule| (rule.cidr, rule.region))
         .collect::<HashMap<_, _>>();
+    let mut manual_changed = false;
+
+    for (cidr, regions) in ip_regions.iter() {
+        if manual.contains_key(cidr) {
+            continue;
+        }
+        let country_regions = country_regions(regions);
+        if country_regions.len() > 1 && country_regions.iter().any(|region| region.as_str() == "cn") {
+            manual.insert(cidr.clone(), "direct".to_owned());
+            manual_rules.push(ManualIpRule {
+                cidr: cidr.clone(),
+                region: "direct".to_owned(),
+            });
+            manual_changed = true;
+        }
+    }
+    if manual_changed {
+        manual_rules.sort_unstable_by(|a, b| a.cidr.cmp(&b.cidr));
+    }
+
     let mut direct = Vec::new();
     let mut bypass = Vec::new();
     let mut keys = ip_regions.keys().chain(manual.keys()).cloned().collect::<Vec<_>>();
@@ -1762,6 +1858,14 @@ fn resolve_ip_rules(
     (direct, bypass)
 }
 
+fn country_regions(regions: &BTreeSet<String>) -> Vec<String> {
+    regions
+        .iter()
+        .filter(|region| is_country_region(region))
+        .cloned()
+        .collect()
+}
+
 struct DomainResolution {
     direct_domain: Vec<String>,
     bypass_domain: Vec<String>,
@@ -1785,7 +1889,8 @@ fn resolve_domain_rules(
     let mut manual_changed = false;
 
     for domain in direct.intersection(&bypass) {
-        if manual_domain_decision(domain, &manual).is_none() {
+        if manual_domain_decision(domain, &manual).is_none() && has_high_priority_direct_source(domain, domain_sources)
+        {
             manual.insert(domain.clone(), "direct".to_owned());
             manual_rules.push(ManualDomainRule {
                 domain: domain.clone(),
@@ -1818,6 +1923,12 @@ fn resolve_domain_rules(
             } else {
                 bypass_domain.push(domain);
             }
+        } else if direct.contains(&domain) && bypass.contains(&domain) {
+            if has_high_priority_direct_source(&domain, domain_sources) {
+                direct_domain.push(domain);
+            } else {
+                bypass_domain.push(domain);
+            }
         } else if direct.contains(&domain) {
             direct_domain.push(domain);
         } else if bypass.contains(&domain) {
@@ -1841,6 +1952,14 @@ fn manual_domain_decision(domain: &str, manual: &HashMap<String, String>) -> Opt
         .iter()
         .find(|(rule, _)| domain_matches_rule(rule, domain))
         .map(|(_, region)| region.clone())
+}
+
+fn has_high_priority_direct_source(domain: &str, domain_sources: &HashMap<String, BTreeSet<String>>) -> bool {
+    domain_sources.get(domain).is_some_and(|sources| {
+        sources
+            .iter()
+            .any(|source| HIGH_PRIORITY_DIRECT_DOMAIN_SOURCES.contains(&source.as_str()))
+    })
 }
 
 fn read_len_fields(mut bytes: &[u8], field: u64) -> io::Result<Vec<&[u8]>> {
