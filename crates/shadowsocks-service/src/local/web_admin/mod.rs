@@ -1125,7 +1125,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       setSelect('dnsBind',dns.local_address||'0.0.0.0'); dnsPort.value=dns.local_port||1053;
       renderDnsList('dnsDomesticList',routeRules.domestic_dns||[(dns.local_dns_address||'223.5.5.5')+':'+(dns.local_dns_port||53)]);
       renderDnsList('dnsForeignList',routeRules.foreign_dns||[(dns.remote_dns_address||'8.8.8.8')+':'+(dns.remote_dns_port||53)]);
-      dnsCacheCapacity.value=routeRules.dns_cache_capacity||100000;
+      dnsCacheCapacity.value=routeRules.dns_cache_capacity||10000;
       dnsCacheTtl.value=routeRules.dns_cache_ttl_seconds||604800;
       dnsCacheRefreshEnabled.checked=routeRules.dns_cache_refresh_enabled!==false;
       dnsCacheRefreshBatch.value=routeRules.dns_cache_refresh_batch_size||500;
@@ -1147,7 +1147,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         }
       }
       let routeRules=Object.assign({},currentRawConfig.route_rules||{});
-      routeRules.dns_cache_capacity=num(dnsCacheCapacity.value,100000);
+      routeRules.dns_cache_capacity=num(dnsCacheCapacity.value,10000);
       routeRules.dns_cache_ttl_seconds=num(dnsCacheTtl.value,604800);
       routeRules.dns_cache_refresh_enabled=dnsCacheRefreshEnabled.checked;
       routeRules.dns_cache_refresh_batch_size=num(dnsCacheRefreshBatch.value,500);

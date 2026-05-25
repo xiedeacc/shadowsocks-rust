@@ -274,13 +274,25 @@ impl DnsTcpServer {
                 }
             };
 
-            tokio::spawn(Self::handle_tcp_stream(
-                self.client.clone(),
-                stream,
-                peer_addr,
-                self.local_addr.clone(),
-                self.remote_addr.clone(),
-            ));
+            let client = self.client.clone();
+            let local_addr = self.local_addr.clone();
+            let remote_addr = self.remote_addr.clone();
+            tokio::spawn(async move {
+                match time::timeout(
+                    Duration::from_secs(10),
+                    Self::handle_tcp_stream(client, stream, peer_addr, local_addr, remote_addr),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        error!("dns tcp {} failed, error: {}", peer_addr, err);
+                    }
+                    Err(..) => {
+                        error!("dns tcp {} lookup timed out after 10s", peer_addr);
+                    }
+                }
+            });
         }
     }
 
@@ -460,14 +472,33 @@ impl DnsUdpServer {
                 }
             };
 
-            tokio::spawn(Self::handle_udp_packet(
-                self.client.clone(),
-                self.listener.clone(),
-                peer_addr,
-                message,
-                self.local_addr.clone(),
-                self.remote_addr.clone(),
-            ));
+            let client = self.client.clone();
+            let listener = self.listener.clone();
+            let local_addr = self.local_addr.clone();
+            let remote_addr = self.remote_addr.clone();
+            tokio::spawn(async move {
+                match time::timeout(
+                    Duration::from_secs(10),
+                    Self::handle_udp_packet(
+                        client,
+                        listener,
+                        peer_addr,
+                        message,
+                        local_addr,
+                        remote_addr,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        error!("dns udp {} lookup failed, error: {}", peer_addr, err);
+                    }
+                    Err(..) => {
+                        error!("dns udp {} lookup timed out after 10s", peer_addr);
+                    }
+                }
+            });
         }
     }
 

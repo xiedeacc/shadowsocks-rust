@@ -115,6 +115,56 @@ function Install-TunRoutes {
             Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
         New-NetRoute -DestinationPrefix $hostPrefix -InterfaceIndex $defaultRoute.InterfaceIndex -NextHop $defaultRoute.NextHop -RouteMetric 1 -PolicyStore ActiveStore | Out-Null
     }
+
+    if ($defaultRoute.NextHop -and $defaultRoute.NextHop -ne "0.0.0.0") {
+        $gatewayPrefix = "$($defaultRoute.NextHop)/32"
+        Get-NetRoute -DestinationPrefix $gatewayPrefix -ErrorAction SilentlyContinue |
+            Where-Object { $_.InterfaceIndex -eq $defaultRoute.InterfaceIndex } |
+            Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+        New-NetRoute -DestinationPrefix $gatewayPrefix -InterfaceIndex $defaultRoute.InterfaceIndex -NextHop $defaultRoute.NextHop -RouteMetric 1 -PolicyStore ActiveStore | Out-Null
+    }
+}
+
+function Install-SshGitHubConfig {
+    $sshDir = Join-Path $env:USERPROFILE ".ssh"
+    New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+    $configPath = Join-Path $sshDir "config"
+    $marker = "# shadowsocks-rust deploy"
+    $block = @"
+$marker
+Host github.com
+    HostName ssh.github.com
+    Port 443
+    User git
+Host ssh.github.com
+    Port 443
+    User git
+"@
+    if (Test-Path -LiteralPath $configPath) {
+        $existing = Get-Content -Raw -LiteralPath $configPath
+        if ($existing -notmatch [regex]::Escape($marker)) {
+            Add-Content -LiteralPath $configPath -Value "`n$block"
+        }
+    } else {
+        Set-Content -LiteralPath $configPath -Value $block.TrimStart()
+    }
+}
+
+function Warn-DoubleTransparentProxy {
+    param([string]$ConfigPath)
+    $config = Get-Content -Raw -LiteralPath $ConfigPath | ConvertFrom-Json
+    $hasTun = @($config.locals | Where-Object { $_.protocol -eq "tun" }).Count -gt 0
+    if (-not $hasTun) { return }
+    $defaultRoute = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
+        Where-Object { $_.NextHop -ne "0.0.0.0" } |
+        Sort-Object RouteMetric, InterfaceMetric |
+        Select-Object -First 1
+    if ($defaultRoute -and $defaultRoute.NextHop -match '^192\.168\.') {
+        Write-Warning @"
+Windows TUN transparent proxy is enabled while the default gateway is $($defaultRoute.NextHop).
+If that router (e.g. OpenWrt) already runs transparent proxy, disable Windows TUN and use SOCKS 127.0.0.1:1080 instead to avoid routing loops and traffic storms.
+"@
+    }
 }
 
 Assert-Admin
@@ -177,7 +227,10 @@ if (-not $SkipService) {
 }
 
 if (-not $SkipRoutes) {
+    Warn-DoubleTransparentProxy -ConfigPath $ConfigDest
     Install-TunRoutes -ConfigPath $ConfigDest -TunName "shadowsocks-tun"
 }
+
+Install-SshGitHubConfig
 
 Write-Host "Deployed shadowsocks-rust to $InstallDir"

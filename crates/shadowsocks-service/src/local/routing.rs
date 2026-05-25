@@ -100,7 +100,7 @@ pub struct RoutingSources {
 }
 
 fn default_dns_cache_capacity() -> usize {
-    100_000
+    10_000
 }
 
 fn default_dns_cache_ttl_seconds() -> u64 {
@@ -1204,7 +1204,11 @@ impl RoutingState {
         if !matches!(inner.sources.dns_intercept_mode.as_str(), "tun" | "both") {
             return None;
         }
-        let ip = inner.sources.dns_listen_address.parse::<IpAddr>().ok()?;
+        let ip = match inner.sources.dns_listen_address.parse::<IpAddr>().ok()? {
+            IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ip => ip,
+        };
         Some(SocketAddr::new(ip, inner.sources.dns_listen_port))
     }
 

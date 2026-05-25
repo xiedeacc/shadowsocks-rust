@@ -472,13 +472,18 @@ impl TcpTun {
                             socket_set.remove(socket_handle);
                         }
 
-                        if !device.recv_available() {
-                            let next_duration = iface
-                                .poll_delay(before_poll, &socket_set)
-                                .unwrap_or(SmolDuration::from_millis(5));
-                            if next_duration != SmolDuration::ZERO {
-                                thread::park_timeout(Duration::from(next_duration));
-                            }
+                        // Always yield: when recv_available() stays true under packet floods the
+                        // previous branch skipped park_timeout entirely and pinned one CPU core.
+                        let mut next_duration = iface
+                            .poll_delay(before_poll, &socket_set)
+                            .unwrap_or(SmolDuration::from_millis(5));
+                        if device.recv_available() {
+                            next_duration = next_duration.min(SmolDuration::from_millis(1));
+                        }
+                        if next_duration > SmolDuration::ZERO {
+                            thread::park_timeout(Duration::from(next_duration));
+                        } else {
+                            thread::park_timeout(Duration::from_micros(500));
                         }
                     }
 

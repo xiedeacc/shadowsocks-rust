@@ -235,15 +235,14 @@ impl Tun {
                 // tun device
                 n = self.device.read(&mut packet_buffer) => {
                     let n = n?;
-
-                    let mut packet_buffer = mem::replace(&mut packet_buffer, create_packet_buffer());
                     unsafe {
                         packet_buffer.set_len(n);
                     }
 
                     trace!("[TUN] received IP packet {:?}", ByteStr::new(&packet_buffer));
 
-                    if let Err(err) = self.handle_tun_frame(&address_broadcast, packet_buffer).await {
+                    let frame = mem::replace(&mut packet_buffer, create_packet_buffer());
+                    if let Err(err) = self.handle_tun_frame(&address_broadcast, frame).await {
                         error!("[TUN] handle IP frame failed, error: {}", err);
                     }
                 }
@@ -503,6 +502,13 @@ foreach ($routeIp in @({route_ips})) {{
         Where-Object {{ $_.InterfaceIndex -eq $defaultRoute.InterfaceIndex }} |
         Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
     New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $defaultRoute.InterfaceIndex -NextHop $defaultRoute.NextHop -RouteMetric 1 -PolicyStore ActiveStore | Out-Null
+}}
+if ($defaultRoute.NextHop -and $defaultRoute.NextHop -ne '0.0.0.0') {{
+    $gatewayPrefix = "$($defaultRoute.NextHop)/32"
+    Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $gatewayPrefix -ErrorAction SilentlyContinue |
+        Where-Object {{ $_.InterfaceIndex -eq $defaultRoute.InterfaceIndex }} |
+        Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    New-NetRoute -DestinationPrefix $gatewayPrefix -InterfaceIndex $defaultRoute.InterfaceIndex -NextHop $defaultRoute.NextHop -RouteMetric 1 -PolicyStore ActiveStore | Out-Null
 }}
 "#,
         tun_name = powershell_quote(tun_name),
