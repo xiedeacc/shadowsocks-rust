@@ -8,6 +8,7 @@ target
 /debian/*.log
 /.vscode
 /*.json
+shadowsocks-client.json
 /restart.sh
 /udp_echo_server.py
 /.idea
