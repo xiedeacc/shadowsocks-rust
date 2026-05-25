@@ -720,9 +720,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .conflict-table td{word-break:break-word}
     pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto}
     .tab{display:none;height:calc(100vh - 88px);min-height:0;overflow:hidden}.tab.active{display:block}
-    #basic.tab.active,#dns.tab.active,#routeConfig.tab.active,#sys.tab.active{display:flex;flex-direction:column}
+    #basic.tab.active,#connections.tab.active,#dns.tab.active,#routeConfig.tab.active,#sys.tab.active{display:flex;flex-direction:column}
     .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
-    .activity-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:16px;align-items:stretch;height:100%;min-height:0}
+    .activity-toolbar{display:flex;align-items:center;margin:0 0 8px}
+    .activity-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:16px;align-items:stretch;flex:1;min-height:0}
     .activity-card{min-width:0;min-height:0;display:flex;flex-direction:column}
     .basic-layout{display:grid;grid-template-columns:minmax(380px,540px) 1fr;gap:18px;align-items:stretch;height:calc(100% - 46px);min-height:0}
     .basic-form-panel{overflow:auto;min-height:0}
@@ -875,9 +876,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
   </section>
 
   <section id="connections" class="tab">
+    <div class="activity-toolbar">
+      <label class="inline-check"><input id="activityRecord" type="checkbox" checked onchange="if(this.checked)refresh('connections')"> Record</label>
+    </div>
     <div class="activity-grid">
       <div class="activity-card">
-        <h3 class="card-title">Recent DNS <label class="inline-check"><input id="recentDnsRecord" type="checkbox" checked> Record</label></h3>
+        <h3 class="card-title">Recent DNS</h3>
         <div id="dnsOut" class="scroll-panel section-scroll"></div>
       </div>
       <div class="activity-card">
@@ -1164,10 +1168,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       document.getElementById(id).innerHTML=table(rows,cols,'conflict-table')
     }
+    function activityRecording(){let el=document.getElementById('activityRecord');return !el||el.checked}
     async function renderConnections(){let rows=await api('/api/activity/connections');connOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Source',r=>r.source_ip+':'+r.source_port],['Destination',r=>(r.destination_ip||r.destination_domain)+':'+r.destination_port],['Domain',r=>r.domain||'-'],['Protocol',r=>r.protocol],['Decision',r=>r.decision]])}
     async function renderUnhitIp(){let rows=await api('/api/activity/unhit-ip');unhitIpOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['IP',r=>r.ip]])}
     async function renderUnhitDns(){let rows=await api('/api/activity/unhit-dns');unhitDnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>r.domain]])}
-    async function renderDns(){if(recentDnsRecord&&!recentDnsRecord.checked)return;let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']])}
+    async function renderDns(){let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']])}
     async function renderRouteConflicts(){await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip')}
     async function renderSys(){let s=await api('/api/sys/status');let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);sysStatusOut.innerHTML=`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p><p><strong>Ubuntu install command:</strong></p><pre>${s.install_command}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}<h3 class="card-title">direct_ip.txt / bypass_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / bypass_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
     async function debugUrlCheck(){let url=debugUrl.value.trim();if(!url){debugUrlOut.innerHTML='<p class="hint">Enter a URL first</p>';return}debugUrlOut.innerHTML='<p class="hint">Running debug, timeout 6s...</p>';let r=await api('/api/sys/debug-url',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url})});debugUrlOut.innerHTML=table([r],[['URL',x=>x.url],['Bypass Domain',x=>x.bypass_domain?'yes':'no'],['DNS Intercepted',x=>x.dns_intercepted?'yes':'no'],['DNS Cache',x=>x.dns_cache_hit?'hit':'miss'],['Resolved IPs',x=>(x.resolved_ips||[]).join('<br>')||'-'],['Transparent Port',x=>x.transparent_port_received?'received':'not received'],['Response',x=>x.response_received?'received':'none'],['HTTP',x=>x.http_code||'-'],['Error',x=>x.curl_error||'-']])}
@@ -1179,7 +1184,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function queryDnsCacheIp(){await renderDnsCacheStats();let ip=dnsQueryIp.value.trim();if(!ip){dnsCacheOut.innerHTML='<p class="hint">Enter an IP</p>';return}let rows=await api('/api/dns/cache/query-ip?ip='+encodeURIComponent(ip));dnsCacheOut.innerHTML=table(rows,[['IP',r=>r.ip],['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Expires',r=>fmtTime(r.expires_at)]])}
     async function clearDnsDomain(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheMessage.textContent='Enter a domain first';return}let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({domain})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';await queryDnsCache()}
     async function clearDnsAll(){let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';dnsCacheOut.innerHTML='';await renderDnsCacheStats()}
-    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='dns')await renderDnsCacheStats();if(id==='routeConfig'){await loadRules();await renderRouteConflicts()}if(id==='sys')await renderSys();if(id==='connections'){await renderDns();await renderConnections();await renderUnhitDns();await renderUnhitIp()}}catch(e){alert(e.message)}}
+    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='dns')await renderDnsCacheStats();if(id==='routeConfig'){await loadRules();await renderRouteConflicts()}if(id==='sys')await renderSys();if(id==='connections'){if(!activityRecording())return;await renderDns();await renderConnections();await renderUnhitDns();await renderUnhitIp()}}catch(e){alert(e.message)}}
     document.querySelector("nav button[data-tab=\"basic\"]").classList.add('active');
     window.addEventListener('resize',updateNavIndicator);
     requestAnimationFrame(updateNavIndicator);
