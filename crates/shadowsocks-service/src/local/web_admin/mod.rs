@@ -96,7 +96,11 @@ struct WebAdminHandler {
 }
 
 impl WebAdminHandler {
-    async fn serve(self: Arc<Self>, req: Request<Incoming>, peer_addr: SocketAddr) -> Result<Response<ResponseBody>, Infallible> {
+    async fn serve(
+        self: Arc<Self>,
+        req: Request<Incoming>,
+        peer_addr: SocketAddr,
+    ) -> Result<Response<ResponseBody>, Infallible> {
         Ok(match self.handle(req, peer_addr).await {
             Ok(resp) => resp,
             Err(err) => json_response(
@@ -316,13 +320,21 @@ impl WebAdminHandler {
                 StatusCode::OK,
                 &self.routing_state.domain_conflicts().await,
             )),
-            (Method::GET, "/api/activity/connections") => {
-                Ok(json_response(StatusCode::OK, &self.routing_state.recent_connections(&self.server_filters()).await))
-            }
-            (Method::GET, "/api/activity/unhit-ip") => Ok(json_response(
+            (Method::GET, "/api/activity/connections") => Ok(json_response(
                 StatusCode::OK,
-                &self.routing_state.recent_unhit_ips().await,
+                &self.routing_state.recent_connections(&self.server_filters()).await,
             )),
+            (Method::GET, "/api/activity/unhit-ip") => {
+                let server_filters = self.server_filters();
+                let rows = self
+                    .routing_state
+                    .recent_unhit_ips()
+                    .await
+                    .into_iter()
+                    .filter(|event| !server_filters.iter().any(|ip| *ip == event.ip))
+                    .collect::<Vec<_>>();
+                Ok(json_response(StatusCode::OK, &rows))
+            }
             (Method::GET, "/api/activity/unhit-dns") => Ok(json_response(
                 StatusCode::OK,
                 &self.routing_state.recent_unhit_domains().await,
@@ -450,9 +462,7 @@ impl WebAdminHandler {
             .and_then(|servers| servers.as_array())
             .into_iter()
             .flatten()
-            .filter_map(|server| {
-                server.get("server")?.as_str()?.parse::<IpAddr>().ok()
-            })
+            .filter_map(|server| server.get("server")?.as_str()?.parse::<IpAddr>().ok())
             .collect()
     }
 }
@@ -515,8 +525,14 @@ fn restart_service_after_response() {
             log::warn!("failed to restart ssservice after config save: {}", err);
         }
         #[cfg(not(windows))]
-        if let Err(err) = Command::new("systemctl").args(["restart", "shadowsocks-client.service"]).status() {
-            log::warn!("failed to restart shadowsocks-client.service after config save: {}", err);
+        if let Err(err) = Command::new("systemctl")
+            .args(["restart", "shadowsocks-client.service"])
+            .status()
+        {
+            log::warn!(
+                "failed to restart shadowsocks-client.service after config save: {}",
+                err
+            );
         }
     });
 }
@@ -538,11 +554,7 @@ fn service_name() -> &'static str {
 }
 
 fn transparent_backend() -> &'static str {
-    if cfg!(windows) {
-        "tun"
-    } else {
-        "redir"
-    }
+    if cfg!(windows) { "tun" } else { "redir" }
 }
 
 #[cfg(target_os = "linux")]
@@ -594,7 +606,12 @@ fn system_status() -> serde_json::Value {
         .output();
     let tun_adapter_status = adapter_output
         .ok()
-        .and_then(|output| output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+        .and_then(|output| {
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        })
         .filter(|status| !status.is_empty());
     serde_json::json!({
         "platform": "windows",
@@ -658,7 +675,9 @@ fn debug_url_host(url: &str) -> io::Result<String> {
 }
 
 fn domain_matches_debug_host(domain: &str, host: &str) -> bool {
-    domain.trim_end_matches('.').eq_ignore_ascii_case(host.trim_end_matches('.'))
+    domain
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case(host.trim_end_matches('.'))
 }
 
 fn run_debug_curl(url: &str) -> io::Result<DebugCurlResult> {

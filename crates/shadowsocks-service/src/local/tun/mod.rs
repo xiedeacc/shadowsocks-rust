@@ -2,6 +2,8 @@
 
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 use std::{
     io, mem,
     net::{IpAddr, SocketAddr},
@@ -13,7 +15,7 @@ use byte_string::ByteStr;
 use cfg_if::cfg_if;
 use ipnet::IpNet;
 use log::{debug, error, info, trace, warn};
-use shadowsocks::config::Mode;
+use shadowsocks::config::{Mode, ServerAddr};
 use smoltcp::wire::{IpProtocol, TcpPacket, UdpPacket};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -128,15 +130,29 @@ impl TunBuilder {
             self.udp_capacity,
         );
 
-        let tcp = TcpTun::new(self.context, self.balancer, device.mtu().unwrap_or(1500) as u32);
+        #[cfg(windows)]
+        let bypass_route_ips = self
+            .balancer
+            .servers()
+            .filter_map(|server| match server.server_config().addr() {
+                ServerAddr::SocketAddr(addr) => Some(addr.ip()),
+                ServerAddr::DomainName(..) => None,
+            })
+            .collect();
+
+        let tcp = TcpTun::new(self.context.clone(), self.balancer, device.mtu().unwrap_or(1500) as u32);
 
         Ok(Tun {
             device,
             tcp,
             udp,
+            #[cfg(windows)]
+            context: self.context,
             udp_cleanup_interval,
             udp_keepalive_rx,
             mode: self.mode,
+            #[cfg(windows)]
+            bypass_route_ips,
         })
     }
 }
@@ -146,9 +162,13 @@ pub struct Tun {
     device: AsyncDevice,
     tcp: TcpTun,
     udp: UdpTun,
+    #[cfg(windows)]
+    context: Arc<ServiceContext>,
     udp_cleanup_interval: Duration,
     udp_keepalive_rx: mpsc::Receiver<SocketAddr>,
     mode: Mode,
+    #[cfg(windows)]
+    bypass_route_ips: Vec<IpAddr>,
 }
 
 impl Tun {
@@ -188,6 +208,13 @@ impl Tun {
             "[TUN] tun device network: {} (address: {}, netmask: {})",
             address_net, address, netmask
         );
+
+        #[cfg(windows)]
+        if let Ok(name) = self.device.tun_name()
+            && let Err(err) = install_windows_bypass_routes(&name, &self.windows_bypass_route_ips().await)
+        {
+            warn!("[TUN] failed to install Windows bypass routes: {}", err);
+        }
 
         let address_broadcast = address_net.broadcast();
 
@@ -394,4 +421,111 @@ impl Tun {
 
         Ok(())
     }
+
+    #[cfg(windows)]
+    async fn windows_bypass_route_ips(&self) -> Vec<IpAddr> {
+        let mut route_ips = self.bypass_route_ips.clone();
+        #[cfg(feature = "local-web-admin")]
+        if let Some(routing_state) = self.context.routing_state() {
+            for dns in routing_state
+                .domestic_dns()
+                .await
+                .into_iter()
+                .chain(routing_state.foreign_dns().await)
+            {
+                if let Some(ip) = parse_dns_server_ip(&dns) {
+                    route_ips.push(ip);
+                }
+            }
+        }
+        route_ips.sort_unstable();
+        route_ips.dedup();
+        route_ips
+    }
+}
+
+#[cfg(windows)]
+fn parse_dns_server_ip(value: &str) -> Option<IpAddr> {
+    let value = value.trim();
+    if let Ok(addr) = value.parse::<IpAddr>() {
+        return Some(addr);
+    }
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Some(addr.ip());
+    }
+    let host = value.rsplit_once(':').map_or(value, |(host, _)| host);
+    host.trim_matches(['[', ']']).parse::<IpAddr>().ok()
+}
+
+#[cfg(windows)]
+fn install_windows_bypass_routes(tun_name: &str, server_ips: &[IpAddr]) -> io::Result<()> {
+    let route_ips = server_ips
+        .iter()
+        .filter(|ip| ip.is_ipv4())
+        .map(|ip| format!("'{}'", ip))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$tunName = {tun_name}
+$adapter = Get-NetAdapter -Name $tunName -ErrorAction Stop
+$defaultRoute = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.InterfaceIndex -ne $adapter.ifIndex -and $_.NextHop -ne '0.0.0.0' }} |
+    Sort-Object RouteMetric, InterfaceMetric |
+    Select-Object -First 1
+if (-not $defaultRoute) {{ throw 'physical default route was not found' }}
+Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.InterfaceIndex -eq $adapter.ifIndex }} |
+    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+foreach ($prefix in @('10.0.0.0/8','100.64.0.0/10','169.254.0.0/16','172.16.0.0/12','192.168.0.0/16','198.18.0.0/15')) {{
+    Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $prefix -ErrorAction SilentlyContinue |
+        Where-Object {{ $_.InterfaceIndex -eq $defaultRoute.InterfaceIndex }} |
+        Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $defaultRoute.InterfaceIndex -NextHop $defaultRoute.NextHop -RouteMetric 1 -PolicyStore ActiveStore | Out-Null
+}}
+$defaultRouteV6 = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.InterfaceIndex -ne $adapter.ifIndex }} |
+    Sort-Object RouteMetric, InterfaceMetric |
+    Select-Object -First 1
+if ($defaultRouteV6) {{
+    foreach ($prefix in @('fc00::/7','fe80::/10')) {{
+        Get-NetRoute -AddressFamily IPv6 -DestinationPrefix $prefix -ErrorAction SilentlyContinue |
+            Where-Object {{ $_.InterfaceIndex -eq $defaultRouteV6.InterfaceIndex }} |
+            Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+        New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $defaultRouteV6.InterfaceIndex -NextHop $defaultRouteV6.NextHop -RouteMetric 1 -PolicyStore ActiveStore | Out-Null
+    }}
+}}
+foreach ($routeIp in @({route_ips})) {{
+    if (-not $routeIp) {{ continue }}
+    $prefix = "$routeIp/32"
+    Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $prefix -ErrorAction SilentlyContinue |
+        Where-Object {{ $_.InterfaceIndex -eq $defaultRoute.InterfaceIndex }} |
+        Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $defaultRoute.InterfaceIndex -NextHop $defaultRoute.NextHop -RouteMetric 1 -PolicyStore ActiveStore | Out-Null
+}}
+"#,
+        tun_name = powershell_quote(tun_name),
+        route_ips = route_ips,
+    );
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .stdin(Stdio::null())
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(io::Error::other(if stderr.is_empty() {
+            format!("powershell exited with {}", output.status)
+        } else {
+            stderr
+        }))
+    }
+}
+
+#[cfg(windows)]
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }

@@ -38,14 +38,20 @@ const DEFAULT_WINDOW: Duration = Duration::from_secs(300);
 const BYPASS_IP_PERSIST_DELAY: Duration = Duration::from_secs(30);
 const DNS_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const CONNECTION_ACTIVITY_TTL: Duration = Duration::from_secs(10);
-const PRIVATE_DIRECT_IP_RULES: [&str; 7] = [
+const PRIVATE_DIRECT_IP_RULES: [&str; 13] = [
+    "0.0.0.0/8",
     "127.0.0.0/8",
     "10.0.0.0/8",
+    "100.64.0.0/10",
+    "169.254.0.0/16",
     "172.16.0.0/12",
     "192.168.0.0/16",
+    "198.18.0.0/15",
+    "::/128",
     "::1/128",
     "fc00::/7",
     "fe80::/10",
+    "ff00::/8",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -1206,15 +1212,7 @@ impl RoutingState {
     pub async fn sync_persistent_ip_rules_to_firewall(&self) -> io::Result<()> {
         let (rules_dir, bypass) = {
             let inner = self.inner.read().await;
-            (
-                inner.rules_dir.clone(),
-                inner
-                    .persistent_raw
-                    .bypass_ip
-                    .iter()
-                    .filter_map(|rule| parse_ip_net(rule))
-                    .collect::<Vec<_>>(),
-            )
+            (inner.rules_dir.clone(), persistent_nft_bypass_nets(&inner))
         };
         crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &[], &bypass)
     }
@@ -2210,6 +2208,14 @@ fn validate_temporary_rules(lists: &RuleLists) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "local-dns"))]
+fn persistent_nft_bypass_nets(inner: &RoutingInner) -> Vec<IpNet> {
+    let direct = &inner.persistent.direct_ip;
+    let mut bypass = inner.persistent.bypass_ip.clone();
+    bypass.retain(|net| !direct.iter().any(|direct| ip_nets_overlap(direct, net)));
+    bypass
 }
 
 #[cfg(all(target_os = "linux", feature = "local-dns"))]

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     io, mem,
     net::{IpAddr, SocketAddr},
@@ -7,6 +7,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        Mutex as StdMutex,
     },
     task::{Context, Poll, Waker},
     thread::{self, JoinHandle, Thread},
@@ -41,9 +42,9 @@ use crate::{
 
 use super::virt_device::{TokenBuffer, VirtTunDevice};
 
-// NOTE: Default buffer could contain 5 AEAD packets
-const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = (0x3FFFu32 * 5).next_power_of_two();
-const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = (0x3FFFu32 * 5).next_power_of_two();
+const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 16 * 1024;
+const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 16 * 1024;
+const MAX_ACTIVE_TCP_CONNECTIONS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TcpSocketState {
@@ -242,6 +243,7 @@ pub struct TcpTun {
     manager_socket_creation_tx: mpsc::UnboundedSender<TcpSocketCreation>,
     manager_running: Arc<AtomicBool>,
     balancer: PingBalancer,
+    active_connections: Arc<StdMutex<HashSet<(SocketAddr, SocketAddr)>>>,
     iface_rx: mpsc::UnboundedReceiver<TokenBuffer>,
     iface_tx: mpsc::UnboundedSender<TokenBuffer>,
     iface_tx_avail: Arc<AtomicBool>,
@@ -494,6 +496,7 @@ impl TcpTun {
             manager_socket_creation_tx,
             manager_running,
             balancer,
+            active_connections: Arc::new(StdMutex::new(HashSet::new())),
             iface_rx,
             iface_tx,
             iface_tx_avail,
@@ -508,6 +511,24 @@ impl TcpTun {
     ) -> io::Result<()> {
         // TCP first handshake packet, create a new Connection
         if tcp_packet.syn() && !tcp_packet.ack() {
+            let connection_key = (src_addr, dst_addr);
+            {
+                let mut active_connections = self.active_connections.lock().expect("active_connections poisoned");
+                if active_connections.len() >= MAX_ACTIVE_TCP_CONNECTIONS {
+                    debug!(
+                        "too many active TUN TCP connections ({}), dropping SYN for {} <-> {}",
+                        active_connections.len(),
+                        src_addr,
+                        dst_addr
+                    );
+                    return Ok(());
+                }
+                if !active_connections.insert(connection_key) {
+                    trace!("duplicated TCP SYN for {} <-> {}, ignoring", src_addr, dst_addr);
+                    return Ok(());
+                }
+            }
+
             let accept_opts = self.context.accept_opts();
 
             let send_buffer_size = accept_opts.tcp.send_buffer_size.unwrap_or(DEFAULT_TCP_SEND_BUFFER_SIZE);
@@ -518,14 +539,17 @@ impl TcpTun {
                 TcpSocketBuffer::new(vec![0u8; send_buffer_size as usize]),
             );
             socket.set_keep_alive(accept_opts.tcp.keepalive.map(From::from));
-            // FIXME: It should follow system's setting. 7200 is Linux's default.
-            socket.set_timeout(Some(SmolDuration::from_secs(7200)));
+            socket.set_timeout(Some(SmolDuration::from_secs(120)));
             // NO ACK delay
             // socket.set_ack_delay(None);
             // Enable Cubic congestion control
             socket.set_congestion_control(CongestionControl::Cubic);
 
             if let Err(err) = socket.listen(dst_addr) {
+                self.active_connections
+                    .lock()
+                    .expect("active_connections poisoned")
+                    .remove(&connection_key);
                 return Err(io::Error::other(format!("listen error: {:?}", err)));
             }
 
@@ -541,11 +565,16 @@ impl TcpTun {
             // establish a tunnel
             let context = self.context.clone();
             let balancer = self.balancer.clone();
+            let active_connections = self.active_connections.clone();
             tokio::spawn(async move {
                 let connection = connection.await;
                 if let Err(err) = handle_redir_client(context, balancer, connection, src_addr, dst_addr).await {
                     error!("TCP tunnel failure, {} <-> {}, error: {}", src_addr, dst_addr, err);
                 }
+                active_connections
+                    .lock()
+                    .expect("active_connections poisoned")
+                    .remove(&connection_key);
             });
         }
 

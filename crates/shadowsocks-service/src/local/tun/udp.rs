@@ -1,6 +1,6 @@
 use std::{
     io::{self, ErrorKind},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
@@ -93,6 +93,15 @@ impl UdpTun {
         let bind_addr = match dns_listener_addr {
             SocketAddr::V4(..) => "0.0.0.0:0",
             SocketAddr::V6(..) => "[::]:0",
+        };
+        let dns_listener_addr = match dns_listener_addr {
+            SocketAddr::V4(addr) if addr.ip().is_unspecified() => {
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+            }
+            SocketAddr::V6(addr) if addr.ip().is_unspecified() => {
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), addr.port())
+            }
+            addr => addr,
         };
         let socket = UdpSocket::bind(bind_addr).await?;
         socket.send_to(payload, dns_listener_addr).await?;

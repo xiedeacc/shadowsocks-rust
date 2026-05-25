@@ -1,6 +1,8 @@
 //! Shadowsocks Local Server
 
-use std::{io, net::{IpAddr, SocketAddr}, sync::Arc, time::Duration};
+#[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
+use std::net::IpAddr;
+use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::future;
 use log::trace;
