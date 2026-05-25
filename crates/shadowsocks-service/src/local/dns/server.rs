@@ -477,6 +477,14 @@ impl DnsUdpServer {
         local_addr: Arc<NameServerAddr>,
         remote_addr: Arc<Address>,
     ) -> io::Result<()> {
+        if let Some(query) = message.queries.first() {
+            info!(
+                "dns udp query from {}: {:?} {}",
+                peer_addr,
+                query.query_type(),
+                query.name()
+            );
+        }
         let respond_message = match client.resolve(message, &local_addr, &remote_addr).await {
             Ok(m) => m,
             Err(err) => {
@@ -490,6 +498,7 @@ impl DnsUdpServer {
             Err(err) => return Err(io::Error::new(io::ErrorKind::Other, err)),
         };
         listener.send_to(&buf, peer_addr).await?;
+        info!("dns udp response sent to {} ({} bytes)", peer_addr, buf.len());
 
         Ok(())
     }
@@ -849,9 +858,19 @@ impl DnsClient {
                 let query_type = query.query_type().to_string();
                 if let Some(cached) = routing_state.dns_cache_lookup(&domain, &query_type, decision).await {
                     let ips = collect_answer_ips(&cached);
+                    info!(
+                        "dns route cache hit {} {:?}: resolver={:?}, results={:?}",
+                        domain, query.query_type(), decision, ips
+                    );
                     routing_state.record_dns(domain, query_type, ips, decision).await;
                     return (Ok(cached), matches!(decision, RouteDecision::Proxy));
                 }
+                info!(
+                    "dns route match {} {:?}: resolver={:?}",
+                    domain,
+                    query.query_type(),
+                    decision
+                );
                 let response = match decision {
                     RouteDecision::Direct => {
                         let local_addr = match routing_state
@@ -880,6 +899,13 @@ impl DnsClient {
                 };
                 if let Ok(ref msg) = response {
                     let ips = collect_answer_ips(msg);
+                    info!(
+                        "dns route result {} {:?}: resolver={:?}, results={:?}",
+                        domain,
+                        query.query_type(),
+                        decision,
+                        ips
+                    );
                     routing_state
                         .dns_cache_insert(&domain, &query_type, decision, msg.clone(), ips.clone())
                         .await;

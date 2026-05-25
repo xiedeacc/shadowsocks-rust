@@ -266,7 +266,7 @@ impl WebAdminHandler {
             )),
             (Method::PUT, "/api/temp-rules") => {
                 let rules: RuleLists = read_json(req).await?;
-                self.routing_state.set_temporary_rules(rules).await;
+                self.routing_state.set_temporary_rules(rules).await?;
                 Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
             }
             (Method::GET, "/api/manual-ip") => Ok(json_response(
@@ -317,6 +317,8 @@ impl WebAdminHandler {
             (Method::GET, "/api/activity/dns") => {
                 Ok(json_response(StatusCode::OK, &self.routing_state.recent_dns().await))
             }
+            (Method::GET, "/api/sys/status") => Ok(json_response(StatusCode::OK, &self.sys_status().await)),
+            (Method::GET, "/api/log/status") => Ok(json_response(StatusCode::OK, &self.sys_status().await)),
             _ => Ok(json_response(
                 StatusCode::NOT_FOUND,
                 &serde_json::json!({ "error": "not found" }),
@@ -341,6 +343,16 @@ impl WebAdminHandler {
             .query()
             .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
             .is_some_and(|token| token == expected)
+    }
+
+    async fn sys_status(&self) -> serde_json::Value {
+        let (ip_conflicts, domain_conflicts) = self.routing_state.direct_bypass_file_conflicts().await;
+        let mut status = nft_status();
+        if let Some(object) = status.as_object_mut() {
+            object.insert("ip_conflicts".to_owned(), serde_json::json!(ip_conflicts));
+            object.insert("domain_conflicts".to_owned(), serde_json::json!(domain_conflicts));
+        }
+        status
     }
 }
 
@@ -375,6 +387,39 @@ fn restart_service_after_response() {
             log::warn!("failed to restart shadowsocks-client.service after config save: {}", err);
         }
     });
+}
+
+fn nft_status() -> serde_json::Value {
+    let install_command = "sudo apt update && sudo apt install -y nftables";
+    match Command::new("nft").arg("--version").output() {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let table_ok = Command::new("nft")
+                .args(["list", "table", "inet", "ssrust_dns"])
+                .status()
+                .is_ok_and(|status| status.success());
+            serde_json::json!({
+                "nft_installed": true,
+                "nft_version": version,
+                "dns_table_installed": table_ok,
+                "install_command": install_command,
+            })
+        }
+        Ok(output) => serde_json::json!({
+            "nft_installed": false,
+            "nft_version": "",
+            "dns_table_installed": false,
+            "install_command": install_command,
+            "error": String::from_utf8_lossy(&output.stderr).trim(),
+        }),
+        Err(err) => serde_json::json!({
+            "nft_installed": false,
+            "nft_version": "",
+            "dns_table_installed": false,
+            "install_command": install_command,
+            "error": err.to_string(),
+        }),
+    }
 }
 
 fn query_param(query: Option<&str>, name: &str) -> Option<String> {
@@ -477,7 +522,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .conflict-table td{word-break:break-word}
     pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto}
     .tab{display:none;height:calc(100vh - 88px);min-height:0;overflow:hidden}.tab.active{display:block}
-    #basic.tab.active,#dns.tab.active,#routeConfig.tab.active{display:flex;flex-direction:column}
+    #basic.tab.active,#dns.tab.active,#routeConfig.tab.active,#sys.tab.active{display:flex;flex-direction:column}
     .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
     .activity-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:16px;align-items:stretch;height:100%;min-height:0}
     .activity-card{min-width:0;min-height:0;display:flex;flex-direction:column}
@@ -502,6 +547,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .temporary-panel textarea{flex:1;min-height:0}
     .dns-layout{display:grid;grid-template-columns:minmax(320px,420px) 1fr;gap:18px;min-height:0;flex:1}
     .dns-panel{min-height:0;overflow:auto}
+    .sys-layout{min-height:0;flex:1;overflow:auto}
+    .status-ok{color:#18864b;font-weight:700}
+    .status-warn{color:#b15d00;font-weight:700}
     .form-line{display:grid;grid-template-columns:150px 1fr;gap:10px;align-items:center;margin:4px 0}
     .form-line label{margin:0;font-size:13px}
     .form-line input[type=checkbox]{width:16px;height:16px;margin:0;justify-self:start}
@@ -531,6 +579,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <button data-tab="connections" onclick="show('connections')">Connections</button>
       <button data-tab="dns" onclick="show('dns')">DNS</button>
       <button data-tab="routeConfig" onclick="show('routeConfig')">Route</button>
+      <button data-tab="sys" onclick="show('sys')">Sys</button>
     </div>
   </nav>
 
@@ -686,6 +735,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <button onclick="downloadRules()">Download</button>
       <button onclick="generateRules()">Generate</button>
       <p class="hint">Manual selections and manual_domain.txt/manual_ip.txt changes take effect after Generate.</p>
+    </div>
+  </section>
+
+  <section id="sys" class="tab">
+    <div class="panel sys-layout">
+      <h3 class="card-title">System Checks</h3>
+      <div id="sysStatusOut"></div>
     </div>
   </section>
 
@@ -889,11 +945,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function renderUnhitDns(){let rows=await api('/api/activity/unhit-dns');unhitDnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>r.domain]])}
     async function renderDns(){let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>r.domain],['Type',r=>r.query_type],['Results',r=>(r.results||[]).join('<br>')],['Resolver',r=>r.resolver]])}
     async function renderRouteConflicts(){await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip')}
+    async function renderSys(){let s=await api('/api/sys/status');let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);sysStatusOut.innerHTML=`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p><p><strong>Ubuntu install command:</strong></p><pre>${s.install_command}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}<h3 class="card-title">direct_ip.txt / bypass_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / bypass_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
     async function renderDnsCacheStats(){let s=await api('/api/dns/cache/stats');dnsCacheSize.textContent=s.size;dnsCacheCapacityOut.textContent=s.capacity;dnsCacheTtlOut.textContent=s.ttl_seconds}
     async function queryDnsCache(){await renderDnsCacheStats();let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheOut.innerHTML='<p class="hint">Enter a domain</p>';return}let rows=await api('/api/dns/cache/query?domain='+encodeURIComponent(domain));let type=dnsQueryType.value;rows=rows.filter(r=>!type||r.query_type===type);dnsCacheOut.innerHTML=table(rows,[['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Results',r=>(r.results||[]).join('<br>')],['Expires',r=>fmtTime(r.expires_at)]])}
     async function clearDnsDomain(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheMessage.textContent='Enter a domain first';return}let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({domain})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';await queryDnsCache()}
     async function clearDnsAll(){let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';dnsCacheOut.innerHTML='';await renderDnsCacheStats()}
-    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='dns')await renderDnsCacheStats();if(id==='routeConfig'){await loadRules();await renderRouteConflicts()}if(id==='connections'){await renderDns();await renderConnections();await renderUnhitDns();await renderUnhitIp()}}catch(e){alert(e.message)}}
+    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='dns')await renderDnsCacheStats();if(id==='routeConfig'){await loadRules();await renderRouteConflicts()}if(id==='sys')await renderSys();if(id==='connections'){await renderDns();await renderConnections();await renderUnhitDns();await renderUnhitIp()}}catch(e){alert(e.message)}}
     document.querySelector("nav button[data-tab=\"basic\"]").classList.add('active');
     window.addEventListener('resize',updateNavIndicator);
     requestAnimationFrame(updateNavIndicator);

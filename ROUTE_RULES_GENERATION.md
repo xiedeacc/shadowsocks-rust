@@ -72,10 +72,16 @@ the conflict is still shown once, with all relevant sources.
 ## IP Generation
 
 `geoip.dat` is parsed by region. CIDRs in region `cn` are added to `direct_ip.txt`. Other regions are
-added to `bypass_ip.txt`.
+kept only as metadata for conflict display; they are not written to `bypass_ip.txt`.
 
-If a CIDR matches `manual_ip.txt`, the manual decision wins. For example, if `geoip.dat` marks a CIDR
-as `cn` but `manual_ip.txt` says `bypass`, the CIDR is written to `bypass_ip.txt`.
+`bypass_ip.txt` is reserved for IPs learned from remote DNS answers at runtime. When a bypass-domain
+DNS query is resolved through the remote DNS path, the returned IPs are added to the in-memory bypass
+IP set and are persisted asynchronously to `bypass_ip.txt`. Running Generate preserves existing
+learned entries in `bypass_ip.txt`; it only avoids adding non-CN `geoip.dat` ranges to that file.
+
+If a CIDR matches `manual_ip.txt`, the manual decision is used during generation. `direct` entries can
+materialize into `direct_ip.txt`; `bypass` entries are kept as conflict metadata and do not prefill
+`bypass_ip.txt`.
 
 ## Conflict Lists
 

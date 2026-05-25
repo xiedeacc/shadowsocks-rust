@@ -5,8 +5,10 @@
 //! firewall mode.
 
 use std::{
-    io,
+    fs::{self, File},
+    io::{self, Write},
     net::IpAddr,
+    path::Path,
     process::{Command, Stdio},
 };
 
@@ -27,7 +29,7 @@ pub struct DnsInterceptGuard {
 
 enum Backend {
     Nft,
-    Iptables { port: u16, uid: u32 },
+    Iptables { port: u16, exempt_ips: Vec<IpAddr> },
 }
 
 impl Drop for DnsInterceptGuard {
@@ -36,26 +38,28 @@ impl Drop for DnsInterceptGuard {
             Backend::Nft => {
                 let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
             }
-            Backend::Iptables { port, uid } => {
-                cleanup_iptables(port, uid);
+            Backend::Iptables { port, ref exempt_ips } => {
+                cleanup_iptables(port, exempt_ips);
             }
         }
     }
 }
 
-pub fn setup_firewall_redirect(port: u16) -> io::Result<DnsInterceptGuard> {
-    let uid = current_uid();
-    match setup_nft(port, uid) {
+pub fn setup_firewall_redirect(port: u16, dns_exempt_ips: &[IpAddr]) -> io::Result<DnsInterceptGuard> {
+    match setup_nft(port, dns_exempt_ips) {
         Ok(()) => {
             info!("installed nftables DNS interception rules on local port {}", port);
             Ok(DnsInterceptGuard { backend: Backend::Nft })
         }
         Err(nft_err) => {
             warn!("failed to install nftables DNS interception rules: {}", nft_err);
-            setup_iptables(port, uid)?;
+            setup_iptables(port, dns_exempt_ips)?;
             info!("installed iptables DNS interception rules on local port {}", port);
             Ok(DnsInterceptGuard {
-                backend: Backend::Iptables { port, uid },
+                backend: Backend::Iptables {
+                    port,
+                    exempt_ips: dns_exempt_ips.to_vec(),
+                },
             })
         }
     }
@@ -91,16 +95,11 @@ pub fn add_route_ips(decision: RouteDecision, ips: &[IpAddr]) -> io::Result<()> 
     Ok(())
 }
 
-pub fn replace_route_nets(direct: &[IpNet], bypass: &[IpNet]) -> io::Result<()> {
-    ensure_nft_sets()?;
-    for set_name in [DIRECT4_SET, DIRECT6_SET, BYPASS4_SET, BYPASS6_SET] {
-        let _ = command("nft", &["flush", "set", "inet", NFT_TABLE, set_name]);
+pub fn add_route_nets(decision: RouteDecision, nets: &[IpNet]) -> io::Result<()> {
+    if nets.is_empty() {
+        return Ok(());
     }
-    add_route_nets(RouteDecision::Direct, direct)?;
-    add_route_nets(RouteDecision::Proxy, bypass)
-}
-
-fn add_route_nets(decision: RouteDecision, nets: &[IpNet]) -> io::Result<()> {
+    ensure_nft_sets()?;
     for net in nets {
         let set_name = match (decision, net) {
             (RouteDecision::Direct, IpNet::V4(..)) => DIRECT4_SET,
@@ -108,7 +107,6 @@ fn add_route_nets(decision: RouteDecision, nets: &[IpNet]) -> io::Result<()> {
             (RouteDecision::Proxy, IpNet::V4(..)) => BYPASS4_SET,
             (RouteDecision::Proxy, IpNet::V6(..)) => BYPASS6_SET,
         };
-        // Ignore duplicate element errors. The rule files remain the source of truth.
         let _ = command(
             "nft",
             &[
@@ -126,7 +124,86 @@ fn add_route_nets(decision: RouteDecision, nets: &[IpNet]) -> io::Result<()> {
     Ok(())
 }
 
-fn setup_nft(port: u16, uid: u32) -> io::Result<()> {
+pub fn remove_route_ips(decision: RouteDecision, ips: &[IpAddr]) -> io::Result<()> {
+    if ips.is_empty() {
+        return Ok(());
+    }
+    ensure_nft_sets()?;
+    for ip in ips {
+        let set_name = match (decision, ip) {
+            (RouteDecision::Direct, IpAddr::V4(..)) => DIRECT4_SET,
+            (RouteDecision::Direct, IpAddr::V6(..)) => DIRECT6_SET,
+            (RouteDecision::Proxy, IpAddr::V4(..)) => BYPASS4_SET,
+            (RouteDecision::Proxy, IpAddr::V6(..)) => BYPASS6_SET,
+        };
+        let _ = command(
+            "nft",
+            &[
+                "delete",
+                "element",
+                "inet",
+                NFT_TABLE,
+                set_name,
+                "{",
+                &ip.to_string(),
+                "}",
+            ],
+        );
+    }
+    Ok(())
+}
+
+pub fn replace_route_nets(work_dir: &Path, direct: &[IpNet], bypass: &[IpNet]) -> io::Result<()> {
+    ensure_nft_sets()?;
+    let script_path = work_dir.join(format!("ssrust-nft-sync-{}.nft", std::process::id()));
+    {
+        let mut script = File::create(&script_path)?;
+        for set_name in [DIRECT4_SET, DIRECT6_SET, BYPASS4_SET, BYPASS6_SET] {
+            writeln!(script, "flush set inet {NFT_TABLE} {set_name}")?;
+        }
+        write_add_elements(&mut script, RouteDecision::Direct, direct)?;
+        write_add_elements(&mut script, RouteDecision::Proxy, bypass)?;
+    }
+    let result = command("nft", &["-f", &script_path.to_string_lossy()]);
+    let _ = fs::remove_file(script_path);
+    result
+}
+
+fn write_add_elements(file: &mut File, decision: RouteDecision, nets: &[IpNet]) -> io::Result<()> {
+    for (set_name, family_nets) in [
+        (
+            match decision {
+                RouteDecision::Direct => DIRECT4_SET,
+                RouteDecision::Proxy => BYPASS4_SET,
+            },
+            nets.iter().filter(|net| matches!(net, IpNet::V4(..))).collect::<Vec<_>>(),
+        ),
+        (
+            match decision {
+                RouteDecision::Direct => DIRECT6_SET,
+                RouteDecision::Proxy => BYPASS6_SET,
+            },
+            nets.iter().filter(|net| matches!(net, IpNet::V6(..))).collect::<Vec<_>>(),
+        ),
+    ] {
+        for chunk in family_nets.chunks(512) {
+            if chunk.is_empty() {
+                continue;
+            }
+            write!(file, "add element inet {NFT_TABLE} {set_name} {{ ")?;
+            for (idx, net) in chunk.iter().enumerate() {
+                if idx > 0 {
+                    write!(file, ", ")?;
+                }
+                write!(file, "{net}")?;
+            }
+            writeln!(file, " }}")?;
+        }
+    }
+    Ok(())
+}
+
+fn setup_nft(port: u16, dns_exempt_ips: &[IpAddr]) -> io::Result<()> {
     let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
     command("nft", &["add", "table", "inet", NFT_TABLE])?;
     add_nft_sets()?;
@@ -173,6 +250,29 @@ fn setup_nft(port: u16, uid: u32) -> io::Result<()> {
                 &format!(":{port}"),
             ],
         )?;
+        for ip in dns_exempt_ips {
+            let family_expr = match ip {
+                IpAddr::V4(..) => "ip",
+                IpAddr::V6(..) => "ip6",
+            };
+            command(
+                "nft",
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    NFT_TABLE,
+                    "output",
+                    family_expr,
+                    "daddr",
+                    &ip.to_string(),
+                    proto,
+                    "dport",
+                    "53",
+                    "return",
+                ],
+            )?;
+        }
         command(
             "nft",
             &[
@@ -181,10 +281,6 @@ fn setup_nft(port: u16, uid: u32) -> io::Result<()> {
                 "inet",
                 NFT_TABLE,
                 "output",
-                "meta",
-                "skuid",
-                "!=",
-                &uid.to_string(),
                 proto,
                 "dport",
                 "53",
@@ -233,8 +329,8 @@ fn add_nft_sets() -> io::Result<()> {
     Ok(())
 }
 
-fn setup_iptables(port: u16, uid: u32) -> io::Result<()> {
-    cleanup_iptables(port, uid);
+fn setup_iptables(port: u16, dns_exempt_ips: &[IpAddr]) -> io::Result<()> {
+    cleanup_iptables(port, dns_exempt_ips);
     for proto in ["udp", "tcp"] {
         command(
             "iptables",
@@ -253,6 +349,25 @@ fn setup_iptables(port: u16, uid: u32) -> io::Result<()> {
                 &port.to_string(),
             ],
         )?;
+        for ip in dns_exempt_ips {
+            command(
+                "iptables",
+                &[
+                    "-t",
+                    "nat",
+                    "-A",
+                    "OUTPUT",
+                    "-p",
+                    proto,
+                    "-d",
+                    &ip.to_string(),
+                    "--dport",
+                    "53",
+                    "-j",
+                    "RETURN",
+                ],
+            )?;
+        }
         command(
             "iptables",
             &[
@@ -264,11 +379,6 @@ fn setup_iptables(port: u16, uid: u32) -> io::Result<()> {
                 proto,
                 "--dport",
                 "53",
-                "-m",
-                "owner",
-                "!",
-                "--uid-owner",
-                &uid.to_string(),
                 "-j",
                 "REDIRECT",
                 "--to-ports",
@@ -279,7 +389,7 @@ fn setup_iptables(port: u16, uid: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn cleanup_iptables(port: u16, uid: u32) {
+fn cleanup_iptables(port: u16, dns_exempt_ips: &[IpAddr]) {
     for proto in ["udp", "tcp"] {
         let _ = command(
             "iptables",
@@ -298,6 +408,25 @@ fn cleanup_iptables(port: u16, uid: u32) {
                 &port.to_string(),
             ],
         );
+        for ip in dns_exempt_ips {
+            let _ = command(
+                "iptables",
+                &[
+                    "-t",
+                    "nat",
+                    "-D",
+                    "OUTPUT",
+                    "-p",
+                    proto,
+                    "-d",
+                    &ip.to_string(),
+                    "--dport",
+                    "53",
+                    "-j",
+                    "RETURN",
+                ],
+            );
+        }
         let _ = command(
             "iptables",
             &[
@@ -309,11 +438,6 @@ fn cleanup_iptables(port: u16, uid: u32) {
                 proto,
                 "--dport",
                 "53",
-                "-m",
-                "owner",
-                "!",
-                "--uid-owner",
-                &uid.to_string(),
                 "-j",
                 "REDIRECT",
                 "--to-ports",
@@ -337,6 +461,3 @@ fn command(program: &str, args: &[&str]) -> io::Result<()> {
     }
 }
 
-fn current_uid() -> u32 {
-    unsafe { libc::geteuid() }
-}

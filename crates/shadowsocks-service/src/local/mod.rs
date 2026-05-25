@@ -1,6 +1,6 @@
 //! Shadowsocks Local Server
 
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{io, net::{IpAddr, SocketAddr}, sync::Arc, time::Duration};
 
 use futures::future;
 use log::trace;
@@ -299,6 +299,14 @@ impl Server {
 
         #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
         let dns_intercept_mode = config.route_rules.dns_intercept_mode.clone();
+        #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
+        let dns_intercept_exempt_ips = dns_intercept_exempt_ips(
+            config
+                .route_rules
+                .domestic_dns
+                .iter()
+                .chain(config.route_rules.foreign_dns.iter()),
+        );
 
         for local_instance in config.local {
             let local_config = local_instance.config;
@@ -440,7 +448,10 @@ impl Server {
 
                     #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
                     if matches!(dns_intercept_mode.as_str(), "firewall" | "both") {
-                        match self::dns::intercept_linux::setup_firewall_redirect(client_addr.port()) {
+                        match self::dns::intercept_linux::setup_firewall_redirect(
+                            client_addr.port(),
+                            &dns_intercept_exempt_ips,
+                        ) {
                             Ok(guard) => {
                                 if let Err(err) = routing_state.sync_persistent_ip_rules_to_firewall().await {
                                     log::warn!("failed to load persistent IP rules into nft sets: {}", err);
@@ -692,6 +703,25 @@ impl Server {
     pub fn fake_dns_servers(&self) -> &[FakeDns] {
         &self.fake_dns_servers
     }
+}
+
+#[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
+fn dns_intercept_exempt_ips<'a>(servers: impl Iterator<Item = &'a String>) -> Vec<IpAddr> {
+    let mut ips = servers
+        .filter_map(|server| {
+            let host = server
+                .rsplit_once(':')
+                .map(|(host, _)| host)
+                .unwrap_or(server)
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            host.parse::<IpAddr>().ok()
+        })
+        .collect::<Vec<_>>();
+    ips.sort_unstable();
+    ips.dedup();
+    ips
 }
 
 #[cfg(feature = "local-flow-stat")]
