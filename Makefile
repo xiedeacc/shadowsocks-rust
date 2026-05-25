@@ -1,14 +1,15 @@
-PREFIX ?= /usr/local/bin
+PREFIX ?= /usr/local/shadowsocks/bin
 TARGET ?= debug
+FEATURES ?= full local-web-admin
 
 .PHONY: all build install uninstall clean
 all: build
 
 build:
 ifeq (${TARGET}, release)
-	cargo build --release --features "full"
+	cargo build --release --features "${FEATURES}"
 else
-	cargo build --features "full"
+	cargo build --features "${FEATURES}"
 endif
 
 install:

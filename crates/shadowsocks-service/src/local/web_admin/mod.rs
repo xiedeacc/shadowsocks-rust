@@ -7,6 +7,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    thread,
     time::Duration,
 };
 
@@ -19,7 +20,7 @@ use tokio::{net::TcpListener, time};
 
 use crate::{
     config::WebAdminConfig,
-    local::routing::{RoutingSources, RoutingState, RuleLists},
+    local::routing::{ManualDomainRule, ManualIpRule, RoutingSources, RoutingState, RuleLists},
 };
 
 type ResponseBody = Full<Bytes>;
@@ -147,16 +148,30 @@ impl WebAdminHandler {
             }
             (Method::POST, "/api/rules/update") => {
                 let routing_state = self.routing_state.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = routing_state.update_from_sources().await {
+                if !routing_state.try_begin_update().await {
+                    return Ok(json_response(
+                        StatusCode::ACCEPTED,
+                        &serde_json::json!({ "ok": true, "started": false, "message": "rule update already running" }),
+                    ));
+                }
+                thread::spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                        Ok(runtime) => runtime,
+                        Err(err) => {
+                            log::warn!("failed to create route rule update runtime: {}", err);
+                            return;
+                        }
+                    };
+                    if let Err(err) = runtime.block_on(routing_state.update_from_sources()) {
                         log::warn!("failed to update route rules from sources: {}", err);
                     }
                 });
                 Ok(json_response(StatusCode::ACCEPTED, &serde_json::json!({ "ok": true })))
             }
-            (Method::GET, "/api/rules/update-progress") => {
-                Ok(json_response(StatusCode::OK, &self.routing_state.update_progress().await))
-            }
+            (Method::GET, "/api/rules/update-progress") => Ok(json_response(
+                StatusCode::OK,
+                &self.routing_state.update_progress().await,
+            )),
             (Method::GET, "/api/dns") => Ok(json_response(
                 StatusCode::OK,
                 &serde_json::json!({
@@ -181,6 +196,32 @@ impl WebAdminHandler {
                 self.routing_state.set_temporary_rules(rules).await;
                 Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
             }
+            (Method::GET, "/api/manual-ip") => Ok(json_response(
+                StatusCode::OK,
+                &self.routing_state.manual_ip_rules().await,
+            )),
+            (Method::PUT, "/api/manual-ip") => {
+                let rule: ManualIpRule = read_json(req).await?;
+                if rule.region.trim().is_empty() {
+                    self.routing_state.remove_manual_ip_rule(&rule.cidr).await?;
+                } else {
+                    self.routing_state.set_manual_ip_rule(rule).await?;
+                }
+                Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
+            }
+            (Method::GET, "/api/manual-domain") => Ok(json_response(
+                StatusCode::OK,
+                &self.routing_state.manual_domain_rules().await,
+            )),
+            (Method::PUT, "/api/manual-domain") => {
+                let rule: ManualDomainRule = read_json(req).await?;
+                if rule.region.trim().is_empty() {
+                    self.routing_state.remove_manual_domain_rule(&rule.domain).await?;
+                } else {
+                    self.routing_state.set_manual_domain_rule(rule).await?;
+                }
+                Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
+            }
             (Method::GET, "/api/conflicts/ip") => {
                 Ok(json_response(StatusCode::OK, &self.routing_state.ip_conflicts().await))
             }
@@ -191,6 +232,14 @@ impl WebAdminHandler {
             (Method::GET, "/api/activity/connections") => Ok(json_response(
                 StatusCode::OK,
                 &self.routing_state.recent_connections().await,
+            )),
+            (Method::GET, "/api/activity/unhit-ip") => Ok(json_response(
+                StatusCode::OK,
+                &self.routing_state.recent_unhit_ips().await,
+            )),
+            (Method::GET, "/api/activity/unhit-dns") => Ok(json_response(
+                StatusCode::OK,
+                &self.routing_state.recent_unhit_domains().await,
             )),
             (Method::GET, "/api/activity/dns") => {
                 Ok(json_response(StatusCode::OK, &self.routing_state.recent_dns().await))
@@ -289,14 +338,23 @@ const INDEX_HTML: &str = r#"<!doctype html>
     th,td{border:1px solid var(--line);padding:7px;text-align:left;vertical-align:top;background:var(--panel)}
     th{background:var(--soft);color:var(--brand2)}
     .scroll-panel{height:548px;overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:0 1px 2px #10203312}
+    .section-scroll{height:300px}
     .scroll-panel table{margin-top:0}
     .scroll-panel th{position:sticky;top:0;z-index:1}
+    .conflict-table{table-layout:fixed}
+    .conflict-table th:nth-child(1),.conflict-table td:nth-child(1){width:34%}
+    .conflict-table th:nth-child(2),.conflict-table td:nth-child(2){width:16%}
+    .conflict-table th:nth-child(3),.conflict-table td:nth-child(3){width:13%}
+    .conflict-table th:nth-child(4),.conflict-table td:nth-child(4){width:25%}
+    .conflict-table th:nth-child(5),.conflict-table td:nth-child(5){width:12%}
+    .conflict-table td{word-break:break-word}
     pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto}
     .tab{display:none}.tab.active{display:block}
     .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+    .activity-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}
+    .activity-card{min-width:0}
     .basic-layout{display:grid;grid-template-columns:minmax(380px,540px) 1fr;gap:18px;align-items:start}
-    .rules-layout{display:grid;grid-template-columns:minmax(360px,50vw);gap:18px;align-items:start}
-    .temporal-layout{display:grid;grid-template-columns:minmax(360px,50vw);gap:18px;align-items:start}
+    .route-rules-layout{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:18px;align-items:start;margin-top:18px}
     .generated-layout{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:18px;align-items:start}
     .form-line{display:grid;grid-template-columns:150px 1fr;gap:10px;align-items:center;margin:4px 0}
     .form-line label{margin:0;font-size:13px}
@@ -314,17 +372,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .progress-box{margin:12px auto 0;max-width:760px;text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;box-shadow:0 1px 2px #10203312}
     .progress-bar{height:10px;background:var(--soft);border-radius:999px;overflow:hidden;margin:8px 0}
     .progress-fill{height:100%;width:0;background:var(--brand)}
-    @media(max-width:1100px){.generated-layout{grid-template-columns:1fr}}
-    @media(max-width:900px){.basic-layout,.rules-layout,.temporal-layout{grid-template-columns:1fr}#clientConfig,#rulesJson,#generatedFileContent{height:420px;max-height:420px}}
+    .progress-completed{white-space:pre-line;margin-top:8px}
+    @media(max-width:1100px){.generated-layout,.activity-grid,.route-rules-layout{grid-template-columns:1fr}}
+    @media(max-width:900px){.basic-layout{grid-template-columns:1fr}#clientConfig,#rulesJson,#generatedFileContent{height:420px;max-height:420px}}
   </style>
 </head>
 <body>
   <nav>
     <button onclick="show('basic')">Basic Config</button>
-    <button onclick="show('rules')">Rules</button>
-    <button onclick="show('temporal')">Temporal Rules</button>
     <button onclick="show('connections')">Connections</button>
-    <button onclick="show('dns')">DNS</button>
     <button onclick="show('routeConfig')">Generated Route Config</button>
   </nav>
 
@@ -375,47 +431,38 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
   </section>
 
-  <section id="rules" class="tab">
-    <h2>Rules</h2>
-    <div class="rules-layout">
-      <div>
-        <h3 class="card-title">geoip Sources</h3><fieldset><div id="geoip_sources"></div><button onclick="addSource('geoip_sources')">Add</button></fieldset>
-        <h3 class="card-title">geosite Sources</h3><fieldset><div id="geosite_sources"></div><button onclick="addSource('geosite_sources')">Add</button></fieldset>
-        <h3 class="card-title">Direct Domain Sources</h3><fieldset><div id="direct_domain_sources"></div><button onclick="addSource('direct_domain_sources')">Add</button></fieldset>
-        <h3 class="card-title">Bypass Domain Sources</h3><fieldset><div id="bypass_domain_sources"></div><button onclick="addSource('bypass_domain_sources')">Add</button></fieldset>
-        <button onclick="loadRules()">Reload</button>
-        <button onclick="saveRules()">Save Sources</button>
-      </div>
-    </div>
-  </section>
-
-  <section id="temporal" class="tab">
-    <h2>Temporal Rules</h2>
-    <div class="temporal-layout">
-      <div>
-        <h3 class="card-title">Temporary Lists</h3>
-        <fieldset>
-          <label>Direct IP<textarea id="tmp_direct_ip"></textarea></label>
-          <label>Direct Domain<textarea id="tmp_direct_domain"></textarea></label>
-          <label>Bypass IP<textarea id="tmp_bypass_ip"></textarea></label>
-          <label>Bypass Domain<textarea id="tmp_bypass_domain"></textarea></label>
-          <p class="hint">一行一个配置，无需分隔符</p>
-        </fieldset>
-        <button onclick="loadRules()">Reload</button>
-        <button onclick="saveRules()">Save Temporary Lists</button>
-      </div>
-    </div>
-  </section>
-
   <section id="connections" class="tab">
     <h2>Connections</h2>
-    <h3 class="card-title">Recent Connections</h3>
-    <div id="connOut" class="scroll-panel"></div>
-    <h3 class="card-title">IP Conflicts</h3>
-    <div id="ipOut"></div>
+    <div class="activity-grid">
+      <div class="activity-card">
+        <h3 class="card-title">Recent DNS</h3>
+        <div id="dnsOut" class="scroll-panel section-scroll"></div>
+      </div>
+      <div class="activity-card">
+        <h3 class="card-title">Recent Connections</h3>
+        <div id="connOut" class="scroll-panel section-scroll"></div>
+      </div>
+      <div class="activity-card">
+        <h3 class="card-title">Domain Conflicts</h3>
+        <div id="domainOut" class="scroll-panel section-scroll"></div>
+      </div>
+      <div class="activity-card">
+        <h3 class="card-title">IP Conflicts</h3>
+        <div id="ipOut" class="scroll-panel section-scroll"></div>
+      </div>
+      <div class="activity-card">
+        <h3 class="card-title">Unhit DNS</h3>
+        <div id="unhitDnsOut" class="scroll-panel section-scroll"></div>
+      </div>
+      <div class="activity-card">
+        <h3 class="card-title">Unhit IP</h3>
+        <div id="unhitIpOut" class="scroll-panel section-scroll"></div>
+      </div>
+    </div>
   </section>
-  <section id="dns" class="tab">
-    <h2>DNS</h2>
+
+  <section id="routeConfig" class="tab">
+    <h2>Generated Route Config</h2>
     <div class="grid">
       <div>
         <h3 class="card-title">Domestic DNS</h3>
@@ -428,14 +475,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
     <button onclick="loadRules()">Reload DNS Config</button>
     <button onclick="saveRules()">Save DNS Config</button>
-    <h3 class="card-title">Recent DNS</h3>
-    <div id="dnsOut"></div>
-    <h3 class="card-title">Domain Conflicts</h3>
-    <div id="domainOut"></div>
-  </section>
-
-  <section id="routeConfig" class="tab">
-    <h2>Generated Route Config</h2>
     <div class="generated-layout">
       <div>
         <h3 class="card-title">Generated JSON</h3>
@@ -454,15 +493,40 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <textarea id="generatedFileContent" readonly></textarea>
       </div>
     </div>
+    <div class="route-rules-layout">
+      <div>
+        <h3 class="card-title">Rule Sources</h3>
+        <h3 class="card-title">geoip Sources</h3><fieldset><div id="geoip_sources"></div><button onclick="addSource('geoip_sources')">Add</button></fieldset>
+        <h3 class="card-title">geosite Sources</h3><fieldset><div id="geosite_sources"></div><button onclick="addSource('geosite_sources')">Add</button></fieldset>
+        <h3 class="card-title">Direct Domain Sources</h3><fieldset><div id="direct_domain_sources"></div><button onclick="addSource('direct_domain_sources')">Add</button></fieldset>
+        <h3 class="card-title">Bypass Domain Sources</h3><fieldset><div id="bypass_domain_sources"></div><button onclick="addSource('bypass_domain_sources')">Add</button></fieldset>
+        <button onclick="loadRules()">Reload Sources</button>
+        <button onclick="saveRules()">Save Sources</button>
+      </div>
+      <div>
+        <h3 class="card-title">Temporary Lists</h3>
+        <fieldset>
+          <label>Direct IP<textarea id="tmp_direct_ip"></textarea></label>
+          <label>Direct Domain<textarea id="tmp_direct_domain"></textarea></label>
+          <label>Bypass IP<textarea id="tmp_bypass_ip"></textarea></label>
+          <label>Bypass Domain<textarea id="tmp_bypass_domain"></textarea></label>
+          <p class="hint">一行一个配置，无需分隔符</p>
+        </fieldset>
+        <button onclick="loadRules()">Reload Temporary Lists</button>
+        <button onclick="saveRules()">Save Temporary Lists</button>
+      </div>
+    </div>
     <div style="text-align:center;margin-top:20px">
       <button onclick="updateRules()">Download and Generate Persistent Files</button>
     </div>
+    <p class="hint" style="text-align:center">Downloads are cached in the data directory. To skip slow downloads, manually place a non-empty file with the same URL filename there, for example geoip.dat or geosite.dat.</p>
     <div id="ruleUpdateProgress" class="progress-box">
       <div><strong>Status:</strong> <span id="progressStatus">idle</span></div>
       <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
       <div><strong>Current source:</strong> <span id="progressSource">-</span></div>
       <div><strong>Progress:</strong> <span id="progressPercent">0%</span>, <strong>remaining files:</strong> <span id="progressRemaining">0</span></div>
       <div class="hint" id="progressMessage"></div>
+      <div class="hint progress-completed" id="progressCompleted"></div>
     </div>
   </section>
 
@@ -473,7 +537,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
     const sourceKeys=[...routeSourceKeys,...dnsKeys];
     function token(){return new URLSearchParams(location.search).get('token')||''}
     async function api(path,opt={}){opt.headers=Object.assign({'x-admin-token':token()},opt.headers||{});let r=await fetch(path,opt);let j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}
-    function show(id){document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.getAttribute('onclick')===`show('${id}')`));refresh(id)}
+    let activeTab='basic', activityTimer=null;
+    function show(id){
+      activeTab=id;
+      if(activityTimer){clearInterval(activityTimer);activityTimer=null}
+      document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));
+      document.getElementById(id).classList.add('active');
+      document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.getAttribute('onclick')===`show('${id}')`));
+      refresh(id);
+      if(id==='connections')activityTimer=setInterval(()=>refresh('connections').catch(e=>{console.warn(e)}),3000);
+    }
     function lines(v){return (v||'').split('\n').map(s=>s.trim()).filter(Boolean)}
     function setLines(id,arr){document.getElementById(id).value=(arr||[]).join('\n')}
     function num(v,d){let n=parseInt(v,10);return Number.isFinite(n)?n:d}
@@ -545,6 +618,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       progressPercent.textContent=(p.percent||0)+'%';
       progressRemaining.textContent=p.remaining_files??0;
       progressMessage.textContent=p.message||'';
+      progressCompleted.textContent=(p.completed_messages||[]).join('\n');
       progressFill.style.width=(p.percent||0)+'%';
     }
     async function pollUpdateProgress(){
@@ -557,7 +631,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function updateRules(){
       await saveRules();
-      renderProgress({status:'running',current_source:'starting',percent:0,remaining_files:0,message:'starting'});
+      renderProgress({status:'running',current_source:'starting',percent:0,remaining_files:0,message:'starting',completed_messages:[]});
       await api('/api/rules/update',{method:'POST'});
       if(progressTimer)clearInterval(progressTimer);
       progressTimer=setInterval(()=>pollUpdateProgress().catch(e=>{progressMessage.textContent=e.message}),1000);
@@ -565,12 +639,36 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     ['tmp_direct_ip','tmp_direct_domain','tmp_bypass_ip','tmp_bypass_domain'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateRulesJson),0));
 
-    function table(rows,cols){if(!rows.length)return '<p class="hint">No data</p>';return '<table><thead><tr>'+cols.map(c=>'<th>'+c[0]+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+String(c[1](r)??'')+'</td>').join('')+'</tr>').join('')+'</tbody></table>'}
+    function table(rows,cols,cls=''){if(!rows.length)return '<p class="hint">No data</p>';return `<table class="${cls}"><thead><tr>`+cols.map(c=>'<th>'+c[0]+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+String(c[1](r)??'')+'</td>').join('')+'</tr>').join('')+'</tbody></table>'}
     function fmtTime(ts){return ts?new Date(ts*1000).toLocaleString():''}
-    async function renderConflicts(id,path){let rows=await api(path);document.getElementById(id).innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Kind',r=>r.kind],['Value',r=>r.value],['Layer',r=>r.layer]])}
+    async function setManualIp(cidr,region){await api('/api/manual-ip',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({cidr,region})});await renderConflicts('ipOut','/api/conflicts/ip')}
+    async function setManualDomain(domain,region){await api('/api/manual-domain',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({domain,region})});await renderConflicts('domainOut','/api/conflicts/domain')}
+    function manualSelect(row,manual,onchange){
+      let regions=[...(row.regions||[])];
+      if(!regions.length)regions=['cn','proxy'];
+      let selected=manual[row.value]||'';
+      if(selected&&!regions.includes(selected))regions.push(selected);
+      return `<select onchange="${onchange}('${row.value}',this.value)"><option value="">Auto</option>${regions.map(region=>`<option value="${region}"${region===selected?' selected':''}>${region}</option>`).join('')}</select>`;
+    }
+    async function renderConflicts(id,path){
+      let rows=await api(path);
+      let manual={};
+      let cols=[['Value',r=>r.value],['Layer',r=>r.layer]];
+      if(id==='ipOut'){
+        (await api('/api/manual-ip')).forEach(rule=>manual[rule.cidr]=rule.region);
+        cols.push(['Regions',r=>(r.regions||[]).join(', ')],['Sources',r=>(r.sources||[]).join(', ')],['Select',r=>manualSelect(r,manual,'setManualIp')]);
+      }
+      if(id==='domainOut'){
+        (await api('/api/manual-domain')).forEach(rule=>manual[rule.domain]=rule.region);
+        cols.push(['Regions',r=>(r.regions||[]).join(', ')],['Sources',r=>(r.sources||[]).join(', ')],['Select',r=>manualSelect(r,manual,'setManualDomain')]);
+      }
+      document.getElementById(id).innerHTML=table(rows,cols,'conflict-table')
+    }
     async function renderConnections(){let rows=await api('/api/activity/connections');connOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Source',r=>r.source_ip+':'+r.source_port],['Destination',r=>(r.destination_ip||r.destination_domain)+':'+r.destination_port],['Protocol',r=>r.protocol],['Decision',r=>r.decision]])}
+    async function renderUnhitIp(){let rows=await api('/api/activity/unhit-ip');unhitIpOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['IP',r=>r.ip]])}
+    async function renderUnhitDns(){let rows=await api('/api/activity/unhit-dns');unhitDnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>r.domain]])}
     async function renderDns(){let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>r.domain],['Type',r=>r.query_type],['Results',r=>(r.results||[]).join('<br>')],['Resolver',r=>r.resolver]])}
-    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='rules'||id==='temporal'||id==='routeConfig')await loadRules();if(id==='connections'){await renderConnections();await renderConflicts('ipOut','/api/conflicts/ip')}if(id==='dns'){await loadRules();await renderDns();await renderConflicts('domainOut','/api/conflicts/domain')}}catch(e){alert(e.message)}}
+    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='routeConfig')await loadRules();if(id==='connections'){await renderDns();await renderConnections();await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip');await renderUnhitDns();await renderUnhitIp()}}catch(e){alert(e.message)}}
     document.querySelector("nav button[onclick=\"show('basic')\"]").classList.add('active');
     loadClientConfig();
   </script>

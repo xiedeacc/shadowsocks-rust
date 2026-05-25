@@ -1543,17 +1543,16 @@ pub const DEFAULT_GEOIP_SOURCE: &str =
 pub const DEFAULT_GEOSITE_SOURCE: &str =
     "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat";
 #[cfg(feature = "local-web-admin")]
+pub const DEFAULT_DEPLOY_DIR: &str = "/usr/local/shadowsocks";
+#[cfg(feature = "local-web-admin")]
 pub const DEFAULT_DIRECT_DOMAIN_SOURCES: &[&str] = &[
-    "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt",
     "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/china-list.txt",
     "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/apple-cn.txt",
     "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/google-cn.txt",
 ];
 #[cfg(feature = "local-web-admin")]
-pub const DEFAULT_BYPASS_DOMAIN_SOURCES: &[&str] = &[
-    "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt",
-    "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt",
-];
+pub const DEFAULT_BYPASS_DOMAIN_SOURCES: &[&str] =
+    &["https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt"];
 
 #[cfg(feature = "local-web-admin")]
 #[derive(Clone, Debug)]
@@ -1571,7 +1570,7 @@ impl Default for WebAdminConfig {
                 .parse()
                 .expect("valid default web admin listen address"),
             token: None,
-            client_config_path: PathBuf::from("/etc/shadowsocks-rust/shadowsocks-client.json"),
+            client_config_path: PathBuf::from(DEFAULT_DEPLOY_DIR).join("conf/shadowsocks-client.json"),
         }
     }
 }
@@ -1592,7 +1591,7 @@ pub struct RouteRulesConfig {
 impl Default for RouteRulesConfig {
     fn default() -> Self {
         Self {
-            rules_dir: PathBuf::from("/etc/shadowsocks-rust/rules"),
+            rules_dir: PathBuf::from(DEFAULT_DEPLOY_DIR).join("data"),
             geoip_sources: vec![DEFAULT_GEOIP_SOURCE.to_owned()],
             geosite_sources: vec![DEFAULT_GEOSITE_SOURCE.to_owned()],
             direct_domain_sources: DEFAULT_DIRECT_DOMAIN_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
