@@ -9,6 +9,7 @@ target
 /.vscode
 /*.json
 shadowsocks-client.json
+deploy/**/conf/shadowsocks-client.json
 /restart.sh
 /udp_echo_server.py
 /.idea
