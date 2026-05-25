@@ -9,7 +9,7 @@ use bytes::{BufMut, BytesMut};
 use etherparse::PacketBuilder;
 use log::debug;
 use shadowsocks::relay::socks5::Address;
-use tokio::sync::mpsc;
+use tokio::{net::UdpSocket, sync::mpsc, time};
 
 use crate::{
     local::{
@@ -21,7 +21,9 @@ use crate::{
 };
 
 pub struct UdpTun {
+    context: Arc<ServiceContext>,
     tun_rx: mpsc::Receiver<BytesMut>,
+    writer: UdpTunInboundWriter,
     manager: UdpAssociationManager<UdpTunInboundWriter>,
 }
 
@@ -33,15 +35,20 @@ impl UdpTun {
         capacity: Option<usize>,
     ) -> (Self, Duration, mpsc::Receiver<SocketAddr>) {
         let (tun_tx, tun_rx) = mpsc::channel(64);
-        let (manager, cleanup_interval, keepalive_rx) = UdpAssociationManager::new(
-            context,
-            UdpTunInboundWriter::new(tun_tx),
-            time_to_live,
-            capacity,
-            balancer,
-        );
+        let writer = UdpTunInboundWriter::new(tun_tx);
+        let (manager, cleanup_interval, keepalive_rx) =
+            UdpAssociationManager::new(context.clone(), writer.clone(), time_to_live, capacity, balancer);
 
-        (Self { tun_rx, manager }, cleanup_interval, keepalive_rx)
+        (
+            Self {
+                context,
+                tun_rx,
+                writer,
+                manager,
+            },
+            cleanup_interval,
+            keepalive_rx,
+        )
     }
 
     pub async fn handle_packet(
@@ -51,6 +58,18 @@ impl UdpTun {
         payload: &[u8],
     ) -> io::Result<()> {
         debug!("UDP {} -> {} payload.size: {} bytes", src_addr, dst_addr, payload.len());
+        #[cfg(feature = "local-web-admin")]
+        if dst_addr.port() == 53
+            && let Some(routing_state) = self.context.routing_state()
+            && let Some(target) = routing_state.dns_tun_intercept_target().await
+        {
+            if let Err(err) = self.handle_dns_packet(src_addr, dst_addr, target, payload).await {
+                debug!("TUN DNS interception failed, fallback to UDP relay: {}", err);
+            } else {
+                return Ok(());
+            }
+        }
+
         if let Err(err) = self.manager.send_to(src_addr, dst_addr.into(), payload).await {
             debug!(
                 "UDP {} -> {} payload.size: {} bytes failed, error: {}",
@@ -61,6 +80,42 @@ impl UdpTun {
             );
         }
         Ok(())
+    }
+
+    #[cfg(feature = "local-web-admin")]
+    async fn handle_dns_packet(
+        &self,
+        src_addr: SocketAddr,
+        original_dst_addr: SocketAddr,
+        dns_listener_addr: SocketAddr,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let bind_addr = match dns_listener_addr {
+            SocketAddr::V4(..) => "0.0.0.0:0",
+            SocketAddr::V6(..) => "[::]:0",
+        };
+        let socket = UdpSocket::bind(bind_addr).await?;
+        socket.send_to(payload, dns_listener_addr).await?;
+
+        let mut response = vec![0u8; 4096];
+        let (n, _) = time::timeout(Duration::from_secs(5), socket.recv_from(&mut response))
+            .await
+            .map_err(|_| io::Error::new(ErrorKind::TimedOut, "TUN DNS query timed out"))??;
+        response.truncate(n);
+        self.writer
+            .send_to(src_addr, &original_dst_addr.into(), &response)
+            .await
+    }
+
+    #[cfg(not(feature = "local-web-admin"))]
+    async fn handle_dns_packet(
+        &self,
+        _src_addr: SocketAddr,
+        _original_dst_addr: SocketAddr,
+        _dns_listener_addr: SocketAddr,
+        _payload: &[u8],
+    ) -> io::Result<()> {
+        Err(io::Error::other("local-web-admin disabled"))
     }
 
     pub async fn recv_packet(&mut self) -> BytesMut {

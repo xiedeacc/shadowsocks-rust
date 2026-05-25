@@ -11,6 +11,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use hickory_resolver::proto::op::Message;
 use ipnet::IpNet;
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -35,7 +36,7 @@ const REMOVED_SOURCE_FILES: [&str; 2] = ["direct-list.txt", "proxy-list.txt"];
 const MAX_EVENTS: usize = 4096;
 const DEFAULT_WINDOW: Duration = Duration::from_secs(300);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteDecision {
     Direct,
@@ -64,6 +65,36 @@ pub struct RoutingSources {
     pub bypass_domain_sources: Vec<String>,
     pub domestic_dns: Vec<String>,
     pub foreign_dns: Vec<String>,
+    #[serde(default = "default_dns_cache_capacity")]
+    pub dns_cache_capacity: usize,
+    #[serde(default = "default_dns_cache_ttl_seconds")]
+    pub dns_cache_ttl_seconds: u64,
+    #[serde(default = "default_dns_intercept_mode")]
+    pub dns_intercept_mode: String,
+    #[serde(default = "default_dns_listen_address")]
+    pub dns_listen_address: String,
+    #[serde(default = "default_dns_listen_port")]
+    pub dns_listen_port: u16,
+}
+
+fn default_dns_cache_capacity() -> usize {
+    100_000
+}
+
+fn default_dns_cache_ttl_seconds() -> u64 {
+    7 * 24 * 60 * 60
+}
+
+fn default_dns_intercept_mode() -> String {
+    "off".to_owned()
+}
+
+fn default_dns_listen_address() -> String {
+    "127.0.0.1".to_owned()
+}
+
+fn default_dns_listen_port() -> u16 {
+    1053
 }
 
 impl From<&RouteRulesConfig> for RoutingSources {
@@ -75,6 +106,11 @@ impl From<&RouteRulesConfig> for RoutingSources {
             bypass_domain_sources: config.bypass_domain_sources.clone(),
             domestic_dns: config.domestic_dns.clone(),
             foreign_dns: config.foreign_dns.clone(),
+            dns_cache_capacity: config.dns_cache_capacity,
+            dns_cache_ttl_seconds: config.dns_cache_ttl_seconds,
+            dns_intercept_mode: config.dns_intercept_mode.clone(),
+            dns_listen_address: config.dns_listen_address.clone(),
+            dns_listen_port: config.dns_listen_port,
         })
     }
 }
@@ -134,6 +170,38 @@ pub struct DnsEvent {
     pub query_type: String,
     pub results: Vec<IpAddr>,
     pub resolver: RouteDecision,
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+struct DnsCacheKey {
+    domain: String,
+    query_type: String,
+    resolver: RouteDecision,
+}
+
+#[derive(Clone, Debug)]
+struct DnsCacheEntry {
+    message: Message,
+    results: Vec<IpAddr>,
+    expires_at: u64,
+    inserted_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DnsCacheStats {
+    pub size: usize,
+    pub capacity: usize,
+    pub ttl_seconds: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DnsCacheView {
+    pub domain: String,
+    pub query_type: String,
+    pub resolver: RouteDecision,
+    pub results: Vec<IpAddr>,
+    pub expires_at: u64,
+    pub inserted_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -220,6 +288,8 @@ struct RoutingInner {
     domain_conflicts: VecDeque<ConflictEvent>,
     connections: VecDeque<ConnectionEvent>,
     dns: VecDeque<DnsEvent>,
+    dns_cache: HashMap<DnsCacheKey, DnsCacheEntry>,
+    dns_cache_order: VecDeque<DnsCacheKey>,
     unhit_ips: VecDeque<UnhitIpEvent>,
     unhit_domains: VecDeque<UnhitDomainEvent>,
 }
@@ -273,6 +343,8 @@ impl RoutingState {
             domain_conflicts: VecDeque::new(),
             connections: VecDeque::new(),
             dns: VecDeque::new(),
+            dns_cache: HashMap::new(),
+            dns_cache_order: VecDeque::new(),
             unhit_ips: VecDeque::new(),
             unhit_domains: VecDeque::new(),
         };
@@ -385,6 +457,10 @@ impl RoutingState {
         inner.persistent = compile_rules(&inner.persistent_raw);
         rebuild_conflicts(&mut inner);
         warn_if_domain_conflict(&mut inner, domain, RuleLayer::Dns);
+        #[cfg(all(target_os = "linux", feature = "local-dns"))]
+        if let Err(err) = crate::local::dns::intercept_linux::add_route_ips(decision, results) {
+            warn!("failed to sync DNS result IPs to nft set: {}", err);
+        }
         Ok(())
     }
 
@@ -628,6 +704,68 @@ impl RoutingState {
             .unwrap_or_default()
     }
 
+    pub async fn download_sources(&self) -> io::Result<()> {
+        let (sources, source_dir) = {
+            let inner = self.inner.read().await;
+            (inner.sources.clone(), inner.rules_dir.join(SOURCE_DIR))
+        };
+        let total_files = total_download_steps(&sources);
+        if self.update_progress().await.status != RuleUpdateStatus::Running {
+            self.begin_update_progress(total_files).await;
+        }
+
+        let mut completed_files = 0usize;
+        for source in sources
+            .geoip_sources
+            .iter()
+            .chain(sources.geosite_sources.iter())
+            .chain(sources.direct_domain_sources.iter())
+            .chain(sources.bypass_domain_sources.iter())
+        {
+            let source_name = source_progress_name(source);
+            self.mark_source_started(&source_name, completed_files, total_files)
+                .await;
+            let downloaded = match download_source(source, &source_dir).await {
+                Ok(downloaded) => downloaded,
+                Err(err) => {
+                    self.mark_update_failed(&source_name, completed_files, total_files, &err)
+                        .await;
+                    return Err(err);
+                }
+            };
+            completed_files += 1;
+            self.mark_source_completed(
+                &downloaded.display_name,
+                downloaded.from_cache,
+                &source_dir,
+                completed_files,
+                total_files,
+            )
+            .await;
+        }
+
+        self.set_update_progress(RuleUpdateProgress {
+            status: RuleUpdateStatus::Completed,
+            current_source: None,
+            completed_files,
+            total_files,
+            remaining_files: 0,
+            percent: 100,
+            message: Some("download completed".to_owned()),
+            completed_messages: self.completed_messages(),
+        })
+        .await;
+        Ok(())
+    }
+
+    pub async fn try_begin_download(&self) -> bool {
+        let total_files = {
+            let inner = self.inner.read().await;
+            total_download_steps(&inner.sources)
+        };
+        self.try_begin_update_progress(total_files)
+    }
+
     pub async fn try_begin_update(&self) -> bool {
         let total_files = {
             let inner = self.inner.read().await;
@@ -833,6 +971,37 @@ impl RoutingState {
         self.inner.read().await.sources.foreign_dns.clone()
     }
 
+    pub async fn dns_tun_intercept_target(&self) -> Option<SocketAddr> {
+        let inner = self.inner.read().await;
+        if !matches!(inner.sources.dns_intercept_mode.as_str(), "tun" | "both") {
+            return None;
+        }
+        let ip = inner.sources.dns_listen_address.parse::<IpAddr>().ok()?;
+        Some(SocketAddr::new(ip, inner.sources.dns_listen_port))
+    }
+
+    #[cfg(all(target_os = "linux", feature = "local-dns"))]
+    pub async fn sync_persistent_ip_rules_to_firewall(&self) -> io::Result<()> {
+        let (direct, bypass) = {
+            let inner = self.inner.read().await;
+            (
+                inner
+                    .persistent_raw
+                    .direct_ip
+                    .iter()
+                    .filter_map(|rule| parse_ip_net(rule))
+                    .collect::<Vec<_>>(),
+                inner
+                    .persistent_raw
+                    .bypass_ip
+                    .iter()
+                    .filter_map(|rule| parse_ip_net(rule))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        crate::local::dns::intercept_linux::replace_route_nets(&direct, &bypass)
+    }
+
     pub async fn record_connection(
         &self,
         source: SocketAddr,
@@ -874,6 +1043,88 @@ impl RoutingState {
             },
         );
         trim_old(&mut inner.dns, DEFAULT_WINDOW);
+    }
+
+    pub async fn dns_cache_lookup(&self, domain: &str, query_type: &str, resolver: RouteDecision) -> Option<Message> {
+        let mut inner = self.inner.write().await;
+        prune_dns_cache(&mut inner);
+        let key = dns_cache_key(domain, query_type, resolver);
+        inner.dns_cache.get(&key).map(|entry| entry.message.clone())
+    }
+
+    pub async fn dns_cache_insert(
+        &self,
+        domain: &str,
+        query_type: &str,
+        resolver: RouteDecision,
+        message: Message,
+        results: Vec<IpAddr>,
+    ) {
+        let mut inner = self.inner.write().await;
+        prune_dns_cache(&mut inner);
+        let key = dns_cache_key(domain, query_type, resolver);
+        let now = now();
+        let ttl = inner.sources.dns_cache_ttl_seconds.max(1);
+        inner.dns_cache.insert(
+            key.clone(),
+            DnsCacheEntry {
+                message,
+                results,
+                expires_at: now.saturating_add(ttl),
+                inserted_at: now,
+            },
+        );
+        inner.dns_cache_order.push_back(key);
+        enforce_dns_cache_capacity(&mut inner);
+    }
+
+    pub async fn dns_cache_stats(&self) -> DnsCacheStats {
+        let mut inner = self.inner.write().await;
+        prune_dns_cache(&mut inner);
+        DnsCacheStats {
+            size: inner.dns_cache.len(),
+            capacity: inner.sources.dns_cache_capacity,
+            ttl_seconds: inner.sources.dns_cache_ttl_seconds,
+        }
+    }
+
+    pub async fn dns_cache_query(&self, domain: &str) -> Vec<DnsCacheView> {
+        let mut inner = self.inner.write().await;
+        prune_dns_cache(&mut inner);
+        let domain = normalize_dns_domain(domain);
+        let mut rows = inner
+            .dns_cache
+            .iter()
+            .filter(|(key, _)| key.domain == domain)
+            .map(|(key, entry)| DnsCacheView {
+                domain: key.domain.clone(),
+                query_type: key.query_type.clone(),
+                resolver: key.resolver,
+                results: entry.results.clone(),
+                expires_at: entry.expires_at,
+                inserted_at: entry.inserted_at,
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| {
+            a.query_type
+                .cmp(&b.query_type)
+                .then_with(|| a.inserted_at.cmp(&b.inserted_at))
+        });
+        rows
+    }
+
+    pub async fn dns_cache_clear(&self, domain: Option<&str>) -> usize {
+        let mut inner = self.inner.write().await;
+        let before = inner.dns_cache.len();
+        if let Some(domain) = domain {
+            let domain = normalize_dns_domain(domain);
+            inner.dns_cache.retain(|key, _| key.domain != domain);
+            inner.dns_cache_order.retain(|key| key.domain != domain);
+        } else {
+            inner.dns_cache.clear();
+            inner.dns_cache_order.clear();
+        }
+        before.saturating_sub(inner.dns_cache.len())
     }
 
     pub async fn ip_conflicts(&self) -> Vec<ConflictEvent> {
@@ -1198,11 +1449,14 @@ fn progress_percent(completed_files: usize, total_files: usize) -> u8 {
 }
 
 fn total_update_steps(sources: &RoutingSources) -> usize {
+    total_download_steps(sources) + GENERATED_RULE_FILES.len()
+}
+
+fn total_download_steps(sources: &RoutingSources) -> usize {
     sources.geoip_sources.len()
         + sources.geosite_sources.len()
         + sources.direct_domain_sources.len()
         + sources.bypass_domain_sources.len()
-        + GENERATED_RULE_FILES.len()
 }
 
 fn normalize_rule_lists(lists: RuleLists) -> RuleLists {
@@ -1247,6 +1501,18 @@ fn normalize_domain(value: &str) -> String {
         .trim_start_matches("regexp:")
         .trim_start_matches("keyword:");
     value.to_ascii_lowercase()
+}
+
+fn normalize_dns_domain(value: &str) -> String {
+    normalize_domain(value)
+}
+
+fn dns_cache_key(domain: &str, query_type: &str, resolver: RouteDecision) -> DnsCacheKey {
+    DnsCacheKey {
+        domain: normalize_dns_domain(domain),
+        query_type: query_type.to_ascii_uppercase(),
+        resolver,
+    }
 }
 
 fn parse_text_rules(text: &str) -> Vec<String> {
@@ -2070,6 +2336,30 @@ fn trim_old<T: Timestamped>(events: &mut VecDeque<T>, window: Duration) {
     }
 }
 
+fn prune_dns_cache(inner: &mut RoutingInner) {
+    let now = now();
+    let expired = inner
+        .dns_cache
+        .iter()
+        .filter_map(|(key, entry)| (entry.expires_at <= now).then_some(key.clone()))
+        .collect::<Vec<_>>();
+    for key in expired {
+        inner.dns_cache.remove(&key);
+    }
+    inner.dns_cache_order.retain(|key| inner.dns_cache.contains_key(key));
+}
+
+fn enforce_dns_cache_capacity(inner: &mut RoutingInner) {
+    let capacity = inner.sources.dns_cache_capacity.max(1);
+    while inner.dns_cache.len() > capacity {
+        if let Some(key) = inner.dns_cache_order.pop_front() {
+            inner.dns_cache.remove(&key);
+        } else {
+            break;
+        }
+    }
+}
+
 trait Timestamped {
     fn timestamp(&self) -> u64;
 }
@@ -2172,5 +2462,76 @@ mod tests {
         assert!(snapshot.persistent.bypass_domain.contains(&"gfw.example".to_owned()));
         assert!(dir.join(DIRECT_IP_FILE).exists());
         assert!(dir.join(BYPASS_IP_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn dns_cache_insert_query_and_clear() {
+        let dir = temp_rules_dir("dns-cache");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.dns_cache_capacity = 1;
+        config.dns_cache_ttl_seconds = 60;
+
+        let state = RoutingState::load(config).await.unwrap();
+        state
+            .dns_cache_insert(
+                "Example.COM.",
+                "A",
+                RouteDecision::Direct,
+                Message::query(),
+                vec!["1.2.3.4".parse().unwrap()],
+            )
+            .await;
+
+        assert_eq!(state.dns_cache_stats().await.size, 1);
+        assert!(
+            state
+                .dns_cache_lookup("example.com", "a", RouteDecision::Direct)
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            state.dns_cache_query("example.com").await[0].results[0].to_string(),
+            "1.2.3.4"
+        );
+
+        let cleared = state.dns_cache_clear(Some("example.com")).await;
+        assert_eq!(cleared, 1);
+        assert_eq!(state.dns_cache_stats().await.size, 0);
+    }
+
+    #[tokio::test]
+    async fn dns_cache_enforces_capacity() {
+        let dir = temp_rules_dir("dns-cache-capacity");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.dns_cache_capacity = 1;
+
+        let state = RoutingState::load(config).await.unwrap();
+        state
+            .dns_cache_insert(
+                "first.example",
+                "A",
+                RouteDecision::Direct,
+                Message::query(),
+                vec!["1.1.1.1".parse().unwrap()],
+            )
+            .await;
+        state
+            .dns_cache_insert(
+                "second.example",
+                "A",
+                RouteDecision::Direct,
+                Message::query(),
+                vec!["2.2.2.2".parse().unwrap()],
+            )
+            .await;
+
+        assert_eq!(state.dns_cache_stats().await.size, 1);
+        assert!(state.dns_cache_query("first.example").await.is_empty());
+        assert_eq!(
+            state.dns_cache_query("second.example").await[0].results[0].to_string(),
+            "2.2.2.2"
+        );
     }
 }

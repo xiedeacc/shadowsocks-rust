@@ -5,6 +5,7 @@ use std::{
     fs, io,
     path::PathBuf,
     pin::Pin,
+    process::Command,
     sync::Arc,
     task::{Context, Poll},
     thread,
@@ -20,7 +21,7 @@ use tokio::{net::TcpListener, time};
 
 use crate::{
     config::WebAdminConfig,
-    local::routing::{ManualDomainRule, ManualIpRule, RoutingSources, RoutingState, RuleLists},
+    local::routing::{ManualDomainRule, ManualIpRule, RoutingState, RuleLists},
 };
 
 type ResponseBody = Full<Bytes>;
@@ -116,17 +117,30 @@ impl WebAdminHandler {
         let path = req.uri().path().to_owned();
         match (method, path.as_str()) {
             (Method::GET, "/") | (Method::GET, "/index.html") => Ok(html_response(INDEX_HTML)),
+            (Method::POST, "/api/restart") => {
+                restart_service_after_response();
+                Ok(json_response(
+                    StatusCode::ACCEPTED,
+                    &serde_json::json!({ "ok": true, "restart": true }),
+                ))
+            }
             (Method::GET, "/api/client-config") => {
                 let content = match fs::read_to_string(&self.client_config_path) {
                     Ok(content) => content,
                     Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
                     Err(err) => return Err(err),
                 };
+                let parsed = if content.trim().is_empty() {
+                    None
+                } else {
+                    json5::from_str::<serde_json::Value>(&content).ok()
+                };
                 Ok(json_response(
                     StatusCode::OK,
                     &serde_json::json!({
                         "path": self.client_config_path,
                         "content": content,
+                        "parsed": parsed,
                     }),
                 ))
             }
@@ -136,13 +150,30 @@ impl WebAdminHandler {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(&self.client_config_path, payload.content)?;
-                Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
+                restart_service_after_response();
+                Ok(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "ok": true, "restart": true }),
+                ))
             }
             (Method::GET, "/api/config/rules") => {
                 Ok(json_response(StatusCode::OK, &self.routing_state.snapshot().await))
             }
             (Method::PUT, "/api/config/rules") => {
-                let sources: RoutingSources = read_json(req).await?;
+                let route_sources: RouteSourcesPayload = read_json(req).await?;
+                let mut sources = self.routing_state.snapshot().await.sources;
+                if let Some(value) = route_sources.geoip_sources {
+                    sources.geoip_sources = value;
+                }
+                if let Some(value) = route_sources.geosite_sources {
+                    sources.geosite_sources = value;
+                }
+                if let Some(value) = route_sources.direct_domain_sources {
+                    sources.direct_domain_sources = value;
+                }
+                if let Some(value) = route_sources.bypass_domain_sources {
+                    sources.bypass_domain_sources = value;
+                }
                 self.routing_state.set_sources(sources).await;
                 Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
             }
@@ -162,8 +193,31 @@ impl WebAdminHandler {
                             return;
                         }
                     };
-                    if let Err(err) = runtime.block_on(routing_state.update_from_sources()) {
-                        log::warn!("failed to update route rules from sources: {}", err);
+                    match runtime.block_on(routing_state.update_from_sources()) {
+                        Ok(()) => restart_service_after_response(),
+                        Err(err) => log::warn!("failed to update route rules from sources: {}", err),
+                    }
+                });
+                Ok(json_response(StatusCode::ACCEPTED, &serde_json::json!({ "ok": true })))
+            }
+            (Method::POST, "/api/rules/download") => {
+                let routing_state = self.routing_state.clone();
+                if !routing_state.try_begin_download().await {
+                    return Ok(json_response(
+                        StatusCode::ACCEPTED,
+                        &serde_json::json!({ "ok": true, "started": false, "message": "rule update already running" }),
+                    ));
+                }
+                thread::spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                        Ok(runtime) => runtime,
+                        Err(err) => {
+                            log::warn!("failed to create route rule download runtime: {}", err);
+                            return;
+                        }
+                    };
+                    if let Err(err) = runtime.block_on(routing_state.download_sources()) {
+                        log::warn!("failed to download route rule sources: {}", err);
                     }
                 });
                 Ok(json_response(StatusCode::ACCEPTED, &serde_json::json!({ "ok": true })))
@@ -179,6 +233,25 @@ impl WebAdminHandler {
                     "foreign_dns": self.routing_state.foreign_dns().await,
                 }),
             )),
+            (Method::GET, "/api/dns/cache/stats") => Ok(json_response(
+                StatusCode::OK,
+                &self.routing_state.dns_cache_stats().await,
+            )),
+            (Method::GET, "/api/dns/cache/query") => {
+                let domain = query_param(req.uri().query(), "domain").unwrap_or_default();
+                Ok(json_response(
+                    StatusCode::OK,
+                    &self.routing_state.dns_cache_query(&domain).await,
+                ))
+            }
+            (Method::POST, "/api/dns/cache/clear") => {
+                let payload: DnsCacheClearPayload = read_json(req).await?;
+                let cleared = self.routing_state.dns_cache_clear(payload.domain.as_deref()).await;
+                Ok(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "ok": true, "cleared": cleared }),
+                ))
+            }
             (Method::PUT, "/api/dns") => {
                 let mut sources = self.routing_state.snapshot().await.sources;
                 let dns: DnsPayload = read_json(req).await?;
@@ -278,8 +351,60 @@ struct DnsPayload {
 }
 
 #[derive(serde::Deserialize)]
+struct RouteSourcesPayload {
+    geoip_sources: Option<Vec<String>>,
+    geosite_sources: Option<Vec<String>>,
+    direct_domain_sources: Option<Vec<String>>,
+    bypass_domain_sources: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct DnsCacheClearPayload {
+    domain: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
 struct ClientConfigPayload {
     content: String,
+}
+
+fn restart_service_after_response() {
+    thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(300));
+        if let Err(err) = Command::new("systemctl").args(["restart", "shadowsocks-client.service"]).status() {
+            log::warn!("failed to restart shadowsocks-client.service after config save: {}", err);
+        }
+    });
+}
+
+fn query_param(query: Option<&str>, name: &str) -> Option<String> {
+    let query = query?;
+    query.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == name).then(|| {
+            value
+                .replace('+', " ")
+                .split('%')
+                .enumerate()
+                .fold(String::new(), |mut acc, (idx, chunk)| {
+                    if idx == 0 {
+                        acc.push_str(chunk);
+                    } else if chunk.len() >= 2 {
+                        if let Ok(byte) = u8::from_str_radix(&chunk[..2], 16) {
+                            acc.push(byte as char);
+                            acc.push_str(&chunk[2..]);
+                        } else {
+                            acc.push('%');
+                            acc.push_str(chunk);
+                        }
+                    } else {
+                        acc.push('%');
+                        acc.push_str(chunk);
+                    }
+                    acc
+                })
+        })
+    })
 }
 
 async fn read_json<T: serde::de::DeserializeOwned>(req: Request<Incoming>) -> io::Result<T> {
@@ -322,11 +447,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
     html,body{height:100%}
     body{font-family:system-ui,sans-serif;margin:0;padding:24px;background:var(--bg);color:var(--ink);line-height:1.4;box-sizing:border-box;overflow:hidden}
     h1{margin:0 0 6px;color:var(--brand2)}
-    nav{padding:0;margin:0 0 16px;background:transparent;border:0;box-shadow:none}
-    nav button{margin:0 8px 0 0;background:var(--soft);color:var(--brand2)}
+    nav{display:flex;justify-content:center;padding:0;margin:0 0 16px;background:transparent;border:0;box-shadow:none}
+    .nav-tabs{position:relative;display:inline-flex;gap:18px}
+    .nav-indicator{position:absolute;top:0;left:0;height:100%;border-radius:9px;background:var(--brand);transition:transform .24s ease,width .24s ease;z-index:0}
+    nav button{position:relative;z-index:1;margin:0;background:var(--soft);color:var(--brand2);transition:color .18s ease,background .18s ease}
     nav button:hover{background:#d7e7f4;color:var(--brand2)}
-    nav button.active{background:var(--brand);color:#fff}
-    nav button.active:hover{background:var(--brand2);color:#fff}
+    nav button.active{background:transparent;color:#fff}
+    nav button.active:hover{background:transparent;color:#fff}
     fieldset,.panel{border:1px solid var(--line);border-radius:10px;margin:0 0 8px;padding:9px;background:var(--panel);box-shadow:0 1px 2px #10203312}
     legend{font-weight:700;color:var(--brand2)}
     .card-title{margin:8px 0 5px;font-size:15px;color:var(--brand2)}
@@ -350,21 +477,37 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .conflict-table td{word-break:break-word}
     pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto}
     .tab{display:none;height:calc(100vh - 88px);min-height:0;overflow:hidden}.tab.active{display:block}
-    #basic.tab.active,#routeConfig.tab.active{display:flex;flex-direction:column}
+    #basic.tab.active,#dns.tab.active,#routeConfig.tab.active{display:flex;flex-direction:column}
     .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
-    .activity-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(3,minmax(0,1fr));gap:16px;align-items:stretch;height:100%;min-height:0}
+    .activity-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:16px;align-items:stretch;height:100%;min-height:0}
     .activity-card{min-width:0;min-height:0;display:flex;flex-direction:column}
     .basic-layout{display:grid;grid-template-columns:minmax(380px,540px) 1fr;gap:18px;align-items:stretch;height:calc(100% - 46px);min-height:0}
     .basic-form-panel{overflow:auto;min-height:0}
     .basic-json-panel{display:flex;flex-direction:column;min-height:0}
     .basic-json-panel textarea{flex:1}
     .basic-actions{margin-top:8px}
-    .route-rules-layout{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:18px;align-items:start;margin-top:8px;min-height:0}
+    .route-toolbar{text-align:center;margin:8px 0 0}
+    .route-toolbar .hint{margin:4px 0 0}
+    .route-config-layout{display:grid;grid-template-columns:repeat(2,minmax(320px,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:16px;min-height:0;flex:1}
+    .route-config-column{min-width:0;min-height:0;display:flex;flex-direction:column}
+    .route-config-column .scroll-panel{min-height:0;flex:1}
+    .rules-workspace{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.8fr);gap:12px;align-items:stretch;min-height:0;flex:1}
+    .rules-workspace #rulesJson{height:auto;min-height:0;flex:1}
+    .rules-workspace .progress-box{height:auto;margin:2px 0 5px;max-width:none;max-height:none;box-sizing:border-box}
+    .route-rules-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:start;margin-top:8px;min-height:0}
+    .temporary-panel{display:flex;flex-direction:column}
+    .temporary-panel .route-rules-layout{flex:1;align-items:stretch;margin-top:0}
+    .temporary-panel fieldset{display:flex;flex-direction:column;margin:0}
+    .temporary-panel label{display:flex;flex-direction:column;flex:1;min-height:0}
+    .temporary-panel textarea{flex:1;min-height:0}
+    .dns-layout{display:grid;grid-template-columns:minmax(320px,420px) 1fr;gap:18px;min-height:0;flex:1}
+    .dns-panel{min-height:0;overflow:auto}
     .form-line{display:grid;grid-template-columns:150px 1fr;gap:10px;align-items:center;margin:4px 0}
     .form-line label{margin:0;font-size:13px}
     .form-line input[type=checkbox]{width:16px;height:16px;margin:0;justify-self:start}
     #clientConfig{min-height:0;height:auto;max-height:none;overflow:auto;resize:vertical;font-size:13px}
     #rulesJson{min-height:100px;height:auto;max-height:none;overflow:auto;resize:vertical;font-size:13px;flex:1}
+    #routeConfig .route-config-column>.scroll-panel{height:auto}
     #routeConfig .route-rules-layout textarea{height:clamp(56px,8vh,96px);min-height:56px;resize:vertical}
     .row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;margin:4px 0}
     .row input{margin:0}
@@ -374,15 +517,21 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .progress-bar{height:10px;background:var(--soft);border-radius:999px;overflow:hidden;margin:8px 0}
     .progress-fill{height:100%;width:0;background:var(--brand)}
     .progress-completed{white-space:pre-line;margin-top:8px}
-    @media(max-width:1100px){.activity-grid,.route-rules-layout{grid-template-columns:1fr}.activity-grid{grid-template-rows:repeat(6,minmax(0,1fr))}}
+    @media(max-width:1300px){.route-config-layout{grid-template-columns:1fr}.route-config-column{min-height:260px}}
+    @media(max-width:1000px){.rules-workspace{grid-template-columns:1fr}}
+    @media(max-width:1100px){.activity-grid,.route-rules-layout{grid-template-columns:1fr}.activity-grid{grid-template-rows:repeat(4,minmax(0,1fr))}}
     @media(max-width:900px){.basic-layout{grid-template-columns:1fr}#clientConfig,#rulesJson{height:auto;max-height:none}}
   </style>
 </head>
 <body>
   <nav>
-    <button onclick="show('basic')">Basic Config</button>
-    <button onclick="show('connections')">Connections</button>
-    <button onclick="show('routeConfig')">Generated Route Config</button>
+    <div class="nav-tabs">
+      <span class="nav-indicator" aria-hidden="true"></span>
+      <button data-tab="basic" onclick="show('basic')">Basic</button>
+      <button data-tab="connections" onclick="show('connections')">Connections</button>
+      <button data-tab="dns" onclick="show('dns')">DNS</button>
+      <button data-tab="routeConfig" onclick="show('routeConfig')">Route</button>
+    </div>
   </nav>
 
   <section id="basic" class="tab active">
@@ -408,6 +557,21 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="form-line"><label>TCP Redir</label><select id="tcpRedir"><option>redirect</option><option>tproxy</option></select></div>
           <div class="form-line"><label>UDP Redir</label><select id="udpRedir"><option>tproxy</option></select></div>
         </fieldset>
+        <h3 class="card-title">DNS Listener</h3>
+        <fieldset>
+          <div class="form-line"><label>Enable DNS</label><input id="dnsEnable" type="checkbox"></div>
+          <div class="form-line"><label>Bind Address</label><select id="dnsBind"><option>127.0.0.1</option><option>0.0.0.0</option></select></div>
+          <div class="form-line"><label>Port</label><input id="dnsPort" type="number" min="1" max="65535"></div>
+          <label>Domestic DNS</label>
+          <div id="dnsDomesticList"></div>
+          <button type="button" onclick="addDns('dnsDomesticList')">+ Domestic DNS</button>
+          <label>Foreign DNS</label>
+          <div id="dnsForeignList"></div>
+          <button type="button" onclick="addDns('dnsForeignList')">+ Foreign DNS</button>
+          <div class="form-line"><label>Cache Capacity</label><input id="dnsCacheCapacity" type="number" min="1"></div>
+          <div class="form-line"><label>Cache TTL Seconds</label><input id="dnsCacheTtl" type="number" min="1"></div>
+          <div class="form-line"><label>Intercept Mode</label><select id="dnsInterceptMode"><option>off</option><option>firewall</option><option>tun</option><option>both</option></select></div>
+        </fieldset>
         <h3 class="card-title">Server</h3>
         <fieldset>
           <div class="form-line"><label>Server Address</label><input id="serverHost"></div>
@@ -429,7 +593,28 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
     <div class="basic-actions">
       <button onclick="loadClientConfig()">Reload</button>
-      <button onclick="saveClientConfig()">Save Generated JSON</button>
+      <button onclick="saveClientConfig()">Save</button>
+      <button onclick="restartService()">Restart</button>
+    </div>
+  </section>
+
+  <section id="dns" class="tab">
+    <div class="dns-layout">
+      <div class="panel dns-panel">
+        <h3 class="card-title">Cache Management</h3>
+        <div><strong>Size:</strong> <span id="dnsCacheSize">0</span> / <span id="dnsCacheCapacityOut">0</span></div>
+        <div><strong>TTL:</strong> <span id="dnsCacheTtlOut">0</span> seconds</div>
+        <label>Domain<input id="dnsQueryDomain" placeholder="example.com"></label>
+        <label>Record Type<select id="dnsQueryType"><option>A</option><option>AAAA</option></select></label>
+        <button onclick="queryDnsCache()">Query Cache</button>
+        <button onclick="clearDnsDomain()">Clear Domain</button>
+        <button onclick="clearDnsAll()">Clear All Cache</button>
+        <p class="hint" id="dnsCacheMessage"></p>
+      </div>
+      <div class="dns-panel">
+        <h3 class="card-title">Cached Results</h3>
+        <div id="dnsCacheOut" class="scroll-panel section-scroll"></div>
+      </div>
     </div>
   </section>
 
@@ -444,14 +629,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <div id="connOut" class="scroll-panel section-scroll"></div>
       </div>
       <div class="activity-card">
-        <h3 class="card-title">Domain Conflicts</h3>
-        <div id="domainOut" class="scroll-panel section-scroll"></div>
-      </div>
-      <div class="activity-card">
-        <h3 class="card-title">IP Conflicts</h3>
-        <div id="ipOut" class="scroll-panel section-scroll"></div>
-      </div>
-      <div class="activity-card">
         <h3 class="card-title">Unhit DNS</h3>
         <div id="unhitDnsOut" class="scroll-panel section-scroll"></div>
       </div>
@@ -463,54 +640,79 @@ const INDEX_HTML: &str = r#"<!doctype html>
   </section>
 
   <section id="routeConfig" class="tab">
-    <h3 class="card-title">Rules</h3>
-    <textarea id="rulesJson"></textarea>
-    <div>
-      <button onclick="loadRules()">Reload Rules</button>
-      <button onclick="saveRules()">Save Rules</button>
+    <div class="route-config-layout">
+      <div class="route-config-column">
+        <h3 class="card-title">Rules</h3>
+        <div class="rules-workspace">
+          <textarea id="rulesJson"></textarea>
+          <div id="ruleUpdateProgress" class="progress-box">
+            <div><strong>Status:</strong> <span id="progressStatus">idle</span></div>
+            <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+            <div><strong>Current source:</strong> <span id="progressSource">-</span></div>
+            <div><strong>Progress:</strong> <span id="progressPercent">0%</span>, <strong>remaining files:</strong> <span id="progressRemaining">0</span></div>
+            <div class="hint" id="progressMessage"></div>
+            <div class="hint progress-completed" id="progressCompleted"></div>
+          </div>
+        </div>
+      </div>
+      <div class="route-config-column">
+        <h3 class="card-title">Domain Conflicts</h3>
+        <div id="domainOut" class="scroll-panel section-scroll"></div>
+      </div>
+      <div class="route-config-column">
+        <h3 class="card-title">IP Conflicts</h3>
+        <div id="ipOut" class="scroll-panel section-scroll"></div>
+      </div>
+      <div class="route-config-column">
+        <h3 class="card-title">Temporary Lists</h3>
+        <div class="scroll-panel section-scroll temporary-panel">
+          <div class="route-rules-layout" style="padding:9px">
+            <fieldset>
+              <label>Direct IP<textarea id="tmp_direct_ip"></textarea></label>
+              <label>Direct Domain<textarea id="tmp_direct_domain"></textarea></label>
+            </fieldset>
+            <fieldset>
+              <label>Bypass IP<textarea id="tmp_bypass_ip"></textarea></label>
+              <label>Bypass Domain<textarea id="tmp_bypass_domain"></textarea></label>
+            </fieldset>
+          </div>
+          <p class="hint" style="padding:0 9px 9px">Temporary lists have priority over generated direct/bypass files. 一行一个配置，无需分隔符。</p>
+        </div>
+      </div>
     </div>
-    <h3 class="card-title">Temporary Lists</h3>
-    <div class="route-rules-layout">
-      <fieldset>
-        <label>Direct IP<textarea id="tmp_direct_ip"></textarea></label>
-        <label>Direct Domain<textarea id="tmp_direct_domain"></textarea></label>
-      </fieldset>
-      <fieldset>
-        <label>Bypass IP<textarea id="tmp_bypass_ip"></textarea></label>
-        <label>Bypass Domain<textarea id="tmp_bypass_domain"></textarea></label>
-      </fieldset>
-    </div>
-    <p class="hint">Temporary lists have priority over generated direct/bypass files. 一行一个配置，无需分隔符。</p>
-    <div style="text-align:center;margin-top:20px">
-      <button onclick="updateRules()">Download and Generate Persistent Files</button>
-    </div>
-    <p class="hint" style="text-align:center">Downloads are cached in data/source. Downloads are first written to data/source/temp and only replace the source file after success.</p>
-    <div id="ruleUpdateProgress" class="progress-box">
-      <div><strong>Status:</strong> <span id="progressStatus">idle</span></div>
-      <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
-      <div><strong>Current source:</strong> <span id="progressSource">-</span></div>
-      <div><strong>Progress:</strong> <span id="progressPercent">0%</span>, <strong>remaining files:</strong> <span id="progressRemaining">0</span></div>
-      <div class="hint" id="progressMessage"></div>
-      <div class="hint progress-completed" id="progressCompleted"></div>
+    <div class="route-toolbar">
+      <button onclick="loadRules()">Reload</button>
+      <button onclick="saveRules()">Save</button>
+      <button onclick="downloadRules()">Download</button>
+      <button onclick="generateRules()">Generate</button>
+      <p class="hint">Manual selections and manual_domain.txt/manual_ip.txt changes take effect after Generate.</p>
     </div>
   </section>
 
   <script>
     let currentConfigPath='', currentRawConfig={}, rulesSnapshot={};
     const routeSourceKeys=['geoip_sources','geosite_sources','direct_domain_sources','bypass_domain_sources'];
-    const dnsKeys=['domestic_dns','foreign_dns'];
+    const dnsKeys=['domestic_dns','foreign_dns','dns_cache_capacity','dns_cache_ttl_seconds','dns_intercept_mode','dns_listen_address','dns_listen_port'];
     const sourceKeys=[...routeSourceKeys,...dnsKeys];
     function token(){return new URLSearchParams(location.search).get('token')||''}
     async function api(path,opt={}){opt.headers=Object.assign({'x-admin-token':token()},opt.headers||{});let r=await fetch(path,opt);let j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}
     let activeTab='basic', activityTimer=null;
+    function updateNavIndicator(){
+      let active=document.querySelector('nav button.active'), indicator=document.querySelector('.nav-indicator'), tabs=document.querySelector('.nav-tabs');
+      if(!active||!indicator||!tabs)return;
+      indicator.style.width=active.offsetWidth+'px';
+      indicator.style.transform='translateX('+active.offsetLeft+'px)';
+    }
     function show(id){
       activeTab=id;
       if(activityTimer){clearInterval(activityTimer);activityTimer=null}
       document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));
       document.getElementById(id).classList.add('active');
-      document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.getAttribute('onclick')===`show('${id}')`));
+      document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===id));
+      updateNavIndicator();
       refresh(id);
       if(id==='connections')activityTimer=setInterval(()=>refresh('connections').catch(e=>{console.warn(e)}),3000);
+      if(id==='routeConfig')activityTimer=setInterval(()=>renderRouteConflicts().catch(e=>{console.warn(e)}),3000);
     }
     function lines(v){return (v||'').split('\n').map(s=>s.trim()).filter(Boolean)}
     function setLines(id,arr){document.getElementById(id).value=(arr||[]).join('\n')}
@@ -519,12 +721,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function firstServer(){return (currentRawConfig.servers||[])[0]||{}}
     function setSelect(id,value){let el=document.getElementById(id); if([...el.options].some(o=>o.value===value)){el.value=value}else{el.value=el.options[0].value}}
     function renderBasic(){
-      let socks=firstLocal('socks'), http=firstLocal('http'), redir=firstLocal('redir'), server=firstServer();
+      let socks=firstLocal('socks'), http=firstLocal('http'), redir=firstLocal('redir'), dns=firstLocal('dns'), server=firstServer();
+      let routeRules=currentRawConfig.route_rules||{};
       setSelect('socksBind',socks.local_address||'127.0.0.1'); socksPort.value=socks.local_port||1080;
       setSelect('httpBind',http.local_address||'127.0.0.1'); httpPort.value=http.local_port||1081;
       redirEnable.checked=!!redir.protocol;
       setSelect('redirBind',redir.local_address||'0.0.0.0'); redirPort.value=redir.local_port||12345;
       setSelect('redirMode',redir.mode||'tcp_and_udp'); setSelect('tcpRedir',redir.tcp_redir||'redirect'); setSelect('udpRedir',redir.udp_redir||'tproxy');
+      dnsEnable.checked=!!dns.protocol;
+      setSelect('dnsBind',dns.local_address||'0.0.0.0'); dnsPort.value=dns.local_port||1053;
+      renderDnsList('dnsDomesticList',routeRules.domestic_dns||[(dns.local_dns_address||'223.5.5.5')+':'+(dns.local_dns_port||53)]);
+      renderDnsList('dnsForeignList',routeRules.foreign_dns||[(dns.remote_dns_address||'8.8.8.8')+':'+(dns.remote_dns_port||53)]);
+      dnsCacheCapacity.value=routeRules.dns_cache_capacity||100000;
+      dnsCacheTtl.value=routeRules.dns_cache_ttl_seconds||604800;
+      setSelect('dnsInterceptMode',routeRules.dns_intercept_mode||'off');
       serverHost.value=server.server||''; serverPort.value=server.server_port||443; setSelect('method',server.method||'aes-256-gcm');
       password.value=server.password||''; timeout.value=server.timeout||300; plugin.value=server.plugin||''; pluginOpts.value=server.plugin_opts||'';
       updateClientJson();
@@ -537,19 +747,52 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if(redirEnable.checked){
         locals.push({local_address:redirBind.value,local_port:num(redirPort.value,12345),protocol:'redir',mode:redirMode.value,tcp_redir:tcpRedir.value,udp_redir:udpRedir.value});
       }
+      let routeRules=Object.assign({},currentRawConfig.route_rules||{});
+      routeRules.dns_cache_capacity=num(dnsCacheCapacity.value,100000);
+      routeRules.dns_cache_ttl_seconds=num(dnsCacheTtl.value,604800);
+      routeRules.dns_intercept_mode=dnsInterceptMode.value;
+      routeRules.dns_listen_address=dnsBind.value;
+      routeRules.dns_listen_port=num(dnsPort.value,1053);
+      let domesticDns=readDns('dnsDomesticList');
+      let foreignDns=readDns('dnsForeignList');
+      routeRules.domestic_dns=domesticDns.length?domesticDns:['223.5.5.5:53'];
+      routeRules.foreign_dns=foreignDns.length?foreignDns:['8.8.8.8:53'];
+      if(dnsEnable.checked){
+        let domestic=parseHostPort(routeRules.domestic_dns[0],'223.5.5.5',53);
+        let foreign=parseHostPort(routeRules.foreign_dns[0],'8.8.8.8',53);
+        locals.push({local_address:dnsBind.value,local_port:num(dnsPort.value,1053),protocol:'dns',mode:'tcp_and_udp',local_dns_address:domestic.host,local_dns_port:domestic.port,remote_dns_address:foreign.host,remote_dns_port:foreign.port,client_cache_size:64});
+      }
       let server={server:serverHost.value.trim(),server_port:num(serverPort.value,443),password:password.value,timeout:num(timeout.value,300),method:method.value};
       if(plugin.value.trim())server.plugin=plugin.value.trim();
       if(pluginOpts.value.trim())server.plugin_opts=pluginOpts.value.trim();
-      return Object.assign({},currentRawConfig,{locals,servers:[server]});
+      return Object.assign({},currentRawConfig,{locals,servers:[server],route_rules:routeRules});
+    }
+    function parseHostPort(value,hostDefault,portDefault){
+      let text=(value||'').trim();
+      if(!text)return {host:hostDefault,port:portDefault};
+      let idx=text.lastIndexOf(':');
+      if(idx>0&&text.indexOf(']')<idx){
+        let port=parseInt(text.slice(idx+1),10);
+        if(Number.isFinite(port))return {host:text.slice(0,idx).replace(/^\[|\]$/g,''),port};
+      }
+      return {host:text.replace(/^\[|\]$/g,''),port:portDefault};
     }
     function updateClientJson(){clientConfig.value=JSON.stringify(buildClientConfig(),null,2)}
+    function dnsRow(containerId,value=''){let div=document.createElement('div');div.className='row';div.innerHTML=`<input value="${value.replaceAll('"','&quot;')}" placeholder="8.8.8.8:53"><button type="button">Remove</button>`;div.querySelector('button').onclick=()=>{div.remove();updateClientJson()};div.querySelector('input').oninput=updateClientJson;document.getElementById(containerId).appendChild(div)}
+    function addDns(containerId){dnsRow(containerId);updateClientJson()}
+    function readDns(containerId){return [...document.querySelectorAll('#'+containerId+' input')].map(i=>i.value.trim()).filter(Boolean)}
+    function renderDnsList(containerId,values){document.getElementById(containerId).innerHTML='';(values||[]).forEach(v=>dnsRow(containerId,v));if(!(values||[]).length)dnsRow(containerId,'')}
     async function loadClientConfig(){
       let r=await api('/api/client-config'); currentConfigPath=r.path; configPath.textContent=r.path;
-      try{currentRawConfig=r.content?JSON.parse(r.content):{}}catch(e){currentRawConfig={locals:[],servers:[]}; clientConfig.value=r.content||''; return}
+      try{currentRawConfig=r.parsed||(r.content?JSON.parse(r.content):{})}catch(e){currentRawConfig={locals:[],servers:[]}}
+      currentRawConfig.locals=currentRawConfig.locals||[];
+      currentRawConfig.servers=currentRawConfig.servers||[];
+      currentRawConfig.route_rules=currentRawConfig.route_rules||{};
       renderBasic();
     }
-    async function saveClientConfig(){updateClientJson(); await api('/api/client-config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:clientConfig.value})}); await loadClientConfig()}
-    ['socksBind','socksPort','httpBind','httpPort','redirEnable','redirBind','redirPort','redirMode','tcpRedir','udpRedir','serverHost','serverPort','method','password','timeout','plugin','pluginOpts'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
+    async function saveClientConfig(){updateClientJson(); await api('/api/client-config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:clientConfig.value})}); configPath.textContent=currentConfigPath+' saved, restarting service...'}
+    async function restartService(){await api('/api/restart',{method:'POST'}); configPath.textContent='restarting service...'}
+    ['socksBind','socksPort','httpBind','httpPort','redirEnable','redirBind','redirPort','redirMode','tcpRedir','udpRedir','dnsEnable','dnsBind','dnsPort','dnsCacheCapacity','dnsCacheTtl','dnsInterceptMode','serverHost','serverPort','method','password','timeout','plugin','pluginOpts'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
 
     function sourceRow(key,value=''){let div=document.createElement('div');div.className='row';div.innerHTML=`<input value="${value.replaceAll('"','&quot;')}"><button type="button">Remove</button>`;div.querySelector('button').onclick=()=>{div.remove();updateRulesJson()};div.querySelector('input').oninput=updateRulesJson;document.getElementById(key).appendChild(div)}
     function addSource(key){sourceRow(key);updateRulesJson()}
@@ -557,10 +800,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function renderSource(key,values){document.getElementById(key).innerHTML='';(values||[]).forEach(v=>sourceRow(key,v));if(!(values||[]).length)sourceRow(key,'')}
     function tempRules(){return {direct_ip:lines(tmp_direct_ip.value),direct_domain:lines(tmp_direct_domain.value),bypass_ip:lines(tmp_bypass_ip.value),bypass_domain:lines(tmp_bypass_domain.value)}}
     function sourcesFromForm(){return (rulesSnapshot&&rulesSnapshot.sources)||{}}
-    function updateRulesJson(snapshot=rulesSnapshot){rulesJson.value=JSON.stringify({sources:(snapshot&&snapshot.sources)||{}},null,2)}
+    function routeRuleSourcesForJson(sources){let copy=Object.assign({},sources||{});dnsKeys.forEach(key=>delete copy[key]);return copy}
+    function updateRulesJson(snapshot=rulesSnapshot){rulesJson.value=JSON.stringify({sources:routeRuleSourcesForJson((snapshot&&snapshot.sources)||{})},null,2)}
     function rulesPayloadFromJson(){
       let payload=JSON.parse(rulesJson.value||'{}');
-      let sources=Object.assign({},(rulesSnapshot&&rulesSnapshot.sources)||{},payload.sources||{});
+      if(payload.sources){dnsKeys.forEach(key=>delete payload.sources[key])}
+      let sources=routeRuleSourcesForJson(payload.sources||{});
       let temporary=tempRules();
       return {sources,temporary};
     }
@@ -601,6 +846,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
       progressTimer=setInterval(()=>pollUpdateProgress().catch(e=>{progressMessage.textContent=e.message}),1000);
       await pollUpdateProgress();
     }
+    async function startRuleJob(path,message){
+      await saveRules();
+      renderProgress({status:'running',current_source:'starting',percent:0,remaining_files:0,message,completed_messages:[]});
+      await api(path,{method:'POST'});
+      if(progressTimer)clearInterval(progressTimer);
+      progressTimer=setInterval(()=>pollUpdateProgress().catch(e=>{progressMessage.textContent=e.message}),1000);
+      await pollUpdateProgress();
+    }
+    async function downloadRules(){await startRuleJob('/api/rules/download','starting download')}
+    async function generateRules(){await startRuleJob('/api/rules/update','starting generation')}
     function table(rows,cols,cls=''){if(!rows.length)return '<p class="hint">No data</p>';return `<table class="${cls}"><thead><tr>`+cols.map(c=>'<th>'+c[0]+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+String(c[1](r)??'')+'</td>').join('')+'</tr>').join('')+'</tbody></table>'}
     function fmtTime(ts){return ts?new Date(ts*1000).toLocaleString():''}
     let manualSelectEditing=false;
@@ -633,8 +888,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function renderUnhitIp(){let rows=await api('/api/activity/unhit-ip');unhitIpOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['IP',r=>r.ip]])}
     async function renderUnhitDns(){let rows=await api('/api/activity/unhit-dns');unhitDnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>r.domain]])}
     async function renderDns(){let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>r.domain],['Type',r=>r.query_type],['Results',r=>(r.results||[]).join('<br>')],['Resolver',r=>r.resolver]])}
-    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='routeConfig')await loadRules();if(id==='connections'){await renderDns();await renderConnections();await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip');await renderUnhitDns();await renderUnhitIp()}}catch(e){alert(e.message)}}
-    document.querySelector("nav button[onclick=\"show('basic')\"]").classList.add('active');
+    async function renderRouteConflicts(){await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip')}
+    async function renderDnsCacheStats(){let s=await api('/api/dns/cache/stats');dnsCacheSize.textContent=s.size;dnsCacheCapacityOut.textContent=s.capacity;dnsCacheTtlOut.textContent=s.ttl_seconds}
+    async function queryDnsCache(){await renderDnsCacheStats();let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheOut.innerHTML='<p class="hint">Enter a domain</p>';return}let rows=await api('/api/dns/cache/query?domain='+encodeURIComponent(domain));let type=dnsQueryType.value;rows=rows.filter(r=>!type||r.query_type===type);dnsCacheOut.innerHTML=table(rows,[['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Results',r=>(r.results||[]).join('<br>')],['Expires',r=>fmtTime(r.expires_at)]])}
+    async function clearDnsDomain(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheMessage.textContent='Enter a domain first';return}let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({domain})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';await queryDnsCache()}
+    async function clearDnsAll(){let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';dnsCacheOut.innerHTML='';await renderDnsCacheStats()}
+    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='dns')await renderDnsCacheStats();if(id==='routeConfig'){await loadRules();await renderRouteConflicts()}if(id==='connections'){await renderDns();await renderConnections();await renderUnhitDns();await renderUnhitIp()}}catch(e){alert(e.message)}}
+    document.querySelector("nav button[data-tab=\"basic\"]").classList.add('active');
+    window.addEventListener('resize',updateNavIndicator);
+    requestAnimationFrame(updateNavIndicator);
     loadClientConfig();
   </script>
 </body>

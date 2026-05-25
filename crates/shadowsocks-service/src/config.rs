@@ -643,6 +643,16 @@ struct SSRouteRulesConfig {
     domestic_dns: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     foreign_dns: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dns_cache_capacity: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dns_cache_ttl_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dns_intercept_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dns_listen_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dns_listen_port: Option<u16>,
 }
 
 /// Server config type
@@ -1585,6 +1595,11 @@ pub struct RouteRulesConfig {
     pub bypass_domain_sources: Vec<String>,
     pub domestic_dns: Vec<String>,
     pub foreign_dns: Vec<String>,
+    pub dns_cache_capacity: usize,
+    pub dns_cache_ttl_seconds: u64,
+    pub dns_intercept_mode: String,
+    pub dns_listen_address: String,
+    pub dns_listen_port: u16,
 }
 
 #[cfg(feature = "local-web-admin")]
@@ -1598,6 +1613,11 @@ impl Default for RouteRulesConfig {
             bypass_domain_sources: DEFAULT_BYPASS_DOMAIN_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
             domestic_dns: vec!["223.5.5.5:53".to_owned(), "119.29.29.29:53".to_owned()],
             foreign_dns: vec!["8.8.8.8:53".to_owned(), "1.1.1.1:53".to_owned()],
+            dns_cache_capacity: 100_000,
+            dns_cache_ttl_seconds: 7 * 24 * 60 * 60,
+            dns_intercept_mode: "off".to_owned(),
+            dns_listen_address: "127.0.0.1".to_owned(),
+            dns_listen_port: 1053,
         }
     }
 }
@@ -2806,6 +2826,21 @@ impl Config {
                 if let Some(dns) = route_rules.foreign_dns {
                     parsed.foreign_dns = dns;
                 }
+                if let Some(capacity) = route_rules.dns_cache_capacity {
+                    parsed.dns_cache_capacity = capacity.max(1);
+                }
+                if let Some(ttl) = route_rules.dns_cache_ttl_seconds {
+                    parsed.dns_cache_ttl_seconds = ttl.max(1);
+                }
+                if let Some(mode) = route_rules.dns_intercept_mode {
+                    parsed.dns_intercept_mode = mode;
+                }
+                if let Some(address) = route_rules.dns_listen_address {
+                    parsed.dns_listen_address = address;
+                }
+                if let Some(port) = route_rules.dns_listen_port {
+                    parsed.dns_listen_port = port;
+                }
                 nconfig.route_rules = parsed;
             }
         }
@@ -3599,6 +3634,11 @@ impl fmt::Display for Config {
                 bypass_domain_sources: Some(self.route_rules.bypass_domain_sources.clone()),
                 domestic_dns: Some(self.route_rules.domestic_dns.clone()),
                 foreign_dns: Some(self.route_rules.foreign_dns.clone()),
+                dns_cache_capacity: Some(self.route_rules.dns_cache_capacity),
+                dns_cache_ttl_seconds: Some(self.route_rules.dns_cache_ttl_seconds),
+                dns_intercept_mode: Some(self.route_rules.dns_intercept_mode.clone()),
+                dns_listen_address: Some(self.route_rules.dns_listen_address.clone()),
+                dns_listen_port: Some(self.route_rules.dns_listen_port),
             });
         }
 

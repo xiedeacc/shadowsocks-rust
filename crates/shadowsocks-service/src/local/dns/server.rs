@@ -846,6 +846,12 @@ impl DnsClient {
         {
             let domain = query.name().to_ascii();
             if let Some(decision) = routing_state.route_domain(&domain).await {
+                let query_type = query.query_type().to_string();
+                if let Some(cached) = routing_state.dns_cache_lookup(&domain, &query_type, decision).await {
+                    let ips = collect_answer_ips(&cached);
+                    routing_state.record_dns(domain, query_type, ips, decision).await;
+                    return (Ok(cached), matches!(decision, RouteDecision::Proxy));
+                }
                 let response = match decision {
                     RouteDecision::Direct => {
                         let local_addr = match routing_state
@@ -874,12 +880,13 @@ impl DnsClient {
                 };
                 if let Ok(ref msg) = response {
                     let ips = collect_answer_ips(msg);
+                    routing_state
+                        .dns_cache_insert(&domain, &query_type, decision, msg.clone(), ips.clone())
+                        .await;
                     if !ips.is_empty() {
                         let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
                     }
-                    routing_state
-                        .record_dns(domain, query.query_type().to_string(), ips, decision)
-                        .await;
+                    routing_state.record_dns(domain, query_type, ips, decision).await;
                 }
                 return (response, matches!(decision, RouteDecision::Proxy));
             }
@@ -888,11 +895,15 @@ impl DnsClient {
         match should_forward_by_query(&self.context, &self.balancer, query) {
             Some(true) => {
                 let remote_response = self.lookup_remote(query, remote_addr).await;
+                self.record_web_dns_result(query, &remote_response, RouteDecision::Proxy)
+                    .await;
                 trace!("pick remote response (query): {:?}", remote_response);
                 return (remote_response, true);
             }
             Some(false) => {
                 let local_response = self.lookup_local(query, local_addr).await;
+                self.record_web_dns_result(query, &local_response, RouteDecision::Direct)
+                    .await;
                 trace!("pick local response (query): {:?}", local_response);
                 return (local_response, false);
             }
@@ -917,6 +928,8 @@ impl DnsClient {
             tokio::select! {
                 response = &mut remote_response_fut, if remote_response.is_none() => {
                     if use_remote {
+                        self.record_web_dns_result(query, &response, RouteDecision::Proxy)
+                            .await;
                         trace!("pick remote response (response): {:?}", response);
                         return (response, true);
                     } else {
@@ -925,9 +938,13 @@ impl DnsClient {
                 }
                 decision = &mut decider, if !use_remote => {
                     if let Some(local_response) = decision {
+                        self.record_web_dns_result(query, &local_response, RouteDecision::Direct)
+                            .await;
                         trace!("pick local response (response): {:?}", local_response);
                         return (local_response, false);
                     } else if let Some(remote_response) = remote_response {
+                        self.record_web_dns_result(query, &remote_response, RouteDecision::Proxy)
+                            .await;
                         trace!("pick remote response (response): {:?}", remote_response);
                         return (remote_response, true);
                     } else {
@@ -936,6 +953,26 @@ impl DnsClient {
                 }
                 else => unreachable!(),
             }
+        }
+    }
+
+    async fn record_web_dns_result(&self, query: &Query, response: &io::Result<Message>, decision: RouteDecision) {
+        #[cfg(feature = "local-web-admin")]
+        if let Some(routing_state) = self.context.routing_state()
+            && query.query_class() == DNSClass::IN
+            && query.query_type() != RecordType::PTR
+            && let Ok(msg) = response
+        {
+            let domain = query.name().to_ascii();
+            let query_type = query.query_type().to_string();
+            let ips = collect_answer_ips(msg);
+            routing_state
+                .dns_cache_insert(&domain, &query_type, decision, msg.clone(), ips.clone())
+                .await;
+            if !ips.is_empty() {
+                let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
+            }
+            routing_state.record_dns(domain, query_type, ips, decision).await;
         }
     }
 

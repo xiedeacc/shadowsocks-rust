@@ -22,6 +22,8 @@ use self::{
     loadbalancing::{PingBalancer, PingBalancerBuilder},
 };
 
+#[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
+use self::dns::intercept_linux::DnsInterceptGuard;
 #[cfg(feature = "local-dns")]
 use self::dns::{Dns, DnsBuilder};
 #[cfg(feature = "local-fake-dns")]
@@ -84,6 +86,8 @@ pub struct Server {
     tun_servers: Vec<Tun>,
     #[cfg(feature = "local-dns")]
     dns_servers: Vec<Dns>,
+    #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
+    dns_intercept_guards: Vec<DnsInterceptGuard>,
     #[cfg(feature = "local-redir")]
     redir_servers: Vec<Redir>,
     #[cfg(feature = "local-fake-dns")]
@@ -261,6 +265,8 @@ impl Server {
             tun_servers: Vec::new(),
             #[cfg(feature = "local-dns")]
             dns_servers: Vec::new(),
+            #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
+            dns_intercept_guards: Vec::new(),
             #[cfg(feature = "local-redir")]
             redir_servers: Vec::new(),
             #[cfg(feature = "local-fake-dns")]
@@ -290,6 +296,9 @@ impl Server {
                 Some(web_admin) => Some(WebAdminBuilder::new(web_admin, routing_state.clone()).build().await?),
             },
         };
+
+        #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
+        let dns_intercept_mode = config.route_rules.dns_intercept_mode.clone();
 
         for local_instance in config.local {
             let local_config = local_instance.config;
@@ -428,6 +437,19 @@ impl Server {
                         Some(a) => a,
                         None => return Err(io::Error::other("dns requires local address")),
                     };
+
+                    #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
+                    if matches!(dns_intercept_mode.as_str(), "firewall" | "both") {
+                        match self::dns::intercept_linux::setup_firewall_redirect(client_addr.port()) {
+                            Ok(guard) => {
+                                if let Err(err) = routing_state.sync_persistent_ip_rules_to_firewall().await {
+                                    log::warn!("failed to load persistent IP rules into nft sets: {}", err);
+                                }
+                                local_server.dns_intercept_guards.push(guard);
+                            }
+                            Err(err) => log::warn!("failed to setup DNS firewall interception: {}", err),
+                        }
+                    }
 
                     let mut server_builder = {
                         let local_addr = local_config.local_dns_addr.expect("missing local_dns_addr");
