@@ -355,16 +355,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .activity-card{min-width:0}
     .basic-layout{display:grid;grid-template-columns:minmax(380px,540px) 1fr;gap:18px;align-items:start}
     .route-rules-layout{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:18px;align-items:start;margin-top:18px}
-    .generated-layout{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:18px;align-items:start}
     .form-line{display:grid;grid-template-columns:150px 1fr;gap:10px;align-items:center;margin:4px 0}
     .form-line label{margin:0;font-size:13px}
     .form-line input[type=checkbox]{width:16px;height:16px;margin:0;justify-self:start}
-    #clientConfig,#rulesJson,#generatedFileContent{min-height:0;height:548px;max-height:548px;overflow:auto;resize:vertical;font-size:13px}
-    .generated-header{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:8px 0 5px}
-    .generated-header .card-title{margin:0}
-    .file-tabs{display:grid;grid-template-columns:repeat(4,auto);gap:6px;margin:0}
-    .file-tabs button{margin:0;padding:5px 8px;background:var(--soft);color:var(--brand2);font-size:12px}
-    .file-tabs button.active{background:var(--brand);color:#fff}
+    #clientConfig,#rulesJson{min-height:0;height:548px;max-height:548px;overflow:auto;resize:vertical;font-size:13px}
     .row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;margin:4px 0}
     .row input{margin:0}
     .row button{margin:0;white-space:nowrap}
@@ -373,8 +367,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .progress-bar{height:10px;background:var(--soft);border-radius:999px;overflow:hidden;margin:8px 0}
     .progress-fill{height:100%;width:0;background:var(--brand)}
     .progress-completed{white-space:pre-line;margin-top:8px}
-    @media(max-width:1100px){.generated-layout,.activity-grid,.route-rules-layout{grid-template-columns:1fr}}
-    @media(max-width:900px){.basic-layout{grid-template-columns:1fr}#clientConfig,#rulesJson,#generatedFileContent{height:420px;max-height:420px}}
+    @media(max-width:1100px){.activity-grid,.route-rules-layout{grid-template-columns:1fr}}
+    @media(max-width:900px){.basic-layout{grid-template-columns:1fr}#clientConfig,#rulesJson{height:420px;max-height:420px}}
   </style>
 </head>
 <body>
@@ -475,24 +469,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
     <button onclick="loadRules()">Reload DNS Config</button>
     <button onclick="saveRules()">Save DNS Config</button>
-    <div class="generated-layout">
-      <div>
-        <h3 class="card-title">Generated JSON</h3>
-        <textarea id="rulesJson"></textarea>
-      </div>
-      <div>
-        <div class="generated-header">
-          <h3 class="card-title">Generated Files</h3>
-          <div class="file-tabs">
-            <button id="tab_direct_ip" onclick="showGeneratedFile('direct_ip')">direct_ip.txt</button>
-            <button id="tab_direct_domain" onclick="showGeneratedFile('direct_domain')">direct_domain.txt</button>
-            <button id="tab_bypass_ip" onclick="showGeneratedFile('bypass_ip')">bypass_ip.txt</button>
-            <button id="tab_bypass_domain" onclick="showGeneratedFile('bypass_domain')">bypass_domain.txt</button>
-          </div>
-        </div>
-        <textarea id="generatedFileContent" readonly></textarea>
-      </div>
-    </div>
+    <h3 class="card-title">Generated JSON</h3>
+    <textarea id="rulesJson"></textarea>
     <div class="route-rules-layout">
       <div>
         <h3 class="card-title">Rule Sources</h3>
@@ -519,7 +497,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <div style="text-align:center;margin-top:20px">
       <button onclick="updateRules()">Download and Generate Persistent Files</button>
     </div>
-    <p class="hint" style="text-align:center">Downloads are cached in the data directory. To skip slow downloads, manually place a non-empty file with the same URL filename there, for example geoip.dat or geosite.dat.</p>
+    <p class="hint" style="text-align:center">Downloads are cached in data/source. Downloads are first written to data/source/temp and only replace the source file after success.</p>
     <div id="ruleUpdateProgress" class="progress-box">
       <div><strong>Status:</strong> <span id="progressStatus">idle</span></div>
       <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
@@ -531,7 +509,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   </section>
 
   <script>
-    let currentConfigPath='', currentRawConfig={}, rulesSnapshot={}, activeGeneratedFile='direct_ip';
+    let currentConfigPath='', currentRawConfig={}, rulesSnapshot={};
     const routeSourceKeys=['geoip_sources','geosite_sources','direct_domain_sources','bypass_domain_sources'];
     const dnsKeys=['domestic_dns','foreign_dns'];
     const sourceKeys=[...routeSourceKeys,...dnsKeys];
@@ -593,18 +571,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function tempRules(){return {direct_ip:lines(tmp_direct_ip.value),direct_domain:lines(tmp_direct_domain.value),bypass_ip:lines(tmp_bypass_ip.value),bypass_domain:lines(tmp_bypass_domain.value)}}
     function sourcesFromForm(){let s={};sourceKeys.forEach(k=>s[k]=readSource(k));return s}
     function updateRulesJson(){rulesJson.value=JSON.stringify({sources:sourcesFromForm(),temporary:tempRules()},null,2)}
-    function showGeneratedFile(key){
-      activeGeneratedFile=key;
-      ['direct_ip','direct_domain','bypass_ip','bypass_domain'].forEach(k=>document.getElementById('tab_'+k).classList.toggle('active',k===key));
-      let persistent=(rulesSnapshot&&rulesSnapshot.persistent)||{};
-      generatedFileContent.value=(persistent[key]||[]).join('\n');
-    }
     async function loadRules(){
       rulesSnapshot=await api('/api/config/rules'); let tmp=await api('/api/temp-rules');
       sourceKeys.forEach(k=>{let el=document.getElementById(k); if(el)renderSource(k,(rulesSnapshot.sources||{})[k]||[])});
       setLines('tmp_direct_ip',tmp.direct_ip);setLines('tmp_direct_domain',tmp.direct_domain);setLines('tmp_bypass_ip',tmp.bypass_ip);setLines('tmp_bypass_domain',tmp.bypass_domain);
       updateRulesJson();
-      showGeneratedFile(activeGeneratedFile);
     }
     async function saveRules(){
       await api('/api/config/rules',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(sourcesFromForm())});
@@ -644,10 +615,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function setManualIp(cidr,region){await api('/api/manual-ip',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({cidr,region})});await renderConflicts('ipOut','/api/conflicts/ip')}
     async function setManualDomain(domain,region){await api('/api/manual-domain',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({domain,region})});await renderConflicts('domainOut','/api/conflicts/domain')}
     function manualSelect(row,manual,onchange){
-      let regions=[...(row.regions||[])];
-      if(!regions.length)regions=['cn','proxy'];
+      let regions=['direct','bypass'];
       let selected=manual[row.value]||'';
-      if(selected&&!regions.includes(selected))regions.push(selected);
       return `<select onchange="${onchange}('${row.value}',this.value)"><option value="">Auto</option>${regions.map(region=>`<option value="${region}"${region===selected?' selected':''}>${region}</option>`).join('')}</select>`;
     }
     async function renderConflicts(id,path){
