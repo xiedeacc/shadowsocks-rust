@@ -970,7 +970,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
     <div class="activity-grid">
       <div class="activity-card">
-        <h3 class="card-title">Recent DNS <label class="inline-check"><input id="recentDnsRecord" type="checkbox" checked> Record</label></h3>
+        <h3 class="card-title">Recent DNS</h3>
         <div id="dnsOut" class="scroll-panel section-scroll"></div>
       </div>
       <div class="activity-card">
