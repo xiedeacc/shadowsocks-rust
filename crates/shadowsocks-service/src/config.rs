@@ -648,6 +648,10 @@ struct SSRouteRulesConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     dns_cache_ttl_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    dns_cache_refresh_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dns_cache_refresh_batch_size: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     dns_intercept_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dns_listen_address: Option<String>,
@@ -1597,6 +1601,8 @@ pub struct RouteRulesConfig {
     pub foreign_dns: Vec<String>,
     pub dns_cache_capacity: usize,
     pub dns_cache_ttl_seconds: u64,
+    pub dns_cache_refresh_enabled: bool,
+    pub dns_cache_refresh_batch_size: usize,
     pub dns_intercept_mode: String,
     pub dns_listen_address: String,
     pub dns_listen_port: u16,
@@ -1615,6 +1621,8 @@ impl Default for RouteRulesConfig {
             foreign_dns: vec!["8.8.8.8:53".to_owned(), "1.1.1.1:53".to_owned()],
             dns_cache_capacity: 100_000,
             dns_cache_ttl_seconds: 7 * 24 * 60 * 60,
+            dns_cache_refresh_enabled: true,
+            dns_cache_refresh_batch_size: 500,
             dns_intercept_mode: "off".to_owned(),
             dns_listen_address: "127.0.0.1".to_owned(),
             dns_listen_port: 1053,
@@ -2832,6 +2840,12 @@ impl Config {
                 if let Some(ttl) = route_rules.dns_cache_ttl_seconds {
                     parsed.dns_cache_ttl_seconds = ttl.max(1);
                 }
+                if let Some(enabled) = route_rules.dns_cache_refresh_enabled {
+                    parsed.dns_cache_refresh_enabled = enabled;
+                }
+                if let Some(batch_size) = route_rules.dns_cache_refresh_batch_size {
+                    parsed.dns_cache_refresh_batch_size = batch_size.max(1);
+                }
                 if let Some(mode) = route_rules.dns_intercept_mode {
                     parsed.dns_intercept_mode = mode;
                 }
@@ -3636,6 +3650,8 @@ impl fmt::Display for Config {
                 foreign_dns: Some(self.route_rules.foreign_dns.clone()),
                 dns_cache_capacity: Some(self.route_rules.dns_cache_capacity),
                 dns_cache_ttl_seconds: Some(self.route_rules.dns_cache_ttl_seconds),
+                dns_cache_refresh_enabled: Some(self.route_rules.dns_cache_refresh_enabled),
+                dns_cache_refresh_batch_size: Some(self.route_rules.dns_cache_refresh_batch_size),
                 dns_intercept_mode: Some(self.route_rules.dns_intercept_mode.clone()),
                 dns_listen_address: Some(self.route_rules.dns_listen_address.clone()),
                 dns_listen_port: Some(self.route_rules.dns_listen_port),

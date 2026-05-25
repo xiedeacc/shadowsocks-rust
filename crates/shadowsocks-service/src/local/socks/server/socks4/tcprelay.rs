@@ -145,12 +145,12 @@ impl Socks4TcpHandler {
 
         #[cfg(feature = "local-web-admin")]
         if let Some(routing_state) = context.routing_state() {
-            use crate::local::{net::AutoProxyIo, routing::RouteDecision};
+            use crate::local::{net::AutoProxyIo, routing::ConnectionDecision};
 
             let decision = if remote.is_bypassed() {
-                RouteDecision::Direct
+                ConnectionDecision::Direct
             } else {
-                RouteDecision::Proxy
+                ConnectionDecision::Socks5Proxy
             };
             routing_state
                 .record_connection(peer_addr, &target_addr, "tcp", decision)

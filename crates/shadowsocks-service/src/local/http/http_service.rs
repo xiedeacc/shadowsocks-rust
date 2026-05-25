@@ -136,9 +136,9 @@ impl HttpService {
             #[cfg(feature = "local-web-admin")]
             if let Some(routing_state) = self.context.routing_state() {
                 let decision = if stream.is_bypassed() {
-                    crate::local::routing::RouteDecision::Direct
+                    crate::local::routing::ConnectionDecision::Direct
                 } else {
-                    crate::local::routing::RouteDecision::Proxy
+                    crate::local::routing::ConnectionDecision::HttpProxy
                 };
                 routing_state
                     .record_connection(self.peer_addr, &host, "tcp", decision)

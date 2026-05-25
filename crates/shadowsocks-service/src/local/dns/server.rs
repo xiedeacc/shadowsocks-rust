@@ -136,6 +136,8 @@ impl DnsBuilder {
 
         let local_addr = Arc::new(self.local_addr);
         let remote_addr = Arc::new(self.remote_addr);
+        #[cfg(feature = "local-web-admin")]
+        client.spawn_proxy_dns_cache_refresh(remote_addr.clone());
 
         let mut tcp_server = None;
         if self.mode.enable_tcp() {
@@ -638,6 +640,15 @@ fn collect_answer_ips(message: &Message) -> Vec<IpAddr> {
         .collect()
 }
 
+#[cfg(feature = "local-web-admin")]
+fn dns_cache_refresh_query(domain: &str, query_type: &str) -> io::Result<Query> {
+    let name = Name::from_str(domain)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid dns name: {err}")))?;
+    let record_type = RecordType::from_str(query_type)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid dns type: {err}")))?;
+    Ok(Query::query(name, record_type))
+}
+
 /// given the query, determine whether remote/local query should be used, or inconclusive
 fn should_forward_by_query(context: &ServiceContext, balancer: &PingBalancer, query: &Query) -> Option<bool> {
     // No server was configured, then always resolve with local
@@ -790,6 +801,63 @@ impl DnsClient {
         }
     }
 
+    #[cfg(feature = "local-web-admin")]
+    fn spawn_proxy_dns_cache_refresh(self: &Arc<Self>, remote_addr: Arc<Address>) {
+        let client = self.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(24 * 60 * 60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                client.refresh_proxy_dns_cache(&remote_addr).await;
+            }
+        });
+    }
+
+    #[cfg(feature = "local-web-admin")]
+    async fn refresh_proxy_dns_cache(&self, remote_addr: &Address) {
+        let Some(routing_state) = self.context.routing_state() else {
+            return;
+        };
+        let candidates = routing_state.dns_cache_proxy_refresh_candidates().await;
+        for candidate in candidates {
+            let query = match dns_cache_refresh_query(&candidate.domain, &candidate.query_type) {
+                Ok(query) => query,
+                Err(err) => {
+                    warn!(
+                        "failed to build dns cache refresh query for {} {}: {}",
+                        candidate.domain, candidate.query_type, err
+                    );
+                    continue;
+                }
+            };
+            match self.lookup_remote(&query, remote_addr).await {
+                Ok(msg) => {
+                    let ips = collect_answer_ips(&msg);
+                    if routing_state
+                        .dns_cache_refresh_preserve_ttl(
+                            &candidate.domain,
+                            &candidate.query_type,
+                            RouteDecision::Proxy,
+                            msg,
+                            ips.clone(),
+                        )
+                        .await
+                        && !ips.is_empty()
+                    {
+                        let _ = routing_state
+                            .add_dns_results(RouteDecision::Proxy, &candidate.domain, &ips)
+                            .await;
+                    }
+                }
+                Err(err) => warn!(
+                    "failed to refresh proxy dns cache for {} {}: {}",
+                    candidate.domain, candidate.query_type, err
+                ),
+            }
+        }
+    }
+
     async fn resolve(
         &self,
         request: Message,
@@ -862,7 +930,7 @@ impl DnsClient {
                         "dns route cache hit {} {:?}: resolver={:?}, results={:?}",
                         domain, query.query_type(), decision, ips
                     );
-                    routing_state.record_dns(domain, query_type, ips, decision).await;
+                    routing_state.record_dns(domain, query_type, ips, decision, true).await;
                     return (Ok(cached), matches!(decision, RouteDecision::Proxy));
                 }
                 info!(
@@ -912,9 +980,19 @@ impl DnsClient {
                     if !ips.is_empty() {
                         let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
                     }
-                    routing_state.record_dns(domain, query_type, ips, decision).await;
+                    routing_state.record_dns(domain, query_type, ips, decision, false).await;
                 }
                 return (response, matches!(decision, RouteDecision::Proxy));
+            }
+            let query_type = query.query_type().to_string();
+            if let Some((cached, decision)) = routing_state.dns_cache_lookup_any(&domain, &query_type).await {
+                let ips = collect_answer_ips(&cached);
+                info!(
+                    "dns fallback cache hit {} {:?}: resolver={:?}, results={:?}",
+                    domain, query.query_type(), decision, ips
+                );
+                routing_state.record_dns(domain, query_type, ips, decision, true).await;
+                return (Ok(cached), matches!(decision, RouteDecision::Proxy));
             }
         }
 
@@ -998,7 +1076,7 @@ impl DnsClient {
             if !ips.is_empty() {
                 let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
             }
-            routing_state.record_dns(domain, query_type, ips, decision).await;
+            routing_state.record_dns(domain, query_type, ips, decision, false).await;
         }
     }
 

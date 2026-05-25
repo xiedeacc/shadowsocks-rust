@@ -585,7 +585,7 @@ async fn establish_client_tcp_redir(
         #[cfg(feature = "local-web-admin")]
         if let Some(routing_state) = context.routing_state() {
             routing_state
-                .record_connection(peer_addr, addr, "tcp", crate::local::routing::RouteDecision::Direct)
+                .record_connection(peer_addr, addr, "tcp", crate::local::routing::ConnectionDecision::Tun)
                 .await;
         }
         return establish_tcp_tunnel_bypassed(&mut stream, &mut remote, peer_addr, addr).await;
@@ -598,14 +598,9 @@ async fn establish_client_tcp_redir(
         AutoProxyClientStream::connect_with_opts(context.clone(), &server, addr, server.connect_opts_ref()).await?;
     #[cfg(feature = "local-web-admin")]
     if let Some(routing_state) = context.routing_state() {
-        use crate::local::{net::AutoProxyIo, routing::RouteDecision};
-
-        let decision = if remote.is_bypassed() {
-            RouteDecision::Direct
-        } else {
-            RouteDecision::Proxy
-        };
-        routing_state.record_connection(peer_addr, addr, "tcp", decision).await;
+        routing_state
+            .record_connection(peer_addr, addr, "tcp", crate::local::routing::ConnectionDecision::Tun)
+            .await;
     }
     establish_tcp_tunnel(svr_cfg, &mut stream, &mut remote, peer_addr, addr).await
 }

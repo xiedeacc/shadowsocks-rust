@@ -45,8 +45,8 @@ impl Drop for DnsInterceptGuard {
     }
 }
 
-pub fn setup_firewall_redirect(port: u16, dns_exempt_ips: &[IpAddr]) -> io::Result<DnsInterceptGuard> {
-    match setup_nft(port, dns_exempt_ips) {
+pub fn setup_firewall_redirect(port: u16, redir_port: Option<u16>, dns_exempt_ips: &[IpAddr]) -> io::Result<DnsInterceptGuard> {
+    match setup_nft(port, redir_port, dns_exempt_ips) {
         Ok(()) => {
             info!("installed nftables DNS interception rules on local port {}", port);
             Ok(DnsInterceptGuard { backend: Backend::Nft })
@@ -169,6 +169,94 @@ pub fn replace_route_nets(work_dir: &Path, direct: &[IpNet], bypass: &[IpNet]) -
     result
 }
 
+pub fn bypass_set_matches(input: &str) -> io::Result<Vec<String>> {
+    let query = parse_debug_ip_query(input)?;
+    let set_name = match query.family() {
+        IpFamily::V4 => BYPASS4_SET,
+        IpFamily::V6 => BYPASS6_SET,
+    };
+    let output = Command::new("nft")
+        .args(["list", "set", "inet", NFT_TABLE, set_name])
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!("nft list set exited with {}", output.status)));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut matches = parse_nft_ip_nets(&text)
+        .into_iter()
+        .filter(|net| query.matches(net))
+        .map(|net| net.to_string())
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum IpFamily {
+    V4,
+    V6,
+}
+
+#[derive(Clone, Debug)]
+enum DebugIpQuery {
+    Ip(IpAddr),
+    Net(IpNet),
+}
+
+impl DebugIpQuery {
+    fn family(&self) -> IpFamily {
+        match self {
+            DebugIpQuery::Ip(IpAddr::V4(..)) | DebugIpQuery::Net(IpNet::V4(..)) => IpFamily::V4,
+            DebugIpQuery::Ip(IpAddr::V6(..)) | DebugIpQuery::Net(IpNet::V6(..)) => IpFamily::V6,
+        }
+    }
+
+    fn matches(&self, net: &IpNet) -> bool {
+        match self {
+            DebugIpQuery::Ip(ip) => net.contains(ip),
+            DebugIpQuery::Net(query_net) => ip_nets_overlap(query_net, net),
+        }
+    }
+}
+
+fn parse_debug_ip_query(input: &str) -> io::Result<DebugIpQuery> {
+    let input = input.trim();
+    if input.contains('/') {
+        input
+            .parse::<IpNet>()
+            .map(DebugIpQuery::Net)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid cidr: {err}")))
+    } else {
+        input
+            .parse::<IpAddr>()
+            .map(DebugIpQuery::Ip)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid ip: {err}")))
+    }
+}
+
+fn parse_nft_ip_nets(output: &str) -> Vec<IpNet> {
+    output
+        .split(|c: char| c.is_ascii_whitespace() || matches!(c, ',' | '{' | '}'))
+        .filter_map(|token| {
+            let token = token.trim_matches([';', '"']);
+            if token.is_empty() || token.contains('-') {
+                return None;
+            }
+            token.parse::<IpNet>().ok().or_else(|| token.parse::<IpAddr>().ok().map(IpNet::from))
+        })
+        .collect()
+}
+
+fn ip_nets_overlap(left: &IpNet, right: &IpNet) -> bool {
+    match (left, right) {
+        (IpNet::V4(left), IpNet::V4(right)) => left.contains(&right.network()) || right.contains(&left.network()),
+        (IpNet::V6(left), IpNet::V6(right)) => left.contains(&right.network()) || right.contains(&left.network()),
+        _ => false,
+    }
+}
+
 fn write_add_elements(file: &mut File, decision: RouteDecision, nets: &[IpNet]) -> io::Result<()> {
     for (set_name, family_nets) in [
         (
@@ -203,7 +291,7 @@ fn write_add_elements(file: &mut File, decision: RouteDecision, nets: &[IpNet]) 
     Ok(())
 }
 
-fn setup_nft(port: u16, dns_exempt_ips: &[IpAddr]) -> io::Result<()> {
+fn setup_nft(port: u16, redir_port: Option<u16>, dns_exempt_ips: &[IpAddr]) -> io::Result<()> {
     let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
     command("nft", &["add", "table", "inet", NFT_TABLE])?;
     add_nft_sets()?;
@@ -250,6 +338,50 @@ fn setup_nft(port: u16, dns_exempt_ips: &[IpAddr]) -> io::Result<()> {
                 &format!(":{port}"),
             ],
         )?;
+        if proto == "tcp"
+            && let Some(redir_port) = redir_port
+        {
+            command(
+                "nft",
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    NFT_TABLE,
+                    "prerouting",
+                    "ip",
+                    "daddr",
+                    "@bypass4",
+                    "tcp",
+                    "dport",
+                    "!=",
+                    "53",
+                    "redirect",
+                    "to",
+                    &format!(":{redir_port}"),
+                ],
+            )?;
+            command(
+                "nft",
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    NFT_TABLE,
+                    "prerouting",
+                    "ip6",
+                    "daddr",
+                    "@bypass6",
+                    "tcp",
+                    "dport",
+                    "!=",
+                    "53",
+                    "redirect",
+                    "to",
+                    &format!(":{redir_port}"),
+                ],
+            )?;
+        }
         for ip in dns_exempt_ips {
             let family_expr = match ip {
                 IpAddr::V4(..) => "ip",
@@ -289,6 +421,50 @@ fn setup_nft(port: u16, dns_exempt_ips: &[IpAddr]) -> io::Result<()> {
                 &format!(":{port}"),
             ],
         )?;
+        if proto == "tcp"
+            && let Some(redir_port) = redir_port
+        {
+            command(
+                "nft",
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    NFT_TABLE,
+                    "output",
+                    "ip",
+                    "daddr",
+                    "@bypass4",
+                    "tcp",
+                    "dport",
+                    "!=",
+                    "53",
+                    "redirect",
+                    "to",
+                    &format!(":{redir_port}"),
+                ],
+            )?;
+            command(
+                "nft",
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    NFT_TABLE,
+                    "output",
+                    "ip6",
+                    "daddr",
+                    "@bypass6",
+                    "tcp",
+                    "dport",
+                    "!=",
+                    "53",
+                    "redirect",
+                    "to",
+                    &format!(":{redir_port}"),
+                ],
+            )?;
+        }
     }
     Ok(())
 }

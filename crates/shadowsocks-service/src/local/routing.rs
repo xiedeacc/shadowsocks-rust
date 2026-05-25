@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     io::{self, Write},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, RwLock as StdRwLock},
@@ -36,6 +36,17 @@ const REMOVED_SOURCE_FILES: [&str; 2] = ["direct-list.txt", "proxy-list.txt"];
 const MAX_EVENTS: usize = 4096;
 const DEFAULT_WINDOW: Duration = Duration::from_secs(300);
 const BYPASS_IP_PERSIST_DELAY: Duration = Duration::from_secs(30);
+const DNS_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const CONNECTION_ACTIVITY_TTL: Duration = Duration::from_secs(10);
+const PRIVATE_DIRECT_IP_RULES: [&str; 7] = [
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "::1/128",
+    "fc00::/7",
+    "fe80::/10",
+];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +81,10 @@ pub struct RoutingSources {
     pub dns_cache_capacity: usize,
     #[serde(default = "default_dns_cache_ttl_seconds")]
     pub dns_cache_ttl_seconds: u64,
+    #[serde(default = "default_dns_cache_refresh_enabled")]
+    pub dns_cache_refresh_enabled: bool,
+    #[serde(default = "default_dns_cache_refresh_batch_size")]
+    pub dns_cache_refresh_batch_size: usize,
     #[serde(default = "default_dns_intercept_mode")]
     pub dns_intercept_mode: String,
     #[serde(default = "default_dns_listen_address")]
@@ -84,6 +99,14 @@ fn default_dns_cache_capacity() -> usize {
 
 fn default_dns_cache_ttl_seconds() -> u64 {
     7 * 24 * 60 * 60
+}
+
+fn default_dns_cache_refresh_enabled() -> bool {
+    true
+}
+
+fn default_dns_cache_refresh_batch_size() -> usize {
+    500
 }
 
 fn default_dns_intercept_mode() -> String {
@@ -109,6 +132,8 @@ impl From<&RouteRulesConfig> for RoutingSources {
             foreign_dns: config.foreign_dns.clone(),
             dns_cache_capacity: config.dns_cache_capacity,
             dns_cache_ttl_seconds: config.dns_cache_ttl_seconds,
+            dns_cache_refresh_enabled: config.dns_cache_refresh_enabled,
+            dns_cache_refresh_batch_size: config.dns_cache_refresh_batch_size,
             dns_intercept_mode: config.dns_intercept_mode.clone(),
             dns_listen_address: config.dns_listen_address.clone(),
             dns_listen_port: config.dns_listen_port,
@@ -159,9 +184,21 @@ pub struct ConnectionEvent {
     pub source_port: u16,
     pub destination_ip: Option<IpAddr>,
     pub destination_domain: Option<String>,
+    pub domain: Option<String>,
     pub destination_port: u16,
     pub protocol: String,
-    pub decision: RouteDecision,
+    pub decision: ConnectionDecision,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionDecision {
+    Direct,
+    Proxy,
+    HttpProxy,
+    Socks5Proxy,
+    Redir,
+    Tun,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -171,6 +208,7 @@ pub struct DnsEvent {
     pub query_type: String,
     pub results: Vec<IpAddr>,
     pub resolver: RouteDecision,
+    pub cache_hit: bool,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -186,6 +224,7 @@ struct DnsCacheEntry {
     results: Vec<IpAddr>,
     expires_at: u64,
     inserted_at: u64,
+    refreshed_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -193,6 +232,8 @@ pub struct DnsCacheStats {
     pub size: usize,
     pub capacity: usize,
     pub ttl_seconds: u64,
+    pub refresh_enabled: bool,
+    pub refresh_batch_size: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -203,6 +244,35 @@ pub struct DnsCacheView {
     pub results: Vec<IpAddr>,
     pub expires_at: u64,
     pub inserted_at: u64,
+    pub refreshed_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DnsCacheIpView {
+    pub ip: IpAddr,
+    pub domain: String,
+    pub query_type: String,
+    pub resolver: RouteDecision,
+    pub expires_at: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct DnsCacheRefreshCandidate {
+    pub domain: String,
+    pub query_type: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct IpMembershipDebug {
+    pub query: String,
+    pub valid: bool,
+    pub error: Option<String>,
+    pub bypass_file: bool,
+    pub bypass_file_matches: Vec<String>,
+    pub nft_checked: bool,
+    pub nft_bypass: bool,
+    pub nft_matches: Vec<String>,
+    pub nft_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -290,7 +360,9 @@ struct RoutingInner {
     ip_conflicts: VecDeque<ConflictEvent>,
     domain_conflicts: VecDeque<ConflictEvent>,
     connections: VecDeque<ConnectionEvent>,
+    connection_activity_until: u64,
     dns: VecDeque<DnsEvent>,
+    reverse_domains: HashMap<IpAddr, String>,
     dns_cache: HashMap<DnsCacheKey, DnsCacheEntry>,
     dns_cache_order: VecDeque<DnsCacheKey>,
     unhit_ips: VecDeque<UnhitIpEvent>,
@@ -327,8 +399,8 @@ impl RoutingState {
         let manual_domain_modified = file_modified(&config.rules_dir.join(MANUAL_DOMAIN_FILE))?;
         let (ip_regions, ip_sources) = read_rule_metadata(&config.rules_dir.join(IP_METADATA_FILE))?;
         let (domain_regions, domain_sources) = read_rule_metadata(&config.rules_dir.join(DOMAIN_METADATA_FILE))?;
-        let temporary_raw = RuleLists::default();
-        let temporary = CompiledRules::default();
+        let temporary_raw = with_private_direct_rules(RuleLists::default());
+        let temporary = compile_rules(&temporary_raw);
         let mut inner = RoutingInner {
             sources: RoutingSources::from(&config),
             rules_dir: config.rules_dir,
@@ -347,7 +419,9 @@ impl RoutingState {
             ip_conflicts: VecDeque::new(),
             domain_conflicts: VecDeque::new(),
             connections: VecDeque::new(),
+            connection_activity_until: 0,
             dns: VecDeque::new(),
+            reverse_domains: HashMap::new(),
             dns_cache: HashMap::new(),
             dns_cache_order: VecDeque::new(),
             unhit_ips: VecDeque::new(),
@@ -378,7 +452,7 @@ impl RoutingState {
     }
 
     pub async fn set_temporary_rules(&self, rules: RuleLists) -> io::Result<()> {
-        let rules = normalize_rule_lists(rules);
+        let rules = with_private_direct_rules(normalize_rule_lists(rules));
         validate_temporary_rules(&rules)?;
         #[cfg(all(target_os = "linux", feature = "local-dns"))]
         let (rules_dir, bypass_nets) = {
@@ -1150,13 +1224,24 @@ impl RoutingState {
         source: SocketAddr,
         target: &Address,
         protocol: &str,
-        decision: RouteDecision,
+        decision: ConnectionDecision,
     ) {
         let (destination_ip, destination_domain, destination_port) = match target {
             Address::SocketAddress(saddr) => (Some(saddr.ip()), None, saddr.port()),
             Address::DomainNameAddress(domain, port) => (None, Some(domain.clone()), *port),
         };
         let mut inner = self.inner.write().await;
+        if inner.connection_activity_until < now() {
+            return;
+        }
+        if destination_ip.is_some_and(|ip| is_private_connection_ip(&ip)) {
+            return;
+        }
+        let domain = destination_domain.clone().or_else(|| {
+            destination_ip
+                .as_ref()
+                .and_then(|ip| inner.reverse_domains.get(ip).cloned())
+        });
         push_event(
             &mut inner.connections,
             ConnectionEvent {
@@ -1165,6 +1250,7 @@ impl RoutingState {
                 source_port: source.port(),
                 destination_ip,
                 destination_domain,
+                domain,
                 destination_port,
                 protocol: protocol.to_owned(),
                 decision,
@@ -1173,16 +1259,33 @@ impl RoutingState {
         trim_old(&mut inner.connections, DEFAULT_WINDOW);
     }
 
-    pub async fn record_dns(&self, domain: String, query_type: String, results: Vec<IpAddr>, resolver: RouteDecision) {
+    pub async fn enable_connection_activity(&self) {
         let mut inner = self.inner.write().await;
+        inner.connection_activity_until = now().saturating_add(CONNECTION_ACTIVITY_TTL.as_secs());
+    }
+
+    pub async fn record_dns(
+        &self,
+        domain: String,
+        query_type: String,
+        results: Vec<IpAddr>,
+        resolver: RouteDecision,
+        cache_hit: bool,
+    ) {
+        let mut inner = self.inner.write().await;
+        let normalized_domain = normalize_dns_domain(&domain);
+        for ip in &results {
+            inner.reverse_domains.insert(*ip, normalized_domain.clone());
+        }
         push_event(
             &mut inner.dns,
             DnsEvent {
                 timestamp: now(),
-                domain,
+                domain: normalized_domain,
                 query_type,
                 results,
                 resolver,
+                cache_hit,
             },
         );
         trim_old(&mut inner.dns, DEFAULT_WINDOW);
@@ -1193,6 +1296,18 @@ impl RoutingState {
         prune_dns_cache(&mut inner);
         let key = dns_cache_key(domain, query_type, resolver);
         inner.dns_cache.get(&key).map(|entry| entry.message.clone())
+    }
+
+    pub async fn dns_cache_lookup_any(&self, domain: &str, query_type: &str) -> Option<(Message, RouteDecision)> {
+        let mut inner = self.inner.write().await;
+        prune_dns_cache(&mut inner);
+        for resolver in [RouteDecision::Proxy, RouteDecision::Direct] {
+            let key = dns_cache_key(domain, query_type, resolver);
+            if let Some(entry) = inner.dns_cache.get(&key) {
+                return Some((entry.message.clone(), resolver));
+            }
+        }
+        None
     }
 
     pub async fn dns_cache_insert(
@@ -1215,10 +1330,52 @@ impl RoutingState {
                 results,
                 expires_at: now.saturating_add(ttl),
                 inserted_at: now,
+                refreshed_at: now,
             },
         );
         inner.dns_cache_order.push_back(key);
         enforce_dns_cache_capacity(&mut inner);
+    }
+
+    pub async fn dns_cache_proxy_refresh_candidates(&self) -> Vec<DnsCacheRefreshCandidate> {
+        let mut inner = self.inner.write().await;
+        prune_dns_cache(&mut inner);
+        if !inner.sources.dns_cache_refresh_enabled {
+            return Vec::new();
+        }
+        let cutoff = now().saturating_sub(DNS_CACHE_REFRESH_INTERVAL.as_secs());
+        let batch_size = inner.sources.dns_cache_refresh_batch_size.max(1);
+        inner
+            .dns_cache
+            .iter()
+            .filter(|(key, entry)| key.resolver == RouteDecision::Proxy && entry.refreshed_at <= cutoff)
+            .take(batch_size)
+            .map(|(key, _)| DnsCacheRefreshCandidate {
+                domain: key.domain.clone(),
+                query_type: key.query_type.clone(),
+            })
+            .collect()
+    }
+
+    pub async fn dns_cache_refresh_preserve_ttl(
+        &self,
+        domain: &str,
+        query_type: &str,
+        resolver: RouteDecision,
+        message: Message,
+        results: Vec<IpAddr>,
+    ) -> bool {
+        let mut inner = self.inner.write().await;
+        prune_dns_cache(&mut inner);
+        let key = dns_cache_key(domain, query_type, resolver);
+        if let Some(entry) = inner.dns_cache.get_mut(&key) {
+            entry.message = message;
+            entry.results = results;
+            entry.refreshed_at = now();
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn dns_cache_stats(&self) -> DnsCacheStats {
@@ -1228,6 +1385,8 @@ impl RoutingState {
             size: inner.dns_cache.len(),
             capacity: inner.sources.dns_cache_capacity,
             ttl_seconds: inner.sources.dns_cache_ttl_seconds,
+            refresh_enabled: inner.sources.dns_cache_refresh_enabled,
+            refresh_batch_size: inner.sources.dns_cache_refresh_batch_size,
         }
     }
 
@@ -1246,6 +1405,7 @@ impl RoutingState {
                 results: entry.results.clone(),
                 expires_at: entry.expires_at,
                 inserted_at: entry.inserted_at,
+                refreshed_at: entry.refreshed_at,
             })
             .collect::<Vec<_>>();
         rows.sort_by(|a, b| {
@@ -1253,6 +1413,28 @@ impl RoutingState {
                 .cmp(&b.query_type)
                 .then_with(|| a.inserted_at.cmp(&b.inserted_at))
         });
+        rows
+    }
+
+    pub async fn dns_cache_query_ip(&self, ip: &str) -> Vec<DnsCacheIpView> {
+        let Ok(ip) = ip.trim().parse::<IpAddr>() else {
+            return Vec::new();
+        };
+        let mut inner = self.inner.write().await;
+        prune_dns_cache(&mut inner);
+        let mut rows = inner
+            .dns_cache
+            .iter()
+            .filter(|(_, entry)| entry.results.iter().any(|result| *result == ip))
+            .map(|(key, entry)| DnsCacheIpView {
+                ip,
+                domain: key.domain.clone(),
+                query_type: key.query_type.clone(),
+                resolver: key.resolver,
+                expires_at: entry.expires_at,
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.domain.cmp(&b.domain).then_with(|| a.query_type.cmp(&b.query_type)));
         rows
     }
 
@@ -1313,28 +1495,47 @@ impl RoutingState {
         Ok(())
     }
 
-    pub async fn recent_connections(&self) -> Vec<ConnectionEvent> {
+    pub async fn recent_connections(&self, excluded_remotes: &[IpAddr]) -> Vec<ConnectionEvent> {
         let mut inner = self.inner.write().await;
+        inner.connection_activity_until = now().saturating_add(CONNECTION_ACTIVITY_TTL.as_secs());
         trim_old(&mut inner.connections, DEFAULT_WINDOW);
-        inner.connections.iter().rev().cloned().collect()
+        let reverse_domains = inner.reverse_domains.clone();
+        let mut rows = inner
+            .connections
+            .iter()
+            .rev()
+            .filter(|event| !is_excluded_remote(event, excluded_remotes))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut seen = rows.iter().map(connection_key).collect::<HashSet<_>>();
+        for event in collect_system_connections(&reverse_domains) {
+            if is_excluded_remote(&event, excluded_remotes) {
+                continue;
+            }
+            if seen.insert(connection_key(&event)) {
+                rows.push(event);
+            }
+        }
+        rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        rows
     }
 
     pub async fn recent_dns(&self) -> Vec<DnsEvent> {
         let mut inner = self.inner.write().await;
         trim_old(&mut inner.dns, DEFAULT_WINDOW);
-        inner.dns.iter().cloned().collect()
+        inner.dns.iter().rev().cloned().collect()
     }
 
     pub async fn recent_unhit_ips(&self) -> Vec<UnhitIpEvent> {
         let mut inner = self.inner.write().await;
         trim_old(&mut inner.unhit_ips, DEFAULT_WINDOW);
-        inner.unhit_ips.iter().cloned().collect()
+        inner.unhit_ips.iter().rev().cloned().collect()
     }
 
     pub async fn recent_unhit_domains(&self) -> Vec<UnhitDomainEvent> {
         let mut inner = self.inner.write().await;
         trim_old(&mut inner.unhit_domains, DEFAULT_WINDOW);
-        inner.unhit_domains.iter().cloned().collect()
+        inner.unhit_domains.iter().rev().cloned().collect()
     }
 
     pub async fn direct_bypass_file_conflicts(&self) -> (Vec<String>, Vec<String>) {
@@ -1374,6 +1575,51 @@ impl RoutingState {
         domain_conflicts.sort_unstable();
 
         (ip_conflicts, domain_conflicts)
+    }
+
+    pub async fn debug_ip_membership(&self, input: &str) -> IpMembershipDebug {
+        let query = input.trim().to_owned();
+        let parsed = parse_debug_ip_query(&query);
+        let mut result = IpMembershipDebug {
+            query,
+            valid: parsed.is_ok(),
+            error: parsed.as_ref().err().map(ToString::to_string),
+            bypass_file: false,
+            bypass_file_matches: Vec::new(),
+            nft_checked: false,
+            nft_bypass: false,
+            nft_matches: Vec::new(),
+            nft_error: None,
+        };
+        let Ok(parsed) = parsed else {
+            return result;
+        };
+
+        let inner = self.inner.read().await;
+        result.bypass_file_matches = inner
+            .persistent_raw
+            .bypass_ip
+            .iter()
+            .filter_map(|rule| parse_ip_net(rule))
+            .filter(|net| debug_ip_query_matches(&parsed, net))
+            .map(|net| net.to_string())
+            .collect();
+        result.bypass_file = !result.bypass_file_matches.is_empty();
+        drop(inner);
+
+        #[cfg(all(target_os = "linux", feature = "local-dns"))]
+        {
+            result.nft_checked = true;
+            match crate::local::dns::intercept_linux::bypass_set_matches(&parsed.to_string()) {
+                Ok(matches) => {
+                    result.nft_bypass = !matches.is_empty();
+                    result.nft_matches = matches;
+                }
+                Err(err) => result.nft_error = Some(err.to_string()),
+            }
+        }
+
+        result
     }
 }
 
@@ -1668,6 +1914,234 @@ fn parse_ip_net(value: &str) -> Option<IpNet> {
     value.parse::<IpAddr>().ok().map(IpNet::from)
 }
 
+#[derive(Clone, Debug)]
+enum DebugIpQuery {
+    Ip(IpAddr),
+    Net(IpNet),
+}
+
+impl std::fmt::Display for DebugIpQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DebugIpQuery::Ip(ip) => write!(f, "{ip}"),
+            DebugIpQuery::Net(net) => write!(f, "{net}"),
+        }
+    }
+}
+
+fn parse_debug_ip_query(value: &str) -> io::Result<DebugIpQuery> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "ip or cidr is required"));
+    }
+    if value.contains('/') {
+        value
+            .parse::<IpNet>()
+            .map(DebugIpQuery::Net)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid cidr: {err}")))
+    } else {
+        value
+            .parse::<IpAddr>()
+            .map(DebugIpQuery::Ip)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid ip: {err}")))
+    }
+}
+
+fn debug_ip_query_matches(query: &DebugIpQuery, net: &IpNet) -> bool {
+    match query {
+        DebugIpQuery::Ip(ip) => net.contains(ip),
+        DebugIpQuery::Net(query_net) => ip_nets_overlap(query_net, net),
+    }
+}
+
+fn is_private_connection_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.octets()[0] == 10
+                || (ip.octets()[0] == 172 && (16..=31).contains(&ip.octets()[1]))
+                || (ip.octets()[0] == 192 && ip.octets()[1] == 168)
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.to_ipv4_mapped().is_some_and(|ip| is_private_connection_ip(&IpAddr::V4(ip)))
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn connection_key(event: &ConnectionEvent) -> (IpAddr, u16, Option<IpAddr>, Option<String>, u16, String) {
+    (
+        event.source_ip,
+        event.source_port,
+        event.destination_ip,
+        event.destination_domain.clone(),
+        event.destination_port,
+        event.protocol.clone(),
+    )
+}
+
+fn is_excluded_remote(event: &ConnectionEvent, excluded_remotes: &[IpAddr]) -> bool {
+    let Some(destination_ip) = event.destination_ip else {
+        return false;
+    };
+    excluded_remotes.iter().any(|ip| *ip == destination_ip)
+}
+
+fn collect_system_connections(reverse_domains: &HashMap<IpAddr, String>) -> Vec<ConnectionEvent> {
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    for event in collect_conntrack_connections(reverse_domains)
+        .into_iter()
+        .chain(collect_proc_net_connections(reverse_domains))
+    {
+        if seen.insert(connection_key(&event)) {
+            rows.push(event);
+        }
+    }
+    rows
+}
+
+fn collect_conntrack_connections(reverse_domains: &HashMap<IpAddr, String>) -> Vec<ConnectionEvent> {
+    ["/proc/net/nf_conntrack", "/proc/net/ip_conntrack"]
+        .into_iter()
+        .find_map(|path| fs::read_to_string(path).ok())
+        .map(|content| {
+            content
+                .lines()
+                .filter_map(|line| parse_conntrack_line(line, reverse_domains))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_conntrack_line(line: &str, reverse_domains: &HashMap<IpAddr, String>) -> Option<ConnectionEvent> {
+    let mut protocol = None;
+    for token in line.split_whitespace().take(4) {
+        if matches!(token, "tcp" | "udp") {
+            protocol = Some(token.to_owned());
+            break;
+        }
+    }
+    let protocol = protocol?;
+    let mut source_ip = None;
+    let mut destination_ip = None;
+    let mut source_port = None;
+    let mut destination_port = None;
+    for token in line.split_whitespace() {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        match key {
+            "src" if source_ip.is_none() => source_ip = value.parse::<IpAddr>().ok(),
+            "dst" if destination_ip.is_none() => destination_ip = value.parse::<IpAddr>().ok(),
+            "sport" if source_port.is_none() => source_port = value.parse::<u16>().ok(),
+            "dport" if destination_port.is_none() => destination_port = value.parse::<u16>().ok(),
+            _ => {}
+        }
+        if source_ip.is_some() && destination_ip.is_some() && source_port.is_some() && destination_port.is_some() {
+            break;
+        }
+    }
+    let destination_ip = destination_ip?;
+    if is_private_connection_ip(&destination_ip) {
+        return None;
+    }
+    Some(ConnectionEvent {
+        timestamp: now(),
+        source_ip: source_ip?,
+        source_port: source_port?,
+        destination_ip: Some(destination_ip),
+        destination_domain: None,
+        domain: reverse_domains.get(&destination_ip).cloned(),
+        destination_port: destination_port?,
+        protocol,
+        decision: ConnectionDecision::Direct,
+    })
+}
+
+fn collect_proc_net_connections(reverse_domains: &HashMap<IpAddr, String>) -> Vec<ConnectionEvent> {
+    [
+        ("/proc/net/tcp", "tcp", false),
+        ("/proc/net/udp", "udp", false),
+        ("/proc/net/tcp6", "tcp", true),
+        ("/proc/net/udp6", "udp", true),
+    ]
+    .into_iter()
+    .flat_map(|(path, protocol, ipv6)| {
+        fs::read_to_string(path)
+            .ok()
+            .into_iter()
+            .flat_map(move |content| {
+                content
+                    .lines()
+                    .skip(1)
+                    .filter_map(move |line| parse_proc_net_line(line, protocol, ipv6, reverse_domains))
+                    .collect::<Vec<_>>()
+            })
+    })
+    .collect()
+}
+
+fn parse_proc_net_line(
+    line: &str,
+    protocol: &str,
+    ipv6: bool,
+    reverse_domains: &HashMap<IpAddr, String>,
+) -> Option<ConnectionEvent> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let local = fields.get(1)?;
+    let remote = fields.get(2)?;
+    let state = fields.get(3).copied().unwrap_or_default();
+    if state == "0A" {
+        return None;
+    }
+    let (source_ip, source_port) = parse_proc_net_addr(local, ipv6)?;
+    let (destination_ip, destination_port) = parse_proc_net_addr(remote, ipv6)?;
+    if destination_port == 0 || is_unspecified_ip(&destination_ip) || is_private_connection_ip(&destination_ip) {
+        return None;
+    }
+    Some(ConnectionEvent {
+        timestamp: now(),
+        source_ip,
+        source_port,
+        destination_ip: Some(destination_ip),
+        destination_domain: None,
+        domain: reverse_domains.get(&destination_ip).cloned(),
+        destination_port,
+        protocol: protocol.to_owned(),
+        decision: ConnectionDecision::Direct,
+    })
+}
+
+fn parse_proc_net_addr(value: &str, ipv6: bool) -> Option<(IpAddr, u16)> {
+    let (addr, port) = value.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    if ipv6 {
+        let bytes = (0..16)
+            .map(|idx| u8::from_str_radix(&addr[idx * 2..idx * 2 + 2], 16).ok())
+            .collect::<Option<Vec<_>>>()?;
+        let mut octets = [0u8; 16];
+        for (chunk_idx, chunk) in bytes.chunks(4).enumerate() {
+            for (idx, byte) in chunk.iter().rev().enumerate() {
+                octets[chunk_idx * 4 + idx] = *byte;
+            }
+        }
+        Some((IpAddr::V6(Ipv6Addr::from(octets)), port))
+    } else {
+        let raw = u32::from_str_radix(addr, 16).ok()?;
+        Some((IpAddr::V4(Ipv4Addr::from(raw.to_le_bytes())), port))
+    }
+}
+
+fn is_unspecified_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_unspecified(),
+        IpAddr::V6(ip) => ip.is_unspecified(),
+    }
+}
+
 fn progress_percent(completed_files: usize, total_files: usize) -> u8 {
     if total_files == 0 {
         100
@@ -1694,6 +2168,11 @@ fn normalize_rule_lists(lists: RuleLists) -> RuleLists {
         bypass_ip: normalize_lines(lists.bypass_ip),
         bypass_domain: normalize_domains(lists.bypass_domain),
     }
+}
+
+fn with_private_direct_rules(mut lists: RuleLists) -> RuleLists {
+    lists.direct_ip.extend(PRIVATE_DIRECT_IP_RULES.iter().map(|rule| (*rule).to_owned()));
+    normalize_rule_lists(lists)
 }
 
 fn validate_temporary_rules(lists: &RuleLists) -> io::Result<()> {

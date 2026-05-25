@@ -3,13 +3,14 @@
 use std::{
     convert::Infallible,
     fs, io,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     pin::Pin,
-    process::Command,
+    process::{Command, Stdio},
     sync::Arc,
     task::{Context, Poll},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
@@ -78,7 +79,7 @@ impl WebAdmin {
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 if let Err(err) = http1::Builder::new()
-                    .serve_connection(io, service_fn(move |req| handler.clone().serve(req)))
+                    .serve_connection(io, service_fn(move |req| handler.clone().serve(req, peer_addr)))
                     .await
                 {
                     error!("web admin connection {} failed with error: {}", peer_addr, err);
@@ -95,8 +96,8 @@ struct WebAdminHandler {
 }
 
 impl WebAdminHandler {
-    async fn serve(self: Arc<Self>, req: Request<Incoming>) -> Result<Response<ResponseBody>, Infallible> {
-        Ok(match self.handle(req).await {
+    async fn serve(self: Arc<Self>, req: Request<Incoming>, peer_addr: SocketAddr) -> Result<Response<ResponseBody>, Infallible> {
+        Ok(match self.handle(req, peer_addr).await {
             Ok(resp) => resp,
             Err(err) => json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -105,7 +106,13 @@ impl WebAdminHandler {
         })
     }
 
-    async fn handle(&self, req: Request<Incoming>) -> io::Result<Response<ResponseBody>> {
+    async fn handle(&self, req: Request<Incoming>, peer_addr: SocketAddr) -> io::Result<Response<ResponseBody>> {
+        if !is_lan_admin_peer(peer_addr.ip()) {
+            return Ok(json_response(
+                StatusCode::FORBIDDEN,
+                &serde_json::json!({ "error": "web admin is only available from LAN clients" }),
+            ));
+        }
         if !self.authorized(&req) {
             return Ok(json_response(
                 StatusCode::UNAUTHORIZED,
@@ -244,6 +251,13 @@ impl WebAdminHandler {
                     &self.routing_state.dns_cache_query(&domain).await,
                 ))
             }
+            (Method::GET, "/api/dns/cache/query-ip") => {
+                let ip = query_param(req.uri().query(), "ip").unwrap_or_default();
+                Ok(json_response(
+                    StatusCode::OK,
+                    &self.routing_state.dns_cache_query_ip(&ip).await,
+                ))
+            }
             (Method::POST, "/api/dns/cache/clear") => {
                 let payload: DnsCacheClearPayload = read_json(req).await?;
                 let cleared = self.routing_state.dns_cache_clear(payload.domain.as_deref()).await;
@@ -302,10 +316,9 @@ impl WebAdminHandler {
                 StatusCode::OK,
                 &self.routing_state.domain_conflicts().await,
             )),
-            (Method::GET, "/api/activity/connections") => Ok(json_response(
-                StatusCode::OK,
-                &self.routing_state.recent_connections().await,
-            )),
+            (Method::GET, "/api/activity/connections") => {
+                Ok(json_response(StatusCode::OK, &self.routing_state.recent_connections(&self.server_filters()).await))
+            }
             (Method::GET, "/api/activity/unhit-ip") => Ok(json_response(
                 StatusCode::OK,
                 &self.routing_state.recent_unhit_ips().await,
@@ -318,6 +331,17 @@ impl WebAdminHandler {
                 Ok(json_response(StatusCode::OK, &self.routing_state.recent_dns().await))
             }
             (Method::GET, "/api/sys/status") => Ok(json_response(StatusCode::OK, &self.sys_status().await)),
+            (Method::POST, "/api/sys/debug-url") => {
+                let payload: DebugUrlPayload = read_json(req).await?;
+                Ok(json_response(StatusCode::OK, &self.debug_url(payload.url).await?))
+            }
+            (Method::POST, "/api/sys/debug-ip") => {
+                let payload: DebugIpPayload = read_json(req).await?;
+                Ok(json_response(
+                    StatusCode::OK,
+                    &self.routing_state.debug_ip_membership(&payload.query).await,
+                ))
+            }
             (Method::GET, "/api/log/status") => Ok(json_response(StatusCode::OK, &self.sys_status().await)),
             _ => Ok(json_response(
                 StatusCode::NOT_FOUND,
@@ -354,6 +378,79 @@ impl WebAdminHandler {
         }
         status
     }
+
+    async fn debug_url(&self, url: String) -> io::Result<serde_json::Value> {
+        let url = normalize_debug_url(&url)?;
+        let host = debug_url_host(&url)?;
+        let started_at = unix_now();
+        self.routing_state.enable_connection_activity().await;
+        let decision = self.routing_state.route_domain(&host).await;
+        let cached_before = self
+            .routing_state
+            .dns_cache_query(&host)
+            .await
+            .into_iter()
+            .any(|entry| entry.query_type.eq_ignore_ascii_case("A") && Some(entry.resolver) == decision);
+
+        let curl_result = tokio::task::spawn_blocking({
+            let url = url.clone();
+            move || run_debug_curl(&url)
+        })
+        .await
+        .map_err(io::Error::other)??;
+
+        let dns_events = self.routing_state.recent_dns().await;
+        let matching_dns = dns_events
+            .iter()
+            .filter(|event| event.timestamp >= started_at && domain_matches_debug_host(&event.domain, &host))
+            .cloned()
+            .collect::<Vec<_>>();
+        let resolved_ips = matching_dns
+            .iter()
+            .flat_map(|event| event.results.iter().copied())
+            .collect::<Vec<_>>();
+        let connections = self.routing_state.recent_connections(&self.server_filters()).await;
+        let transparent_connection = connections.iter().find(|event| {
+            event.timestamp >= started_at
+                && event.decision == crate::local::routing::ConnectionDecision::Redir
+                && event
+                    .destination_ip
+                    .is_some_and(|ip| resolved_ips.iter().any(|resolved| *resolved == ip))
+        });
+
+        Ok(serde_json::json!({
+            "url": url,
+            "host": host,
+            "bypass_domain": matches!(decision, Some(crate::local::routing::RouteDecision::Proxy)),
+            "route_decision": decision,
+            "dns_intercepted": !matching_dns.is_empty(),
+            "dns_cache_hit": cached_before,
+            "resolved_ips": resolved_ips,
+            "transparent_port_received": transparent_connection.is_some(),
+            "response_received": curl_result.response_received,
+            "http_code": curl_result.http_code,
+            "curl_exit_code": curl_result.exit_code,
+            "curl_error": curl_result.error,
+        }))
+    }
+
+    fn server_filters(&self) -> Vec<IpAddr> {
+        let Ok(content) = fs::read_to_string(&self.client_config_path) else {
+            return Vec::new();
+        };
+        let Ok(config) = json5::from_str::<serde_json::Value>(&content) else {
+            return Vec::new();
+        };
+        config
+            .get("servers")
+            .and_then(|servers| servers.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|server| {
+                server.get("server")?.as_str()?.parse::<IpAddr>().ok()
+            })
+            .collect()
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -376,8 +473,25 @@ struct DnsCacheClearPayload {
 }
 
 #[derive(serde::Deserialize)]
+struct DebugUrlPayload {
+    url: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DebugIpPayload {
+    query: String,
+}
+
+#[derive(serde::Deserialize)]
 struct ClientConfigPayload {
     content: String,
+}
+
+struct DebugCurlResult {
+    response_received: bool,
+    http_code: String,
+    exit_code: Option<i32>,
+    error: Option<String>,
 }
 
 fn restart_service_after_response() {
@@ -420,6 +534,89 @@ fn nft_status() -> serde_json::Value {
             "error": err.to_string(),
         }),
     }
+}
+
+fn is_lan_admin_peer(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.octets()[0] == 10
+                || (ip.octets()[0] == 172 && (16..=31).contains(&ip.octets()[1]))
+                || (ip.octets()[0] == 192 && ip.octets()[1] == 168)
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.to_ipv4_mapped().is_some_and(|ip| is_lan_admin_peer(IpAddr::V4(ip)))
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn normalize_debug_url(url: &str) -> io::Result<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "url is required"));
+    }
+    if url.contains("://") {
+        Ok(url.to_owned())
+    } else {
+        Ok(format!("http://{url}"))
+    }
+}
+
+fn debug_url_host(url: &str) -> io::Result<String> {
+    let uri = url
+        .parse::<hyper::Uri>()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid url: {err}")))?;
+    uri.host()
+        .map(|host| host.trim_matches(['[', ']']).to_ascii_lowercase())
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "url host is required"))
+}
+
+fn domain_matches_debug_host(domain: &str, host: &str) -> bool {
+    domain.trim_end_matches('.').eq_ignore_ascii_case(host.trim_end_matches('.'))
+}
+
+fn run_debug_curl(url: &str) -> io::Result<DebugCurlResult> {
+    let output = Command::new("curl")
+        .args([
+            "-4",
+            "-sS",
+            "--max-time",
+            "6",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            url,
+        ])
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .stdin(Stdio::null())
+        .output()?;
+    let http_code = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Ok(DebugCurlResult {
+        response_received: http_code != "000",
+        http_code,
+        exit_code: output.status.code(),
+        error: (!error.is_empty()).then_some(error),
+    })
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 fn query_param(query: Option<&str>, name: &str) -> Option<String> {
@@ -513,6 +710,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .scroll-panel{overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:0 1px 2px #10203312}
     .section-scroll{height:auto;min-height:0;flex:1}
     .scroll-panel table{margin-top:0}
+    .scroll-panel table,.scroll-panel th,.scroll-panel td{user-select:text}
     .scroll-panel th{position:sticky;top:0;z-index:1}
     .conflict-table{table-layout:fixed}
     .conflict-table th:nth-child(1),.conflict-table td:nth-child(1){width:38%}
@@ -561,6 +759,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .row input{margin:0}
     .row button{margin:0;white-space:nowrap}
     .hint{color:var(--muted);font-size:12px}
+    .inline-check{display:inline-flex;align-items:center;gap:4px;margin:0 0 0 10px;font-size:12px;font-weight:600;color:var(--muted)}
+    .inline-check input{width:auto;margin:0}
     .progress-box{margin:8px auto 0;max-width:760px;max-height:120px;overflow:auto;text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;box-shadow:0 1px 2px #10203312}
     .progress-bar{height:10px;background:var(--soft);border-radius:999px;overflow:hidden;margin:8px 0}
     .progress-fill{height:100%;width:0;background:var(--brand)}
@@ -619,6 +819,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <button type="button" onclick="addDns('dnsForeignList')">+ Foreign DNS</button>
           <div class="form-line"><label>Cache Capacity</label><input id="dnsCacheCapacity" type="number" min="1"></div>
           <div class="form-line"><label>Cache TTL Seconds</label><input id="dnsCacheTtl" type="number" min="1"></div>
+          <div class="form-line"><label>Async Refresh</label><input id="dnsCacheRefreshEnabled" type="checkbox"></div>
+          <div class="form-line"><label>Refresh Batch Size</label><input id="dnsCacheRefreshBatch" type="number" min="1"></div>
           <div class="form-line"><label>Intercept Mode</label><select id="dnsInterceptMode"><option>off</option><option>firewall</option><option>tun</option><option>both</option></select></div>
         </fieldset>
         <h3 class="card-title">Server</h3>
@@ -629,7 +831,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <option>aes-128-gcm</option><option>aes-256-gcm</option><option>chacha20-ietf-poly1305</option>
             <option>2022-blake3-aes-128-gcm</option><option>2022-blake3-aes-256-gcm</option>
           </select></div>
-          <div class="form-line"><label>Password</label><input id="password" type="password"></div>
+          <div class="form-line"><label>Password</label><input id="serverSecret" name="ss-server-secret" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" data-lpignore="true" data-1p-ignore="true"></div>
           <div class="form-line"><label>Timeout Seconds</label><input id="timeout" type="number" min="1"></div>
           <div class="form-line"><label>Plugin Path</label><input id="plugin"></div>
           <div class="form-line"><label>Plugin Options</label><input id="pluginOpts"></div>
@@ -653,9 +855,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <h3 class="card-title">Cache Management</h3>
         <div><strong>Size:</strong> <span id="dnsCacheSize">0</span> / <span id="dnsCacheCapacityOut">0</span></div>
         <div><strong>TTL:</strong> <span id="dnsCacheTtlOut">0</span> seconds</div>
+        <div class="form-line"><label>Async Refresh</label><input id="dnsCacheRefreshEnabledDns" type="checkbox"></div>
+        <div class="form-line"><label>Refresh Batch Size</label><input id="dnsCacheRefreshBatchDns" type="number" min="1"></div>
+        <button onclick="saveDnsCacheSettings()">Save Refresh Settings</button>
         <label>Domain<input id="dnsQueryDomain" placeholder="example.com"></label>
         <label>Record Type<select id="dnsQueryType"><option>A</option><option>AAAA</option></select></label>
         <button onclick="queryDnsCache()">Query Cache</button>
+        <label>IP<input id="dnsQueryIp" placeholder="142.251.151.119"></label>
+        <button onclick="queryDnsCacheIp()">Query Domain By IP</button>
         <button onclick="clearDnsDomain()">Clear Domain</button>
         <button onclick="clearDnsAll()">Clear All Cache</button>
         <p class="hint" id="dnsCacheMessage"></p>
@@ -670,7 +877,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <section id="connections" class="tab">
     <div class="activity-grid">
       <div class="activity-card">
-        <h3 class="card-title">Recent DNS</h3>
+        <h3 class="card-title">Recent DNS <label class="inline-check"><input id="recentDnsRecord" type="checkbox" checked> Record</label></h3>
         <div id="dnsOut" class="scroll-panel section-scroll"></div>
       </div>
       <div class="activity-card">
@@ -742,13 +949,25 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <div class="panel sys-layout">
       <h3 class="card-title">System Checks</h3>
       <div id="sysStatusOut"></div>
+      <h3 class="card-title">Debug URL</h3>
+      <div class="row">
+        <input id="debugUrl" value="http://www.google.com/generate_204">
+        <button onclick="debugUrlCheck()">Debug</button>
+      </div>
+      <div id="debugUrlOut" class="scroll-panel" style="padding:9px;margin-top:8px"></div>
+      <h3 class="card-title">Debug IP / CIDR</h3>
+      <div class="row">
+        <input id="debugIp" placeholder="142.251.155.119 or 142.251.155.0/24">
+        <button onclick="debugIpCheck()">Check</button>
+      </div>
+      <div id="debugIpOut" class="scroll-panel" style="padding:9px;margin-top:8px"></div>
     </div>
   </section>
 
   <script>
     let currentConfigPath='', currentRawConfig={}, rulesSnapshot={};
     const routeSourceKeys=['geoip_sources','geosite_sources','direct_domain_sources','bypass_domain_sources'];
-    const dnsKeys=['domestic_dns','foreign_dns','dns_cache_capacity','dns_cache_ttl_seconds','dns_intercept_mode','dns_listen_address','dns_listen_port'];
+    const dnsKeys=['domestic_dns','foreign_dns','dns_cache_capacity','dns_cache_ttl_seconds','dns_cache_refresh_enabled','dns_cache_refresh_batch_size','dns_intercept_mode','dns_listen_address','dns_listen_port'];
     const sourceKeys=[...routeSourceKeys,...dnsKeys];
     function token(){return new URLSearchParams(location.search).get('token')||''}
     async function api(path,opt={}){opt.headers=Object.assign({'x-admin-token':token()},opt.headers||{});let r=await fetch(path,opt);let j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}
@@ -767,7 +986,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===id));
       updateNavIndicator();
       refresh(id);
-      if(id==='connections')activityTimer=setInterval(()=>refresh('connections').catch(e=>{console.warn(e)}),3000);
+      if(id==='connections')activityTimer=setInterval(()=>refresh('connections').catch(e=>{console.warn(e)}),1000);
       if(id==='routeConfig')activityTimer=setInterval(()=>renderRouteConflicts().catch(e=>{console.warn(e)}),3000);
     }
     function lines(v){return (v||'').split('\n').map(s=>s.trim()).filter(Boolean)}
@@ -790,9 +1009,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       renderDnsList('dnsForeignList',routeRules.foreign_dns||[(dns.remote_dns_address||'8.8.8.8')+':'+(dns.remote_dns_port||53)]);
       dnsCacheCapacity.value=routeRules.dns_cache_capacity||100000;
       dnsCacheTtl.value=routeRules.dns_cache_ttl_seconds||604800;
+      dnsCacheRefreshEnabled.checked=routeRules.dns_cache_refresh_enabled!==false;
+      dnsCacheRefreshBatch.value=routeRules.dns_cache_refresh_batch_size||500;
       setSelect('dnsInterceptMode',routeRules.dns_intercept_mode||'off');
       serverHost.value=server.server||''; serverPort.value=server.server_port||443; setSelect('method',server.method||'aes-256-gcm');
-      password.value=server.password||''; timeout.value=server.timeout||300; plugin.value=server.plugin||''; pluginOpts.value=server.plugin_opts||'';
+      serverSecret.value=server.password||''; timeout.value=server.timeout||300; plugin.value=server.plugin||''; pluginOpts.value=server.plugin_opts||'';
       updateClientJson();
     }
     function buildClientConfig(){
@@ -806,6 +1027,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       let routeRules=Object.assign({},currentRawConfig.route_rules||{});
       routeRules.dns_cache_capacity=num(dnsCacheCapacity.value,100000);
       routeRules.dns_cache_ttl_seconds=num(dnsCacheTtl.value,604800);
+      routeRules.dns_cache_refresh_enabled=dnsCacheRefreshEnabled.checked;
+      routeRules.dns_cache_refresh_batch_size=num(dnsCacheRefreshBatch.value,500);
       routeRules.dns_intercept_mode=dnsInterceptMode.value;
       routeRules.dns_listen_address=dnsBind.value;
       routeRules.dns_listen_port=num(dnsPort.value,1053);
@@ -818,7 +1041,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         let foreign=parseHostPort(routeRules.foreign_dns[0],'8.8.8.8',53);
         locals.push({local_address:dnsBind.value,local_port:num(dnsPort.value,1053),protocol:'dns',mode:'tcp_and_udp',local_dns_address:domestic.host,local_dns_port:domestic.port,remote_dns_address:foreign.host,remote_dns_port:foreign.port,client_cache_size:64});
       }
-      let server={server:serverHost.value.trim(),server_port:num(serverPort.value,443),password:password.value,timeout:num(timeout.value,300),method:method.value};
+      let server={server:serverHost.value.trim(),server_port:num(serverPort.value,443),password:serverSecret.value,timeout:num(timeout.value,300),method:method.value};
       if(plugin.value.trim())server.plugin=plugin.value.trim();
       if(pluginOpts.value.trim())server.plugin_opts=pluginOpts.value.trim();
       return Object.assign({},currentRawConfig,{locals,servers:[server],route_rules:routeRules});
@@ -848,7 +1071,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function saveClientConfig(){updateClientJson(); await api('/api/client-config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:clientConfig.value})}); configPath.textContent=currentConfigPath+' saved, restarting service...'}
     async function restartService(){await api('/api/restart',{method:'POST'}); configPath.textContent='restarting service...'}
-    ['socksBind','socksPort','httpBind','httpPort','redirEnable','redirBind','redirPort','redirMode','tcpRedir','udpRedir','dnsEnable','dnsBind','dnsPort','dnsCacheCapacity','dnsCacheTtl','dnsInterceptMode','serverHost','serverPort','method','password','timeout','plugin','pluginOpts'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
+    ['socksBind','socksPort','httpBind','httpPort','redirEnable','redirBind','redirPort','redirMode','tcpRedir','udpRedir','dnsEnable','dnsBind','dnsPort','dnsCacheCapacity','dnsCacheTtl','dnsCacheRefreshEnabled','dnsCacheRefreshBatch','dnsInterceptMode','serverHost','serverPort','method','serverSecret','timeout','plugin','pluginOpts'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
 
     function sourceRow(key,value=''){let div=document.createElement('div');div.className='row';div.innerHTML=`<input value="${value.replaceAll('"','&quot;')}"><button type="button">Remove</button>`;div.querySelector('button').onclick=()=>{div.remove();updateRulesJson()};div.querySelector('input').oninput=updateRulesJson;document.getElementById(key).appendChild(div)}
     function addSource(key){sourceRow(key);updateRulesJson()}
@@ -912,8 +1135,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function downloadRules(){await startRuleJob('/api/rules/download','starting download')}
     async function generateRules(){await startRuleJob('/api/rules/update','starting generation')}
-    function table(rows,cols,cls=''){if(!rows.length)return '<p class="hint">No data</p>';return `<table class="${cls}"><thead><tr>`+cols.map(c=>'<th>'+c[0]+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+String(c[1](r)??'')+'</td>').join('')+'</tr>').join('')+'</tbody></table>'}
+    function table(rows,cols,cls=''){return `<table class="${cls}"><thead><tr>`+cols.map(c=>'<th>'+c[0]+'</th>').join('')+'</tr></thead><tbody>'+(rows.length?rows.map(r=>'<tr>'+cols.map(c=>'<td>'+String(c[1](r)??'')+'</td>').join('')+'</tr>').join(''):`<tr><td colspan="${cols.length}" class="hint">No data</td></tr>` )+'</tbody></table>'}
     function fmtTime(ts){return ts?new Date(ts*1000).toLocaleString():''}
+    function cleanDomain(v){return (v||'').replace(/\.$/,'')}
     let manualSelectEditing=false;
     function beginManualSelectEdit(){manualSelectEditing=true}
     function endManualSelectEdit(){setTimeout(()=>{manualSelectEditing=false},400)}
@@ -940,14 +1164,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       document.getElementById(id).innerHTML=table(rows,cols,'conflict-table')
     }
-    async function renderConnections(){let rows=await api('/api/activity/connections');connOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Source',r=>r.source_ip+':'+r.source_port],['Destination',r=>(r.destination_ip||r.destination_domain)+':'+r.destination_port],['Protocol',r=>r.protocol],['Decision',r=>r.decision]])}
+    async function renderConnections(){let rows=await api('/api/activity/connections');connOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Source',r=>r.source_ip+':'+r.source_port],['Destination',r=>(r.destination_ip||r.destination_domain)+':'+r.destination_port],['Domain',r=>r.domain||'-'],['Protocol',r=>r.protocol],['Decision',r=>r.decision]])}
     async function renderUnhitIp(){let rows=await api('/api/activity/unhit-ip');unhitIpOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['IP',r=>r.ip]])}
     async function renderUnhitDns(){let rows=await api('/api/activity/unhit-dns');unhitDnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>r.domain]])}
-    async function renderDns(){let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>r.domain],['Type',r=>r.query_type],['Results',r=>(r.results||[]).join('<br>')],['Resolver',r=>r.resolver]])}
+    async function renderDns(){if(recentDnsRecord&&!recentDnsRecord.checked)return;let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']])}
     async function renderRouteConflicts(){await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip')}
     async function renderSys(){let s=await api('/api/sys/status');let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);sysStatusOut.innerHTML=`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p><p><strong>Ubuntu install command:</strong></p><pre>${s.install_command}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}<h3 class="card-title">direct_ip.txt / bypass_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / bypass_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
-    async function renderDnsCacheStats(){let s=await api('/api/dns/cache/stats');dnsCacheSize.textContent=s.size;dnsCacheCapacityOut.textContent=s.capacity;dnsCacheTtlOut.textContent=s.ttl_seconds}
+    async function debugUrlCheck(){let url=debugUrl.value.trim();if(!url){debugUrlOut.innerHTML='<p class="hint">Enter a URL first</p>';return}debugUrlOut.innerHTML='<p class="hint">Running debug, timeout 6s...</p>';let r=await api('/api/sys/debug-url',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url})});debugUrlOut.innerHTML=table([r],[['URL',x=>x.url],['Bypass Domain',x=>x.bypass_domain?'yes':'no'],['DNS Intercepted',x=>x.dns_intercepted?'yes':'no'],['DNS Cache',x=>x.dns_cache_hit?'hit':'miss'],['Resolved IPs',x=>(x.resolved_ips||[]).join('<br>')||'-'],['Transparent Port',x=>x.transparent_port_received?'received':'not received'],['Response',x=>x.response_received?'received':'none'],['HTTP',x=>x.http_code||'-'],['Error',x=>x.curl_error||'-']])}
+    async function debugIpCheck(){let query=debugIp.value.trim();if(!query){debugIpOut.innerHTML='<p class="hint">Enter an IP or CIDR first</p>';return}let r=await api('/api/sys/debug-ip',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query})});debugIpOut.innerHTML=table([r],[['Query',x=>x.query],['Valid',x=>x.valid?'yes':'no'],['bypass_ip.txt',x=>x.bypass_file?'yes':'no'],['bypass Matches',x=>(x.bypass_file_matches||[]).join('<br>')||'-'],['NFT Checked',x=>x.nft_checked?'yes':'no'],['NFT bypass',x=>x.nft_bypass?'yes':'no'],['NFT Matches',x=>(x.nft_matches||[]).join('<br>')||'-'],['Error',x=>x.error||x.nft_error||'-']])}
+    function syncDnsRefreshToBasic(){dnsCacheRefreshEnabled.checked=dnsCacheRefreshEnabledDns.checked;dnsCacheRefreshBatch.value=dnsCacheRefreshBatchDns.value;updateClientJson()}
+    async function saveDnsCacheSettings(){syncDnsRefreshToBasic();await saveClientConfig();dnsCacheMessage.textContent='Refresh settings saved, restarting service...'}
+    async function renderDnsCacheStats(){let s=await api('/api/dns/cache/stats');dnsCacheSize.textContent=s.size;dnsCacheCapacityOut.textContent=s.capacity;dnsCacheTtlOut.textContent=s.ttl_seconds;dnsCacheRefreshEnabledDns.checked=s.refresh_enabled!==false;dnsCacheRefreshBatchDns.value=s.refresh_batch_size||500}
     async function queryDnsCache(){await renderDnsCacheStats();let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheOut.innerHTML='<p class="hint">Enter a domain</p>';return}let rows=await api('/api/dns/cache/query?domain='+encodeURIComponent(domain));let type=dnsQueryType.value;rows=rows.filter(r=>!type||r.query_type===type);dnsCacheOut.innerHTML=table(rows,[['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Results',r=>(r.results||[]).join('<br>')],['Expires',r=>fmtTime(r.expires_at)]])}
+    async function queryDnsCacheIp(){await renderDnsCacheStats();let ip=dnsQueryIp.value.trim();if(!ip){dnsCacheOut.innerHTML='<p class="hint">Enter an IP</p>';return}let rows=await api('/api/dns/cache/query-ip?ip='+encodeURIComponent(ip));dnsCacheOut.innerHTML=table(rows,[['IP',r=>r.ip],['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Expires',r=>fmtTime(r.expires_at)]])}
     async function clearDnsDomain(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheMessage.textContent='Enter a domain first';return}let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({domain})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';await queryDnsCache()}
     async function clearDnsAll(){let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';dnsCacheOut.innerHTML='';await renderDnsCacheStats()}
     async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='dns')await renderDnsCacheStats();if(id==='routeConfig'){await loadRules();await renderRouteConflicts()}if(id==='sys')await renderSys();if(id==='connections'){await renderDns();await renderConnections();await renderUnhitDns();await renderUnhitIp()}}catch(e){alert(e.message)}}

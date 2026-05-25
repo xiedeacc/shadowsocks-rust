@@ -502,9 +502,9 @@ where
         #[cfg(feature = "local-web-admin")]
         if let Some(routing_state) = self.context.routing_state() {
             let decision = if bypassed {
-                crate::local::routing::RouteDecision::Direct
+                crate::local::routing::ConnectionDecision::Direct
             } else {
-                crate::local::routing::RouteDecision::Proxy
+                crate::local::routing::ConnectionDecision::Proxy
             };
             routing_state
                 .record_connection(self.peer_addr, target_addr, "udp", decision)

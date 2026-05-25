@@ -307,6 +307,12 @@ impl Server {
                 .iter()
                 .chain(config.route_rules.foreign_dns.iter()),
         );
+        #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
+        let dns_intercept_redir_port = config
+            .local
+            .iter()
+            .find(|local| matches!(local.config.protocol, ProtocolType::Redir))
+            .and_then(|local| local.config.addr.as_ref().map(|addr| addr.port()));
 
         for local_instance in config.local {
             let local_config = local_instance.config;
@@ -450,6 +456,7 @@ impl Server {
                     if matches!(dns_intercept_mode.as_str(), "firewall" | "both") {
                         match self::dns::intercept_linux::setup_firewall_redirect(
                             client_addr.port(),
+                            dns_intercept_redir_port,
                             &dns_intercept_exempt_ips,
                         ) {
                             Ok(guard) => {
