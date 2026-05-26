@@ -92,11 +92,29 @@
       "server_port": 8388,
       "password": "change-me",
       "timeout": 300,
-      "method": "aes-256-gcm"
+      "method": "aes-256-gcm",
+      // fast_open / no_delay: tells sslocal to set TCP_FASTOPEN + TCP_NODELAY
+      // on the upstream connection to the SS server. Combined with the
+      // xray-plugin "fast-open" plugin_opt below (which adds TFO on the
+      // plugin-managed inner socket), this saves ~1 RTT on every new
+      // tunnel handshake after the kernel has cached a TFO cookie for
+      // the server.
+      "fast_open": true,
+      "no_delay": true,
+      // plugin_opts "mux=8;fast-open":
+      //   * mux=8 lets the xray-plugin client multiplex up to 8 outbound
+      //     TCP/UDP streams over a single WebSocket. Without it every
+      //     new browser request pays a TLS+WS handshake; with mux=8 the
+      //     handshake amortises across all in-flight connections and
+      //     browsing latency drops sharply once the tunnel is warm.
+      //   * fast-open: TFO on the *inner* connection xray-plugin opens
+      //     to the local ssserver, mirroring the outer setting above.
+      "plugin": "D:\\software\\shadowsocks\\bin\\xray-plugin.exe",
+      "plugin_opts": "tls;host=forsimple.youkechat.net;path=/sspath;mux=8;fast-open"
     }
   ],
   "web_admin": {
     "client_config_path": "D:\\software\\shadowsocks\\conf\\shadowsocks-client.json",
-    "listen": "0.0.0.0:9090"
+    "listen": "127.0.0.1:9090"
   }
 }

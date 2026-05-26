@@ -43,8 +43,13 @@ use crate::{
 
 use super::virt_device::{TokenBuffer, VirtTunDevice};
 
-const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 16 * 1024;
-const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 16 * 1024;
+// 16 KiB starves TLS handshakes: a typical RSA/ECDSA leaf-plus-intermediate
+// chain plus EncryptedExtensions/Finished pushes ~6-10 KiB in a single
+// burst, which fills smoltcp's window mid-handshake and stalls the
+// remote sender. 64 KiB matches Windows' default initial TCP window and
+// lets a full TLS 1.3 server flight land in one round trip.
+const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 64 * 1024;
+const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 64 * 1024;
 const MAX_ACTIVE_TCP_CONNECTIONS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -555,8 +560,18 @@ impl TcpTun {
             );
             socket.set_keep_alive(accept_opts.tcp.keepalive.map(From::from));
             socket.set_timeout(Some(SmolDuration::from_secs(120)));
-            // NO ACK delay
-            // socket.set_ack_delay(None);
+            // smoltcp's default 10 ms delayed-ACK is a WAN heuristic. The
+            // TUN side of every socket is a host-local loopback, so a
+            // delayed ACK only adds latency to handshakes (each TLS round
+            // trip eats one ACK delay per direction). Clearing it gives
+            // immediate ACKs to the kernel stack on the other end of
+            // wintun and shaves ~20-30 ms off TLS setup.
+            socket.set_ack_delay(None);
+            // Nagle pairs poorly with TCP_NODELAY/SCHEDULED writes from
+            // user-space TLS libraries (Schannel/openssl), which already
+            // batch records. Forcing it off avoids the Nagle-vs-delayed-
+            // ACK pathology when interacting with peers that delay ACKs.
+            socket.set_nagle_enabled(false);
             // Enable Cubic congestion control
             socket.set_congestion_control(CongestionControl::Cubic);
 
