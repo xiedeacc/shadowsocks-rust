@@ -4,24 +4,49 @@
     Windows TUN deployment helper for shadowsocks-rust.
 
 .DESCRIPTION
-    Three actions are supported via -Action:
+    Single entry point for installing, starting, stopping and inspecting
+    the sslocal Windows TUN deployment. Five actions are supported via
+    -Action:
 
-      Run     (default) - build + copy artefacts, install TUN routes/DNS,
-                          run sslocal.exe in foreground; on Ctrl-C or any
-                          exit the script reverses every system change.
+      Start    (default) - register the sswinservice Windows service with
+                           autostart=auto, build+copy artefacts if needed,
+                           install the TUN catch-all routes and the
+                           per-interface DNS overrides, then start the
+                           service. Idempotent.
 
-      Install           - legacy mode that registers and starts the
-                          sswinservice Windows service. Use only when you
-                          want autostart at boot.
+      Stop               - "Stop AND disable" in one shot:
+                           stop the service, DELETE it (so it cannot
+                           auto-start on reboot), hard-kill any orphan
+                           sslocal/sswinservice/xray-plugin processes,
+                           restore every per-interface DNS server we
+                           overrode, remove every bypass route we added
+                           to the physical adapter, drop every route
+                           still pointing at the TUN adapter, and flush
+                           the OS DNS cache. After this the box is in
+                           the same network state as before the very
+                           first Start. Idempotent.
 
-      Cleanup           - undo every change a previous Run/Install made:
-                          stop+remove the service, drop TUN routes,
-                          remove bypass routes added to the physical
-                          adapter and restore the original DNS servers.
+      Restart            - rebuild + swap the binary + bounce the service.
+                           Routes and DNS overrides are NOT touched - this
+                           is the fast path for "I just recompiled, pick
+                           up the new sslocal.exe".
 
-    All system mutations are recorded in <InstallDir>\state\install-record.json
-    so that Cleanup can reverse them exactly even after a reboot or a
-    process crash.
+      Status             - read-only diagnostic: service state, child
+                           process pids, current TUN routes, current
+                           per-interface DNS servers, install-record
+                           contents.
+
+      Run                - foreground sslocal for debugging. Does an
+                           internal Stop first, runs sslocal.exe in this
+                           shell, and runs Stop again on Ctrl-C / exit.
+
+    All system mutations made by Start/Run are journalled into
+    <InstallDir>\state\install-record.json so that Stop can reverse them
+    exactly even across reboots or unexpected crashes.
+
+    The script self-elevates via UAC: if you launch it from a
+    non-administrator shell it will spawn a new elevated PowerShell
+    window with -NoExit so you can read the output.
 
 .PARAMETER InstallDir
     Target install directory. Defaults to D:\software\shadowsocks.
@@ -31,17 +56,21 @@
     config. Defaults to "shadowsocks-tun".
 
 .EXAMPLE
-    # foreground run + cleanup on exit (recommended for testing)
-    powershell -ExecutionPolicy Bypass -File .\deploy\scripts\deploy_windows.ps1
+    # Install + start + enable autostart (the canonical "I want SS now"):
+    powershell -ExecutionPolicy Bypass -File .\deploy\scripts\deploy_windows.ps1 -Action Start
 
 .EXAMPLE
-    # just undo a previous deployment
-    powershell -ExecutionPolicy Bypass -File .\deploy\scripts\deploy_windows.ps1 -Action Cleanup
+    # Full uninstall + revert all network changes:
+    powershell -ExecutionPolicy Bypass -File .\deploy\scripts\deploy_windows.ps1 -Action Stop
+
+.EXAMPLE
+    # After `cargo build --release`, swap binary + restart service:
+    powershell -ExecutionPolicy Bypass -File .\deploy\scripts\deploy_windows.ps1 -Action Restart
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Run','Install','Cleanup')]
-    [string]$Action = 'Run',
+    [ValidateSet('Start','Stop','Restart','Status','Run')]
+    [string]$Action = 'Start',
     [string]$InstallDir = "D:\software\shadowsocks",
     [string]$ServiceName = "ssservice",
     [string]$TunName = "shadowsocks-tun",
@@ -66,10 +95,45 @@ $ErrorActionPreference = "Stop"
 # Helpers
 # ------------------------------------------------------------------
 
-function Assert-Admin {
+function Test-IsAdmin {
     $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# If we are not running elevated, request UAC and re-launch the same
+# script in a new admin PowerShell window with the same arguments. We
+# pass -NoExit so the elevated window stays open for the user to read
+# the output (especially Stop's per-interface DNS restore log).
+function Invoke-SelfElevate {
+    if (-not $PSCommandPath) {
+        throw "Cannot self-elevate: \$PSCommandPath is unset (run via -File, not piped)."
+    }
+    $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-File', $PSCommandPath)
+    foreach ($k in $PSBoundParameters.Keys) {
+        $v = $PSBoundParameters[$k]
+        if ($v -is [switch]) {
+            if ($v.IsPresent) { $argList += "-$k" }
+        } else {
+            $argList += "-$k"
+            $argList += "$v"
+        }
+    }
+    Write-Host "[deploy] not elevated; requesting UAC to relaunch with -Action $Action..." -ForegroundColor Yellow
+    try {
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs | Out-Null
+    } catch {
+        throw "UAC prompt was cancelled or failed: $($_.Exception.Message)"
+    }
+    Write-Host "[deploy] elevated window spawned; this shell is done." -ForegroundColor Green
+    exit 0
+}
+
+function Assert-Admin {
+    if (-not (Test-IsAdmin)) {
+        Invoke-SelfElevate
+        # Invoke-SelfElevate calls exit; the line below is only reached
+        # if someone disables exit (defence in depth).
         throw "Windows deployment requires an elevated PowerShell session."
     }
 }
@@ -742,14 +806,17 @@ function Invoke-RunAction {
     }
 }
 
-function Invoke-InstallAction {
+function Invoke-StartAction {
     param([string]$Root, [string]$RepoRoot, [string]$TunName, [string]$ServiceName)
 
     if ($ServiceName -ne "ssservice") {
         throw "sswinservice registers itself as 'ssservice'; use the default ServiceName."
     }
 
-    # Reset any prior state cleanly.
+    # Reset any prior install state cleanly before installing fresh.
+    # This guarantees DNS backups are taken from the real OS state, not
+    # from a half-broken previous run where DNS was still pinned to
+    # 127.0.0.1.
     Invoke-Cleanup -Root $Root -ServiceName $ServiceName -TunName $TunName
 
     $ConfigDest = Build-And-Stage -Root $Root -RepoRoot $RepoRoot -ForceConfig:$ForceConfig -NoConfigCopy:$NoConfigCopy
@@ -762,16 +829,205 @@ function Invoke-InstallAction {
         throw "sswinservice.exe missing at $ServiceExe; build with feature 'winservice'"
     }
     $BinPath = "`"$ServiceExe`" local -c `"$ConfigDest`" --log-without-time"
-    Write-Step "registering service $ServiceName"
-    & sc.exe create $ServiceName binPath= $BinPath start= auto | Out-Host
+
+    # Idempotent service registration. If a previous install was Stopped
+    # via `sc delete` the service is gone and we create it; if for some
+    # reason it survived (e.g. user ran sc.exe manually) we just update
+    # binPath and force start type back to auto.
+    $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Step "service '$ServiceName' already registered; updating binPath + start= auto"
+        & sc.exe config $ServiceName binPath= $BinPath start= auto | Out-Host
+    } else {
+        Write-Step "registering service '$ServiceName' (start= auto)"
+        & sc.exe create $ServiceName binPath= $BinPath start= auto | Out-Host
+    }
+
+    Write-Step "starting service '$ServiceName'"
     Start-Service -Name $ServiceName
-    Write-Step "service started"
 
     Start-Sleep -Seconds 2
     $record = Install-RoutesAndDns -Root $Root -ConfigPath $ConfigDest -TunName $TunName
     Save-Record -Root $Root -Record $record
 
-    Write-Step "install finished. Manage with: Get-Service -Name $ServiceName  /  Stop-Service $ServiceName"
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    Write-Host ""
+    Write-Host "[deploy] START finished." -ForegroundColor Green
+    if ($svc) {
+        Write-Host "   service '$ServiceName' : Status=$($svc.Status), StartType=$($svc.StartType) (Automatic = will auto-start on next boot)"
+    }
+    Write-Host "   to STOP + uninstall    : deploy_windows.ps1 -Action Stop"
+    Write-Host "   to inspect             : deploy_windows.ps1 -Action Status"
+}
+
+function Invoke-StopAction {
+    param([string]$Root, [string]$ServiceName, [string]$TunName)
+
+    # `Invoke-Cleanup` already does:
+    #   1. Stop-Service + sc.exe delete (so service disappears + cannot auto-start on reboot)
+    #   2. Kill orphaned sslocal/sswinservice/xray-plugin processes
+    #   3. Drop every route still pointing at the TUN adapter
+    #   4. Drop the LAN/server/gateway bypass routes recorded on the physical adapter
+    #   5. Restore the per-interface DNS server lists we overrode (v4 + v6)
+    #   6. Flush the OS DNS cache
+    #   7. Remove the install-record.json
+    # That covers the user's "completely as if never installed" requirement.
+    Invoke-Cleanup -Root $Root -ServiceName $ServiceName -TunName $TunName
+
+    # Belt-and-braces: kill any xray-plugin spawned by the dead service.
+    foreach ($name in 'sslocal','sswinservice','xray-plugin') {
+        Get-Process -Name $name -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host ""
+    Write-Host "[deploy] STOP finished." -ForegroundColor Green
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($svc) {
+        Write-Host "   service '$ServiceName' : still present (Status=$($svc.Status), StartType=$($svc.StartType))" -ForegroundColor Yellow
+        Write-Host "   (sc.exe delete may need a reboot if the SCM cached a handle.)"
+    } else {
+        Write-Host "   service '$ServiceName' : removed"
+    }
+    foreach ($name in 'sslocal','sswinservice','xray-plugin') {
+        $p = Get-Process -Name $name -ErrorAction SilentlyContinue
+        if ($p) {
+            Write-Host "   ${name}: still running pids $($p.Id -join ', ')" -ForegroundColor Red
+        }
+    }
+    Write-Host "   routes / DNS overrides : reverted (see lines above for details)"
+    Write-Host "   to start again         : deploy_windows.ps1 -Action Start"
+}
+
+function Invoke-RestartAction {
+    param([string]$Root, [string]$RepoRoot, [string]$TunName, [string]$ServiceName)
+
+    # Restart = "I just rebuilt sslocal, swap the binary and bounce".
+    # Routes and DNS overrides are deliberately preserved so the user
+    # doesn't see DNS resolution flap during the restart.
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Write-Warn "service '$ServiceName' not registered; nothing to restart. Use -Action Start."
+        return
+    }
+
+    Write-Step "stopping service '$ServiceName' for restart"
+    if ($svc.Status -ne 'Stopped') {
+        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        $deadline = (Get-Date).AddSeconds(15)
+        while ((Get-Date) -lt $deadline) {
+            $s = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+            if (-not $s -or $s.Status -eq 'Stopped') { break }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+
+    # Give Windows a moment to release the binary lock - xray-plugin in
+    # particular can stay alive briefly after its parent dies.
+    foreach ($name in 'sslocal','sswinservice','xray-plugin') {
+        Get-Process -Name $name -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 1500
+
+    if (-not $SkipBuild) {
+        Write-Step "cargo build --release (features: $Features)"
+        & cargo build --release --no-default-features --features $Features --bin sslocal --bin sswinservice
+        if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
+    }
+
+    $ReleaseDir = Join-Path $RepoRoot "target\release"
+    foreach ($exe in 'sslocal.exe','sswinservice.exe') {
+        $src = Join-Path $ReleaseDir $exe
+        $dst = Join-Path $Root "bin\$exe"
+        if (Test-Path -LiteralPath $src) {
+            Copy-Item -Force -LiteralPath $src -Destination $dst
+            Write-Step "copied $exe ($(((Get-Item $dst).LastWriteTime)))"
+        }
+    }
+
+    Write-Step "starting service '$ServiceName'"
+    Start-Service -Name $ServiceName
+    Start-Sleep -Seconds 2
+
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    Write-Host ""
+    Write-Host "[deploy] RESTART finished." -ForegroundColor Green
+    if ($svc) {
+        Write-Host "   service '$ServiceName' : Status=$($svc.Status), StartType=$($svc.StartType)"
+    }
+}
+
+function Invoke-StatusAction {
+    param([string]$Root, [string]$TunName, [string]$ServiceName)
+
+    Write-Host ""
+    Write-Host "==== service ====" -ForegroundColor Cyan
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($svc) {
+        Get-Service -Name $ServiceName | Select-Object Name,Status,StartType,DisplayName |
+            Format-Table -AutoSize | Out-Host
+    } else {
+        Write-Host "  (service '$ServiceName' not registered)"
+    }
+
+    Write-Host "==== processes ====" -ForegroundColor Cyan
+    $any = $false
+    foreach ($name in 'sslocal','sswinservice','xray-plugin') {
+        $p = Get-Process -Name $name -ErrorAction SilentlyContinue
+        if ($p) {
+            $any = $true
+            $p | Select-Object Name,Id,@{n='CPU(s)';e={[int]$_.CPU}},@{n='WS(MB)';e={[int]($_.WorkingSet64/1MB)}} |
+                Format-Table -AutoSize | Out-Host
+        }
+    }
+    if (-not $any) { Write-Host "  (no sslocal/sswinservice/xray-plugin processes running)" }
+
+    Write-Host "==== TUN adapter ====" -ForegroundColor Cyan
+    $tun = Get-NetAdapter -Name $TunName -ErrorAction SilentlyContinue
+    if ($tun) {
+        $tun | Select-Object Name,Status,ifIndex,MacAddress,LinkSpeed | Format-Table -AutoSize | Out-Host
+        Write-Host "==== routes via TUN ====" -ForegroundColor Cyan
+        Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.InterfaceIndex -eq $tun.ifIndex } |
+            Select-Object DestinationPrefix,NextHop,RouteMetric,InterfaceMetric |
+            Sort-Object DestinationPrefix |
+            Format-Table -AutoSize | Out-Host
+    } else {
+        Write-Host "  (TUN adapter '$TunName' not present)"
+    }
+
+    Write-Host "==== DNS overrides (loopback servers indicate active interception) ====" -ForegroundColor Cyan
+    foreach ($family in 'IPv4','IPv6') {
+        $loopback = if ($family -eq 'IPv4') { '127.0.0.1' } else { '::1' }
+        $hits = Get-DnsClientServerAddress -AddressFamily $family -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.InterfaceAlias -and
+                $_.InterfaceAlias -notmatch '^Loopback' -and
+                $_.InterfaceAlias -ne $TunName -and
+                $_.ServerAddresses -contains $loopback
+            }
+        if ($hits) {
+            $hits | Select-Object @{n='Family';e={$family}},InterfaceAlias,InterfaceIndex,@{n='Servers';e={$_.ServerAddresses -join ', '}} |
+                Format-Table -AutoSize | Out-Host
+        }
+    }
+
+    Write-Host "==== install record ====" -ForegroundColor Cyan
+    $recPath = Get-RecordPath -Root $Root
+    if (Test-Path -LiteralPath $recPath) {
+        Write-Host "  $recPath"
+        $rec = Load-Record -Root $Root
+        if ($rec) {
+            Write-Host "  tun_name           : $($rec.tun_name)"
+            Write-Host "  physical_alias     : $($rec.physical_alias)"
+            Write-Host "  tun_routes         : $((@($rec.tun_routes) | ForEach-Object { $_.prefix }) -join ', ')"
+            Write-Host "  physical_routes    : $((@($rec.physical_routes) | ForEach-Object { $_.prefix }) -join ', ')"
+            Write-Host "  dns_backups count  : $((@($rec.dns_backups)).Count)"
+        }
+    } else {
+        Write-Host "  (no install record at $recPath; either never started or fully stopped)"
+    }
 }
 
 # ------------------------------------------------------------------
@@ -786,11 +1042,17 @@ Write-Step "install: $InstallDir"
 Write-Step "action: $Action"
 
 switch ($Action) {
-    'Cleanup' {
-        Invoke-Cleanup -Root $InstallDir -ServiceName $ServiceName -TunName $TunName
+    'Start' {
+        Invoke-StartAction -Root $InstallDir -RepoRoot $RepoRoot -TunName $TunName -ServiceName $ServiceName
     }
-    'Install' {
-        Invoke-InstallAction -Root $InstallDir -RepoRoot $RepoRoot -TunName $TunName -ServiceName $ServiceName
+    'Stop' {
+        Invoke-StopAction -Root $InstallDir -ServiceName $ServiceName -TunName $TunName
+    }
+    'Restart' {
+        Invoke-RestartAction -Root $InstallDir -RepoRoot $RepoRoot -TunName $TunName -ServiceName $ServiceName
+    }
+    'Status' {
+        Invoke-StatusAction -Root $InstallDir -TunName $TunName -ServiceName $ServiceName
     }
     'Run' {
         Invoke-RunAction -Root $InstallDir -RepoRoot $RepoRoot -TunName $TunName -ServiceName $ServiceName
