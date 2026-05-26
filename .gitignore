@@ -15,3 +15,7 @@ deploy/**/conf/shadowsocks-client.json
 /.idea
 /.devcontainer
 .DS_Store
+# Marker files written by the elevated PowerShell launchers
+# (run_*_elevated.ps1) so the parent shell knows the elevated job
+# finished. Never useful in version control.
+/*.ok

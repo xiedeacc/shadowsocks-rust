@@ -23,7 +23,17 @@ cfg_if! {
 
 fn set_common_sockopt_for_connect(addr: SocketAddr, socket: &TcpSocket, opts: &ConnectOpts) -> io::Result<()> {
     // Binds to IP address
-    if let Some(baddr) = opts.bind_local_addr {
+    //
+    // Skip the bind whenever the destination is loopback: forcing a
+    // non-loopback source on a 127.0.0.0/8 destination is invalid on
+    // Windows (WSAEADDRNOTAVAIL / os error 10049) and useless on other
+    // platforms. This matters most for the TUN setup where the global
+    // `bind_local_addr` is the physical NIC IP, but plugin subprocesses
+    // (xray-plugin etc.) listen on 127.0.0.1 — without this guard every
+    // SS-via-plugin TCP connect fails.
+    if let Some(baddr) = opts.bind_local_addr
+        && !addr.ip().is_loopback()
+    {
         match (baddr, addr) {
             (SocketAddr::V4(..), SocketAddr::V4(..)) => {
                 socket.bind(baddr)?;

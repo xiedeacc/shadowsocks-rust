@@ -931,6 +931,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="form-line"><label>Async Refresh</label><input id="dnsCacheRefreshEnabled" type="checkbox"></div>
           <div class="form-line"><label>Refresh Batch Size</label><input id="dnsCacheRefreshBatch" type="number" min="1"></div>
           <div class="form-line"><label>Intercept Mode</label><select id="dnsInterceptMode"><option>off</option><option>firewall</option><option>tun</option><option>both</option></select></div>
+          <div class="form-line"><label title="Strip AAAA records from DNS responses. Avoids browser happy-eyeballs delay on hosts without working public IPv6.">Address Family</label><select id="dnsIpv4Only"><option value="true">IPv4 only (recommended)</option><option value="false">IPv4 + IPv6</option></select></div>
         </fieldset>
         <h3 class="card-title">Server</h3>
         <fieldset>
@@ -1079,7 +1080,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <script>
     let currentConfigPath='', currentRawConfig={}, rulesSnapshot={}, servicePlatform=null;
     const routeSourceKeys=['geoip_sources','geosite_sources','direct_domain_sources','bypass_domain_sources'];
-    const dnsKeys=['domestic_dns','foreign_dns','dns_cache_capacity','dns_cache_ttl_seconds','dns_cache_refresh_enabled','dns_cache_refresh_batch_size','dns_intercept_mode','dns_listen_address','dns_listen_port'];
+    const dnsKeys=['domestic_dns','foreign_dns','dns_cache_capacity','dns_cache_ttl_seconds','dns_cache_refresh_enabled','dns_cache_refresh_batch_size','dns_intercept_mode','dns_listen_address','dns_listen_port','dns_ipv4_only'];
     const sourceKeys=[...routeSourceKeys,...dnsKeys];
     function token(){return new URLSearchParams(location.search).get('token')||''}
     async function api(path,opt={}){opt.headers=Object.assign({'x-admin-token':token()},opt.headers||{});let r=await fetch(path,opt);let j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}
@@ -1121,15 +1122,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
       tunAddress.value=tun.tun_interface_address||'10.255.0.1/24';
       tunDestination.value=tun.tun_interface_destination||'10.255.0.2/24';
       document.querySelectorAll('.tun-field').forEach(e=>e.style.display=isWindowsService()?'grid':'none');
-      dnsEnable.checked=!!dns.protocol;
-      setSelect('dnsBind',dns.local_address||'0.0.0.0'); dnsPort.value=dns.local_port||1053;
+      dnsEnable.checked=!!dns.protocol||!!tun.protocol;
+      if(tun.protocol&&isWindowsService()){
+        setSelect('dnsBind','0.0.0.0'); dnsPort.value=53; setSelect('dnsInterceptMode','tun');
+      }else{
+        setSelect('dnsBind',dns.local_address||routeRules.dns_listen_address||'127.0.0.1'); dnsPort.value=dns.local_port||routeRules.dns_listen_port||1053;
+        setSelect('dnsInterceptMode',routeRules.dns_intercept_mode||'off');
+      }
       renderDnsList('dnsDomesticList',routeRules.domestic_dns||[(dns.local_dns_address||'223.5.5.5')+':'+(dns.local_dns_port||53)]);
       renderDnsList('dnsForeignList',routeRules.foreign_dns||[(dns.remote_dns_address||'8.8.8.8')+':'+(dns.remote_dns_port||53)]);
       dnsCacheCapacity.value=routeRules.dns_cache_capacity||10000;
       dnsCacheTtl.value=routeRules.dns_cache_ttl_seconds||604800;
       dnsCacheRefreshEnabled.checked=routeRules.dns_cache_refresh_enabled!==false;
       dnsCacheRefreshBatch.value=routeRules.dns_cache_refresh_batch_size||500;
-      setSelect('dnsInterceptMode',routeRules.dns_intercept_mode||'off');
+      setSelect('dnsIpv4Only', (routeRules.dns_ipv4_only===false ? 'false' : 'true'));
       serverHost.value=server.server||''; serverPort.value=server.server_port||443; setSelect('method',server.method||'aes-256-gcm');
       serverSecret.value=server.password||''; timeout.value=server.timeout||300; plugin.value=server.plugin||''; pluginOpts.value=server.plugin_opts||'';
       updateClientJson();
@@ -1142,18 +1148,24 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if(redirEnable.checked){
         if(isWindowsService()){
           locals.push({protocol:'tun',mode:redirMode.value,tun_interface_name:tunName.value.trim()||'shadowsocks-tun',tun_interface_address:tunAddress.value.trim()||'10.255.0.1/24',tun_interface_destination:tunDestination.value.trim()||'10.255.0.2/24'});
+          dnsEnable.checked=true;
+          dnsBind.value='0.0.0.0';
+          dnsPort.value=53;
+          setSelect('dnsInterceptMode','tun');
         }else{
           locals.push({local_address:redirBind.value,local_port:num(redirPort.value,12345),protocol:'redir',mode:redirMode.value,tcp_redir:tcpRedir.value,udp_redir:udpRedir.value});
         }
       }
+      const windowsTun=redirEnable.checked&&isWindowsService();
       let routeRules=Object.assign({},currentRawConfig.route_rules||{});
       routeRules.dns_cache_capacity=num(dnsCacheCapacity.value,10000);
       routeRules.dns_cache_ttl_seconds=num(dnsCacheTtl.value,604800);
       routeRules.dns_cache_refresh_enabled=dnsCacheRefreshEnabled.checked;
       routeRules.dns_cache_refresh_batch_size=num(dnsCacheRefreshBatch.value,500);
-      routeRules.dns_intercept_mode=isWindowsService()&&dnsInterceptMode.value==='firewall'?'tun':dnsInterceptMode.value;
-      routeRules.dns_listen_address=dnsBind.value;
-      routeRules.dns_listen_port=num(dnsPort.value,1053);
+      routeRules.dns_intercept_mode=windowsTun?'tun':(redirEnable.checked?(isWindowsService()&&dnsInterceptMode.value==='firewall'?'tun':dnsInterceptMode.value):'off');
+      routeRules.dns_listen_address=windowsTun?'127.0.0.1':dnsBind.value;
+      routeRules.dns_listen_port=num(dnsPort.value,windowsTun?53:1053);
+      routeRules.dns_ipv4_only=(dnsIpv4Only.value!=='false');
       let domesticDns=readDns('dnsDomesticList');
       let foreignDns=readDns('dnsForeignList');
       routeRules.domestic_dns=domesticDns.length?domesticDns:['223.5.5.5:53'];
@@ -1161,7 +1173,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if(dnsEnable.checked){
         let domestic=parseHostPort(routeRules.domestic_dns[0],'223.5.5.5',53);
         let foreign=parseHostPort(routeRules.foreign_dns[0],'8.8.8.8',53);
-        locals.push({local_address:dnsBind.value,local_port:num(dnsPort.value,1053),protocol:'dns',mode:'tcp_and_udp',local_dns_address:domestic.host,local_dns_port:domestic.port,remote_dns_address:foreign.host,remote_dns_port:foreign.port,client_cache_size:64});
+        const dnsPortValue=windowsTun?53:num(dnsPort.value,1053);
+        const dnsBindValue=windowsTun?'0.0.0.0':dnsBind.value;
+        locals.push({local_address:dnsBindValue,local_port:dnsPortValue,protocol:'dns',mode:'tcp_and_udp',local_dns_address:domestic.host,local_dns_port:domestic.port,remote_dns_address:foreign.host,remote_dns_port:foreign.port,client_cache_size:64});
       }
       let server={server:serverHost.value.trim(),server_port:num(serverPort.value,443),password:serverSecret.value,timeout:num(timeout.value,300),method:method.value};
       if(plugin.value.trim())server.plugin=plugin.value.trim();

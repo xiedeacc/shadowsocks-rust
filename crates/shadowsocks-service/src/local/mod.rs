@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::future;
-use log::trace;
+use log::{info, trace, warn};
 use shadowsocks::{
     config::Mode,
     net::{AcceptOpts, ConnectOpts},
@@ -139,6 +139,32 @@ impl Server {
         // Each Local instance will hold a copy of its fields
         let mut context = ServiceContext::new();
 
+        #[cfg(all(windows, feature = "local-tun"))]
+        let (outbound_bind_interface, outbound_bind_addr) = {
+            let has_tun = config.local.iter().any(|l| matches!(l.config.protocol, ProtocolType::Tun));
+            let need_auto = has_tun
+                && config.outbound_bind_interface.is_none()
+                && config.outbound_bind_addr.is_none();
+            if need_auto {
+                match tun::detect_windows_physical_endpoint() {
+                    Some((iface, ip)) => {
+                        info!("[TUN] auto-detected outbound bind: iface={iface} ip={ip}");
+                        (Some(iface), Some(ip))
+                    }
+                    None => {
+                        warn!("[TUN] unable to detect outbound bind endpoint; outbound TCP may loop through TUN (os error 10049)");
+                        (config.outbound_bind_interface.clone(), config.outbound_bind_addr)
+                    }
+                }
+            } else {
+                (config.outbound_bind_interface.clone(), config.outbound_bind_addr)
+            }
+        };
+        #[cfg(not(all(windows, feature = "local-tun")))]
+        let outbound_bind_interface = config.outbound_bind_interface.clone();
+        #[cfg(not(all(windows, feature = "local-tun")))]
+        let outbound_bind_addr = config.outbound_bind_addr;
+
         let mut connect_opts = ConnectOpts {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             fwmark: config.outbound_fwmark,
@@ -148,8 +174,8 @@ impl Server {
             #[cfg(target_os = "android")]
             vpn_protect_path: config.outbound_vpn_protect_path,
 
-            bind_interface: config.outbound_bind_interface,
-            bind_local_addr: config.outbound_bind_addr.map(|ip| SocketAddr::new(ip, 0)),
+            bind_interface: outbound_bind_interface,
+            bind_local_addr: outbound_bind_addr.map(|ip| SocketAddr::new(ip, 0)),
 
             ..Default::default()
         };

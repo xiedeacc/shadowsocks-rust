@@ -123,6 +123,11 @@ impl TunBuilder {
             Err(err) => return Err(io::Error::other(err)),
         };
 
+        let tun_address = match (device.address(), device.netmask()) {
+            (Ok(address), Ok(netmask)) => IpNet::with_netmask(address, netmask).ok(),
+            _ => None,
+        };
+
         let (udp, udp_cleanup_interval, udp_keepalive_rx) = UdpTun::new(
             self.context.clone(),
             self.balancer.clone(),
@@ -140,7 +145,15 @@ impl TunBuilder {
             })
             .collect();
 
-        let tcp = TcpTun::new(self.context.clone(), self.balancer, device.mtu().unwrap_or(1500) as u32);
+        let tcp = TcpTun::new(
+            self.context.clone(),
+            self.balancer,
+            device.mtu().unwrap_or(1500) as u32,
+            tun_address,
+        );
+
+        #[cfg(windows)]
+        let tun_name_for_cleanup = device.tun_name().ok();
 
         Ok(Tun {
             device,
@@ -153,6 +166,8 @@ impl TunBuilder {
             mode: self.mode,
             #[cfg(windows)]
             bypass_route_ips,
+            #[cfg(windows)]
+            tun_name_for_cleanup,
         })
     }
 }
@@ -169,6 +184,26 @@ pub struct Tun {
     mode: Mode,
     #[cfg(windows)]
     bypass_route_ips: Vec<IpAddr>,
+    /// Cached TUN interface name; used by the Windows Drop impl to roll
+    /// back catch-all routes if the process exits without the deploy
+    /// script's cleanup running (e.g. killed via Task Manager).
+    #[cfg(windows)]
+    tun_name_for_cleanup: Option<String>,
+}
+
+#[cfg(windows)]
+impl Drop for Tun {
+    fn drop(&mut self) {
+        if let Some(name) = self.tun_name_for_cleanup.take() {
+            // Best-effort: log and ignore failures; the deploy script's
+            // cleanup is still the canonical recovery path.
+            if let Err(err) = remove_windows_tun_routes(&name) {
+                warn!("[TUN] failed to remove catch-all routes for '{}' on shutdown: {}", name, err);
+            } else {
+                info!("[TUN] removed catch-all routes for '{}' on shutdown", name);
+            }
+        }
+    }
 }
 
 impl Tun {
@@ -204,16 +239,47 @@ impl Tun {
             }
         };
 
-        trace!(
-            "[TUN] tun device network: {} (address: {}, netmask: {})",
-            address_net, address, netmask
+        info!(
+            "[TUN] device {} ready: network={} address={} netmask={} mode={}",
+            self.device.tun_name().or_else(|r| Ok::<_, ()>(r.to_string())).unwrap(),
+            address_net,
+            address,
+            netmask,
+            self.mode,
         );
 
         #[cfg(windows)]
-        if let Ok(name) = self.device.tun_name()
-            && let Err(err) = install_windows_bypass_routes(&name, &self.windows_bypass_route_ips().await)
-        {
-            warn!("[TUN] failed to install Windows bypass routes: {}", err);
+        if let Ok(name) = self.device.tun_name() {
+            let bypass_ips = self.windows_bypass_route_ips().await;
+            if bypass_ips.is_empty() {
+                info!(
+                    "[TUN] no direct-route exceptions to install for '{}'; relying on deploy script for catch-all routes",
+                    name
+                );
+            } else {
+                // These are /32 routes installed on the *physical* adapter
+                // so the listed destinations bypass the TUN catch-all and
+                // sslocal can reach them directly (otherwise its own
+                // outbound to e.g. the SS server or the local DNS upstream
+                // would be re-captured by TUN and deadlock).
+                info!(
+                    "[TUN] installing direct-route exceptions on physical adapter (so these bypass '{}' catch-all): {}",
+                    name,
+                    bypass_ips
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if let Err(err) = install_windows_bypass_routes(&name, &bypass_ips) {
+                warn!(
+                    "[TUN] failed to install Windows direct-route exceptions (deploy script's routes still apply): {}",
+                    err
+                );
+            } else {
+                info!("[TUN] direct-route exceptions installed for '{}'", name);
+            }
         }
 
         let address_broadcast = address_net.broadcast();
@@ -421,17 +487,28 @@ impl Tun {
         Ok(())
     }
 
+    /// Collect IPs that sslocal itself will *directly* connect to and
+    /// therefore need /32 exceptions on the physical adapter so its
+    /// outbound packets don't loop back into the TUN catch-all.
+    ///
+    /// What belongs here:
+    ///   - SS server IPs       — sslocal opens raw TCP/UDP to them
+    ///   - `domestic_dns` IPs  — `DnsClient::lookup_local` queries
+    ///                           these directly (no proxy)
+    ///
+    /// What does NOT belong here:
+    ///   - `foreign_dns` IPs — those queries are wrapped in the SS
+    ///     protocol and addressed to the SS server. sslocal never
+    ///     opens a raw socket to e.g. `8.8.8.8`, so a /32 exception
+    ///     for it is wasted (and would actually be *harmful* if a
+    ///     future code path ever did open a direct socket to it,
+    ///     because that path would silently sidestep the proxy).
     #[cfg(windows)]
     async fn windows_bypass_route_ips(&self) -> Vec<IpAddr> {
         let mut route_ips = self.bypass_route_ips.clone();
         #[cfg(feature = "local-web-admin")]
         if let Some(routing_state) = self.context.routing_state() {
-            for dns in routing_state
-                .domestic_dns()
-                .await
-                .into_iter()
-                .chain(routing_state.foreign_dns().await)
-            {
+            for dns in routing_state.domestic_dns().await {
                 if let Some(ip) = parse_dns_server_ip(&dns) {
                     route_ips.push(ip);
                 }
@@ -477,7 +554,13 @@ if (-not $defaultRoute) {{ throw 'physical default route was not found' }}
 Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
     Where-Object {{ $_.InterfaceIndex -eq $adapter.ifIndex }} |
     Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-foreach ($prefix in @('10.0.0.0/8','100.64.0.0/10','169.254.0.0/16','172.16.0.0/12','192.168.0.0/16','198.18.0.0/15')) {{
+foreach ($prefix in @('0.0.0.0/1','128.0.0.0/1')) {{
+    Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $prefix -ErrorAction SilentlyContinue |
+        Where-Object {{ $_.InterfaceIndex -eq $adapter.ifIndex }} |
+        Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $adapter.ifIndex -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null
+}}
+foreach ($prefix in @('10.0.0.0/8','100.64.0.0/10','127.0.0.0/8','169.254.0.0/16','172.16.0.0/12','192.168.0.0/16','198.18.0.0/15')) {{
     Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $prefix -ErrorAction SilentlyContinue |
         Where-Object {{ $_.InterfaceIndex -eq $defaultRoute.InterfaceIndex }} |
         Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
@@ -532,6 +615,95 @@ if ($defaultRoute.NextHop -and $defaultRoute.NextHop -ne '0.0.0.0') {{
 }
 
 #[cfg(windows)]
+pub fn detect_windows_physical_interface() -> Option<String> {
+    detect_windows_physical_endpoint().map(|(alias, _)| alias)
+}
+
+/// Locate the physical IPv4 default-route interface and return both its
+/// `InterfaceAlias` (for `IP_UNICAST_IF`) and its first non-link-local
+/// IPv4 address (for `bind_local_addr`).
+///
+/// We need both to plug `WSAEADDRNOTAVAIL` (`os error 10049`) on direct
+/// connects from the TUN bypass path:
+///
+///   * `IP_UNICAST_IF` alone tells Windows *which interface* to route
+///     out via, but in some scenarios (multiple TUN catch-alls, weak
+///     host model interactions) the source address still gets picked
+///     from the TUN adapter, and `connect()` then fails because that
+///     source is not valid on the chosen interface.
+///   * Setting `bind_local_addr` to the Ethernet IP forces the source
+///     to a valid local address before `connect()`, so Windows' route
+///     selection is consistent with the bound source.
+#[cfg(windows)]
+pub fn detect_windows_physical_endpoint() -> Option<(String, IpAddr)> {
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$defaultRoute = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
+    Where-Object { $_.NextHop -ne '0.0.0.0' } |
+    Sort-Object RouteMetric, InterfaceMetric |
+    Select-Object -First 1
+if (-not $defaultRoute) { exit 1 }
+$adapter = Get-NetAdapter -InterfaceIndex $defaultRoute.InterfaceIndex
+if (-not $adapter) { exit 1 }
+$ip = Get-NetIPAddress -InterfaceIndex $defaultRoute.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { $_.PrefixOrigin -ne 'WellKnown' -and $_.IPAddress -notlike '169.254.*' } |
+    Sort-Object -Property @{Expression={ if ($_.PrefixOrigin -eq 'Dhcp') { 0 } else { 1 } }} |
+    Select-Object -First 1
+if (-not $ip) { exit 1 }
+Write-Output ("{0}|{1}" -f $adapter.InterfaceAlias, $ip.IPAddress)
+"#;
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let (alias, ip) = line.split_once('|')?;
+    let alias = alias.trim().to_owned();
+    let ip = ip.trim().parse::<IpAddr>().ok()?;
+    if alias.is_empty() { None } else { Some((alias, ip)) }
+}
+
+#[cfg(windows)]
 fn powershell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Best-effort removal of every IPv4 route attached to the named TUN
+/// adapter. Used by the Windows [`Drop`] impl as a last-line defence so
+/// catch-all `0.0.0.0/1` + `128.0.0.0/1` routes don't survive a hard
+/// kill of `sslocal.exe`. The deploy script still owns the canonical
+/// cleanup (it also restores DNS and the physical adapter routes).
+#[cfg(windows)]
+fn remove_windows_tun_routes(tun_name: &str) -> io::Result<()> {
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$tunName = {tun_name}
+$adapter = Get-NetAdapter -Name $tunName -ErrorAction SilentlyContinue
+if (-not $adapter) {{ exit 0 }}
+Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.InterfaceIndex -eq $adapter.ifIndex }} |
+    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+"#,
+        tun_name = powershell_quote(tun_name),
+    );
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .stdin(Stdio::null())
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(io::Error::other(if stderr.is_empty() {
+            format!("powershell exited with {}", output.status)
+        } else {
+            stderr
+        }))
+    }
 }

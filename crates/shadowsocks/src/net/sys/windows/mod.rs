@@ -59,8 +59,14 @@ impl TcpStream {
             SocketAddr::V6(..) => TcpSocket::new_v6()?,
         };
 
-        // Binds to a specific network interface (device)
-        if let Some(ref iface) = opts.bind_interface {
+        // Binds to a specific network interface (device).
+        //
+        // Skip when the destination is loopback: forcing `IP_UNICAST_IF`
+        // to a physical adapter for a 127.0.0.0/8 connect makes Windows
+        // reject the connect with WSAEADDRNOTAVAIL (os error 10049).
+        if !addr.ip().is_loopback()
+            && let Some(ref iface) = opts.bind_interface
+        {
             set_ip_unicast_if(&socket, &addr, iface)?;
         }
 

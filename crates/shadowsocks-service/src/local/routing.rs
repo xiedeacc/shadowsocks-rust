@@ -97,6 +97,8 @@ pub struct RoutingSources {
     pub dns_listen_address: String,
     #[serde(default = "default_dns_listen_port")]
     pub dns_listen_port: u16,
+    #[serde(default = "default_dns_ipv4_only")]
+    pub dns_ipv4_only: bool,
 }
 
 fn default_dns_cache_capacity() -> usize {
@@ -127,6 +129,10 @@ fn default_dns_listen_port() -> u16 {
     1053
 }
 
+fn default_dns_ipv4_only() -> bool {
+    true
+}
+
 impl From<&RouteRulesConfig> for RoutingSources {
     fn from(config: &RouteRulesConfig) -> Self {
         sanitize_sources(Self {
@@ -143,6 +149,7 @@ impl From<&RouteRulesConfig> for RoutingSources {
             dns_intercept_mode: config.dns_intercept_mode.clone(),
             dns_listen_address: config.dns_listen_address.clone(),
             dns_listen_port: config.dns_listen_port,
+            dns_ipv4_only: config.dns_ipv4_only,
         })
     }
 }
@@ -381,6 +388,9 @@ struct RoutingInner {
 pub struct RoutingState {
     inner: Arc<TokioRwLock<RoutingInner>>,
     progress: Arc<StdRwLock<RuleUpdateProgress>>,
+    /// Mirror of `sources.dns_ipv4_only` so hot DNS hooks can check it
+    /// without taking the async lock on `inner`.
+    dns_ipv4_only_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RoutingState {
@@ -403,8 +413,21 @@ impl RoutingState {
         let manual_domain_raw = read_manual_domain_rules(&config.rules_dir)?;
         write_manual_domain_rules(&config.rules_dir, &manual_domain_raw)?;
         let manual_domain_modified = file_modified(&config.rules_dir.join(MANUAL_DOMAIN_FILE))?;
-        let (ip_regions, ip_sources) = read_rule_metadata(&config.rules_dir.join(IP_METADATA_FILE))?;
-        let (domain_regions, domain_sources) = read_rule_metadata(&config.rules_dir.join(DOMAIN_METADATA_FILE))?;
+        // NOTE: ip_metadata.txt / domain_metadata.txt are NOT loaded at
+        // startup -- with a full geoip.dat that file has ~1.19M rows,
+        // and holding them in two `HashMap<String, BTreeSet<String>>`
+        // costs hundreds of MB of resident RAM. They are only needed
+        // for refresh-time recomputation (which rebuilds them from
+        // geoip.dat anyway) and for UI tooltips. UI requests now read
+        // metadata on demand; refresh repopulates these maps as it
+        // already did. Until the first refresh in this process, the
+        // `metadata`/`sources` fields on conflict events will be empty
+        // -- the conflict detection itself still works from the rule
+        // files (direct_ip / bypass_ip) directly.
+        let ip_regions = HashMap::new();
+        let ip_sources = HashMap::new();
+        let domain_regions = HashMap::new();
+        let domain_sources = HashMap::new();
         let temporary_raw = with_private_direct_rules(RuleLists::default());
         let temporary = compile_rules(&temporary_raw);
         let mut inner = RoutingInner {
@@ -436,9 +459,11 @@ impl RoutingState {
             bypass_ip_persist_scheduled: false,
         };
         rebuild_conflicts(&mut inner);
+        let v4_only = inner.sources.dns_ipv4_only;
         Ok(Self {
             inner: Arc::new(TokioRwLock::new(inner)),
             progress: Arc::new(StdRwLock::new(RuleUpdateProgress::default())),
+            dns_ipv4_only_flag: Arc::new(std::sync::atomic::AtomicBool::new(v4_only)),
         })
     }
 
@@ -455,6 +480,10 @@ impl RoutingState {
     pub async fn set_sources(&self, sources: RoutingSources) {
         let mut inner = self.inner.write().await;
         inner.sources = sanitize_sources(sources);
+        // Keep the lock-free mirror in sync so the DNS hot path
+        // immediately picks up runtime UI toggles (e.g. IPv4-only).
+        self.dns_ipv4_only_flag
+            .store(inner.sources.dns_ipv4_only, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub async fn set_temporary_rules(&self, rules: RuleLists) -> io::Result<()> {
@@ -905,11 +934,27 @@ impl RoutingState {
         inner.manual_domain_modified = file_modified(&inner.rules_dir.join(MANUAL_DOMAIN_FILE))?;
         inner.persistent_raw = lists;
         inner.persistent = persistent;
-        inner.ip_regions = ip_regions;
-        inner.ip_sources = ip_sources;
-        inner.domain_regions = domain_regions;
-        inner.domain_sources = domain_sources;
-        rebuild_conflicts(&mut inner);
+        // The metadata maps were *just* used to compile the rule
+        // lists; the only remaining consumer is conflict-event
+        // enrichment, which we run inline here. Once that returns
+        // every interesting string has been moved into the bounded
+        // `ip_conflicts` / `domain_conflicts` ring buffers and the
+        // multi-million-entry maps can be dropped immediately --
+        // saves several hundred MB of resident RAM. The on-disk
+        // ip_metadata.txt / domain_metadata.txt files are still
+        // written above, so the Web Admin UI can grep them on demand
+        // for tooltips.
+        rebuild_conflicts_with_metadata(
+            &mut inner,
+            &ip_regions,
+            &ip_sources,
+            &domain_regions,
+            &domain_sources,
+        );
+        drop(ip_regions);
+        drop(ip_sources);
+        drop(domain_regions);
+        drop(domain_sources);
         drop(inner);
         self.set_update_progress(RuleUpdateProgress {
             status: RuleUpdateStatus::Completed,
@@ -1197,6 +1242,19 @@ impl RoutingState {
 
     pub async fn foreign_dns(&self) -> Vec<String> {
         self.inner.read().await.sources.foreign_dns.clone()
+    }
+
+    /// Returns true when the user configured / defaulted to v4-only DNS
+    /// (strips AAAA from responses to avoid happy-eyeballs delay on
+    /// hosts without working public IPv6).
+    pub async fn dns_ipv4_only(&self) -> bool {
+        self.inner.read().await.sources.dns_ipv4_only
+    }
+
+    /// Sync version of [`Self::dns_ipv4_only`] for hot paths (DNS
+    /// answer post-processing) that cannot take the async lock.
+    pub fn dns_ipv4_only_sync(&self) -> bool {
+        self.dns_ipv4_only_flag.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn dns_tun_intercept_target(&self) -> Option<SocketAddr> {
@@ -1701,17 +1759,38 @@ fn route_domain_inner(inner: &mut RoutingInner, domain: &str) -> Option<RouteDec
 }
 
 fn rebuild_conflicts(inner: &mut RoutingInner) {
+    // Cold-start / manual-edit path: refresh has already discarded
+    // the giant geo metadata maps to save RAM, so we fall back to
+    // whatever bounded metadata is still resident on `inner` (mostly
+    // entries added by `apply_manual_*_metadata`). Cloning is fine --
+    // these maps are small (manual rules + first-time bootstraps).
+    let ip_regions = inner.ip_regions.clone();
+    let ip_sources = inner.ip_sources.clone();
+    let domain_regions = inner.domain_regions.clone();
+    let domain_sources = inner.domain_sources.clone();
+    rebuild_conflicts_with_metadata(inner, &ip_regions, &ip_sources, &domain_regions, &domain_sources);
+}
+
+fn rebuild_conflicts_with_metadata(
+    inner: &mut RoutingInner,
+    ip_regions: &HashMap<String, BTreeSet<String>>,
+    ip_sources: &HashMap<String, BTreeSet<String>>,
+    domain_regions: &HashMap<String, BTreeSet<String>>,
+    domain_sources: &HashMap<String, BTreeSet<String>>,
+) {
     inner.ip_conflicts.clear();
     inner.domain_conflicts.clear();
 
-    for rule in ip_metadata_conflict_values(&inner.ip_regions) {
-        let regions = inner
-            .ip_regions
-            .get(&rule)
-            .map(display_ip_conflict_regions)
-            .unwrap_or_default();
-        let sources = inner
-            .ip_sources
+    // Conflict detection always derives from the compiled rule sets --
+    // i.e. the actual contents of `direct_ip.txt` vs `bypass_ip.txt`
+    // and `direct_domain.txt` vs `bypass_domain.txt`. When the caller
+    // hands in populated metadata maps (refresh path) we copy the
+    // region / source attribution for *just the conflicting keys*
+    // into the bounded conflict events, so the giant geoip-sized
+    // maps can be dropped immediately after this call returns.
+    for rule in ip_net_conflicts(&inner.persistent.direct_ip, &inner.persistent.bypass_ip) {
+        let regions = ip_regions.get(&rule).map(display_ip_conflict_regions).unwrap_or_default();
+        let sources = ip_sources
             .get(&rule)
             .map(|sources| sources.iter().cloned().collect())
             .unwrap_or_default();
@@ -1721,14 +1800,12 @@ fn rebuild_conflicts(inner: &mut RoutingInner) {
         );
     }
 
-    for rule in metadata_conflict_values(&inner.domain_regions) {
-        let regions = inner
-            .domain_regions
+    for rule in domain_rule_conflicts(&inner.persistent.direct_domain, &inner.persistent.bypass_domain) {
+        let regions = domain_regions
             .get(&rule)
             .map(|regions| regions.iter().cloned().collect())
             .unwrap_or_default();
-        let sources = inner
-            .domain_sources
+        let sources = domain_sources
             .get(&rule)
             .map(|sources| sources.iter().cloned().collect())
             .unwrap_or_default();

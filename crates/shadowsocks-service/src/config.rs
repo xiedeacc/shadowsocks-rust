@@ -657,6 +657,8 @@ struct SSRouteRulesConfig {
     dns_listen_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dns_listen_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dns_ipv4_only: Option<bool>,
 }
 
 /// Server config type
@@ -1610,6 +1612,11 @@ pub struct RouteRulesConfig {
     pub dns_intercept_mode: String,
     pub dns_listen_address: String,
     pub dns_listen_port: u16,
+    /// Strip AAAA answers from local DNS responses. Useful on hosts
+    /// without public IPv6 connectivity — otherwise browsers spend
+    /// happy-eyeballs time trying v6 addresses that can never connect
+    /// before falling back to v4.
+    pub dns_ipv4_only: bool,
 }
 
 #[cfg(feature = "local-web-admin")]
@@ -1630,6 +1637,7 @@ impl Default for RouteRulesConfig {
             dns_intercept_mode: "off".to_owned(),
             dns_listen_address: "127.0.0.1".to_owned(),
             dns_listen_port: 1053,
+            dns_ipv4_only: true,
         }
     }
 }
@@ -2859,6 +2867,9 @@ impl Config {
                 if let Some(port) = route_rules.dns_listen_port {
                     parsed.dns_listen_port = port;
                 }
+                if let Some(v4_only) = route_rules.dns_ipv4_only {
+                    parsed.dns_ipv4_only = v4_only;
+                }
                 nconfig.route_rules = parsed;
             }
         }
@@ -3659,6 +3670,7 @@ impl fmt::Display for Config {
                 dns_intercept_mode: Some(self.route_rules.dns_intercept_mode.clone()),
                 dns_listen_address: Some(self.route_rules.dns_listen_address.clone()),
                 dns_listen_port: Some(self.route_rules.dns_listen_port),
+                dns_ipv4_only: Some(self.route_rules.dns_ipv4_only),
             });
         }
 

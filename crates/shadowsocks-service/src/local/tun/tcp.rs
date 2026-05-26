@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use ipnet::IpNet;
 use log::{debug, error, trace};
 use shadowsocks::{net::TcpSocketOpts, relay::socks5::Address};
 use smoltcp::{
@@ -258,7 +259,7 @@ impl Drop for TcpTun {
 }
 
 impl TcpTun {
-    pub fn new(context: Arc<ServiceContext>, balancer: PingBalancer, mtu: u32) -> Self {
+    pub fn new(context: Arc<ServiceContext>, balancer: PingBalancer, mtu: u32, tun_address: Option<IpNet>) -> Self {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ip;
         capabilities.max_transmission_unit = mtu as usize;
@@ -273,9 +274,18 @@ impl TcpTun {
         let mut iface_config = InterfaceConfig::new(HardwareAddress::Ip);
         iface_config.random_seed = rand::random();
         let mut iface = Interface::new(iface_config, &mut device, SmolInstant::now());
+        let (iface_ipv4, iface_prefix) = match tun_address {
+            Some(net) if net.addr().is_ipv4() => {
+                let IpAddr::V4(v4) = net.addr() else {
+                    unreachable!("checked is_ipv4");
+                };
+                (Ipv4Address::from(v4), net.prefix_len())
+            }
+            _ => (Ipv4Address::new(0, 0, 0, 1), 0),
+        };
         iface.update_ip_addrs(|ip_addrs| {
             ip_addrs
-                .push(IpCidr::new(IpAddress::v4(0, 0, 0, 1), 0))
+                .push(IpCidr::new(IpAddress::Ipv4(iface_ipv4), iface_prefix))
                 .expect("iface IPv4");
             ip_addrs
                 .push(IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), 0))
@@ -283,7 +293,7 @@ impl TcpTun {
         });
         iface
             .routes_mut()
-            .add_default_ipv4_route(Ipv4Address::new(0, 0, 0, 1))
+            .add_default_ipv4_route(iface_ipv4)
             .expect("IPv4 default route");
         iface
             .routes_mut()

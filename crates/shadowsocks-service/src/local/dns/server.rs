@@ -671,6 +671,35 @@ fn collect_answer_ips(message: &Message) -> Vec<IpAddr> {
         .collect()
 }
 
+/// Windows TUN only installs IPv4 split routes; strip AAAA from proxy DNS answers so browsers fall back to IPv4.
+#[cfg(feature = "local-web-admin")]
+fn strip_ipv6_dns_answers(message: &mut Message) {
+    message.answers.retain(|rec| !matches!(rec.data, RData::AAAA(_)));
+}
+
+#[cfg(feature = "local-web-admin")]
+fn maybe_strip_proxy_ipv6_answers(context: &ServiceContext, decision: RouteDecision, message: &mut Message) {
+    if let Some(routing_state) = context.routing_state() {
+        // Global v4-only switch: strip AAAA from EVERY answer (direct or
+        // proxy, any platform). This kills the happy-eyeballs delay when
+        // the host has no working public IPv6 -- which on Windows is the
+        // common case once a TUN catch-all owns v4 only.
+        if routing_state.dns_ipv4_only_sync() {
+            strip_ipv6_dns_answers(message);
+            return;
+        }
+        // Even when v6 is allowed in general, proxied targets on Windows
+        // still go through an IPv4-only TUN catch-all, so keep the old
+        // proxy-side strip for that platform.
+        #[cfg(windows)]
+        if matches!(decision, RouteDecision::Proxy) {
+            strip_ipv6_dns_answers(message);
+            return;
+        }
+    }
+    let _ = (decision, message);
+}
+
 #[cfg(feature = "local-web-admin")]
 fn dns_cache_refresh_query(domain: &str, query_type: &str) -> io::Result<Query> {
     let name = Name::from_str(domain)
@@ -909,6 +938,19 @@ impl DnsClient {
 
             message.metadata.response_code = ResponseCode::NotImp;
         } else if !request.queries.is_empty() {
+            // Short-circuit AAAA queries when v4-only mode is on: return
+            // NOERROR with empty answer immediately so the OS / browser
+            // skips happy-eyeballs and goes straight to A lookup. Avoids
+            // a useless TCP-over-SS round trip per request.
+            #[cfg(feature = "local-web-admin")]
+            if request.queries[0].query_type() == RecordType::AAAA
+                && let Some(routing_state) = self.context.routing_state()
+                && routing_state.dns_ipv4_only_sync()
+            {
+                message.queries = request.queries.clone();
+                return Ok(message);
+            }
+
             // Make queries according to ACL rules
 
             let (r, forward) = self.acl_lookup(&request.queries[0], local_addr, remote_addr).await;
@@ -931,6 +973,15 @@ impl DnsClient {
                 }
                 message = result;
                 message.metadata.id = request.id;
+                // Safety net: even when query is A, upstream sometimes
+                // returns AAAA siblings via CNAME chains; strip them in
+                // v4-only mode.
+                #[cfg(feature = "local-web-admin")]
+                if let Some(routing_state) = self.context.routing_state()
+                    && routing_state.dns_ipv4_only_sync()
+                {
+                    strip_ipv6_dns_answers(&mut message);
+                }
             } else {
                 message.metadata.response_code = ResponseCode::ServFail;
             }
@@ -956,6 +1007,8 @@ impl DnsClient {
             if let Some(decision) = routing_state.route_domain(&domain).await {
                 let query_type = query.query_type().to_string();
                 if let Some(cached) = routing_state.dns_cache_lookup(&domain, &query_type, decision).await {
+                    let mut cached = cached;
+                    maybe_strip_proxy_ipv6_answers(&self.context, decision, &mut cached);
                     let ips = collect_answer_ips(&cached);
                     info!(
                         "dns route cache hit {} {:?}: resolver={:?}, results={:?}",
@@ -996,8 +1049,9 @@ impl DnsClient {
                         self.lookup_remote(query, &remote_addr).await
                     }
                 };
-                if let Ok(ref msg) = response {
-                    let ips = collect_answer_ips(msg);
+                if let Ok(mut msg) = response {
+                    maybe_strip_proxy_ipv6_answers(&self.context, decision, &mut msg);
+                    let ips = collect_answer_ips(&msg);
                     info!(
                         "dns route result {} {:?}: resolver={:?}, results={:?}",
                         domain,
@@ -1012,11 +1066,14 @@ impl DnsClient {
                         let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
                     }
                     routing_state.record_dns(domain, query_type, ips, decision, false).await;
+                    return (Ok(msg), matches!(decision, RouteDecision::Proxy));
                 }
                 return (response, matches!(decision, RouteDecision::Proxy));
             }
             let query_type = query.query_type().to_string();
             if let Some((cached, decision)) = routing_state.dns_cache_lookup_any(&domain, &query_type).await {
+                let mut cached = cached;
+                maybe_strip_proxy_ipv6_answers(&self.context, decision, &mut cached);
                 let ips = collect_answer_ips(&cached);
                 info!(
                     "dns fallback cache hit {} {:?}: resolver={:?}, results={:?}",
@@ -1100,7 +1157,9 @@ impl DnsClient {
         {
             let domain = query.name().to_ascii();
             let query_type = query.query_type().to_string();
-            let ips = collect_answer_ips(msg);
+            let mut msg = msg.clone();
+            maybe_strip_proxy_ipv6_answers(&self.context, decision, &mut msg);
+            let ips = collect_answer_ips(&msg);
             routing_state
                 .dns_cache_insert(&domain, &query_type, decision, msg.clone(), ips.clone())
                 .await;
@@ -1149,6 +1208,31 @@ impl DnsClient {
                     .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
             }
             Mode::TcpAndUdp => {
+                // If the balancer's UDP-candidate has a TcpOnly plugin, the
+                // UDP leg is doomed: UDP bypasses the plugin and lands
+                // directly on the server's `server_port/udp`, which under a
+                // typical TLS-obfuscated deployment (xray-plugin, v2ray-plugin
+                // on 443) is firewalled off. Probing it just costs us the
+                // 5s socket timeout while DNS clients sit on their hands.
+                //
+                // Detect this and fall back to pure TCP. Users who really do
+                // run UDP on the server side can opt in by setting the
+                // server's `plugin_mode` to `tcp_and_udp`.
+                let udp_server = self.balancer.best_udp_server();
+                let udp_blocked_by_plugin = udp_server
+                    .server_config()
+                    .plugin()
+                    .map(|p| !p.plugin_mode.enable_udp())
+                    .unwrap_or(false);
+                if udp_blocked_by_plugin {
+                    let server = self.balancer.best_tcp_server();
+                    return self
+                        .client_cache
+                        .lookup_remote(&self.context, server.server_config(), remote_addr, message, false)
+                        .await
+                        .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+                }
+
                 // Query TCP & UDP simultaneously
 
                 let message2 = message.clone();
@@ -1166,9 +1250,8 @@ impl DnsClient {
                         .await
                 };
                 let udp_fut = async {
-                    let server = self.balancer.best_udp_server();
                     self.client_cache
-                        .lookup_remote(&self.context, server.server_config(), remote_addr, message, true)
+                        .lookup_remote(&self.context, udp_server.server_config(), remote_addr, message, true)
                         .await
                 };
 
