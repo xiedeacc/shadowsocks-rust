@@ -15,7 +15,9 @@ use byte_string::ByteStr;
 use cfg_if::cfg_if;
 use ipnet::IpNet;
 use log::{debug, error, info, trace, warn};
-use shadowsocks::config::{Mode, ServerAddr};
+use shadowsocks::config::Mode;
+#[cfg(windows)]
+use shadowsocks::config::ServerAddr;
 use smoltcp::wire::{IpProtocol, TcpPacket, UdpPacket};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

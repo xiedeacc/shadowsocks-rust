@@ -15,6 +15,14 @@ TARGET_TRIPLE="${TARGET_TRIPLE:-}"
 OPENWRT_TOOLCHAIN="${OPENWRT_TOOLCHAIN:-}"
 DISABLE_LEGACY="${DISABLE_LEGACY:-0}"
 
+# Known toolchain search roots, in preference order:
+#   1. OpenWrt SDK toolchain (exact ABI match for the target device)
+#   2. Generic musl cross-compiler (broader compatibility)
+TOOLCHAIN_SEARCH_ROOTS=(
+	/root/src/toolchains
+	/opt
+)
+
 ssh_cmd() {
 	ssh -o ConnectTimeout=8 -p "$SSH_PORT" "$HOST" "$@"
 }
@@ -43,6 +51,95 @@ detect_target() {
 	esac
 }
 
+# Auto-detect the toolchain root for a given target triple.
+# Prints the toolchain root directory (not the bin/ subdirectory).
+# Search order: OpenWrt SDK toolchain dirs, then generic musl cross dirs.
+auto_detect_toolchain() {
+	local target="$1"
+	local root dir
+
+	case "$target" in
+		aarch64-unknown-linux-musl)
+			# OpenWrt SDK toolchains ship a subdirectory named
+			# toolchain-aarch64_*_musl inside the unpacked tarball.
+			for root in "${TOOLCHAIN_SEARCH_ROOTS[@]}"; do
+				[[ -d "$root" ]] || continue
+				# Pick the most-recently-modified match (newest SDK first).
+				dir="$(find "$root" -maxdepth 3 -type d \
+					-name 'toolchain-aarch64_*_musl' \
+					-exec ls -dt {} + 2>/dev/null | head -1)"
+				if [[ -n "$dir" && -x "$dir/bin/aarch64-openwrt-linux-musl-gcc" ]]; then
+					printf '%s\n' "$dir"
+					return
+				fi
+				# Generic musl cross under the same root.
+				dir="$root/aarch64-linux-musl-cross"
+				if [[ -x "$dir/bin/aarch64-linux-musl-gcc" ]]; then
+					printf '%s\n' "$dir"
+					return
+				fi
+			done
+			;;
+		armv7-unknown-linux-musleabihf)
+			for root in "${TOOLCHAIN_SEARCH_ROOTS[@]}"; do
+				[[ -d "$root" ]] || continue
+				dir="$(find "$root" -maxdepth 3 -type d \
+					-name 'toolchain-arm_*_musl*' \
+					-exec ls -dt {} + 2>/dev/null | head -1)"
+				if [[ -n "$dir" && -x "$dir/bin/arm-openwrt-linux-musleabi-gcc" ]]; then
+					printf '%s\n' "$dir"
+					return
+				fi
+				dir="$root/arm-linux-musleabihf-cross"
+				if [[ -x "$dir/bin/arm-linux-musleabihf-gcc" ]]; then
+					printf '%s\n' "$dir"
+					return
+				fi
+			done
+			;;
+	esac
+}
+
+# Set up compiler env vars for the toolchain directory.
+apply_toolchain() {
+	local tc_root="$1"
+	local tc_bin="$tc_root/bin"
+	export PATH="$tc_bin:$PATH"
+
+	case "$TARGET_TRIPLE" in
+		aarch64-unknown-linux-musl)
+			# Prefer the OpenWrt-branded compiler; fall back to generic musl.
+			local cc
+			if [[ -x "$tc_bin/aarch64-openwrt-linux-musl-gcc" ]]; then
+				cc="$tc_bin/aarch64-openwrt-linux-musl-gcc"
+				local ar="$tc_bin/aarch64-openwrt-linux-musl-gcc-ar"
+			else
+				cc="$tc_bin/aarch64-linux-musl-gcc"
+				local ar="$tc_bin/aarch64-linux-musl-ar"
+			fi
+			export CC_aarch64_unknown_linux_musl="${CC_aarch64_unknown_linux_musl:-$cc}"
+			export AR_aarch64_unknown_linux_musl="${AR_aarch64_unknown_linux_musl:-$ar}"
+			export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER:-$cc}"
+			;;
+		armv7-unknown-linux-musleabihf)
+			local cc
+			if [[ -x "$tc_bin/arm-openwrt-linux-musleabi-gcc" ]]; then
+				cc="$tc_bin/arm-openwrt-linux-musleabi-gcc"
+				local ar="$tc_bin/arm-openwrt-linux-musleabi-gcc-ar"
+			else
+				cc="$tc_bin/arm-linux-musleabihf-gcc"
+				local ar="$tc_bin/arm-linux-musleabihf-ar"
+			fi
+			export CC_armv7_unknown_linux_musleabihf="${CC_armv7_unknown_linux_musleabihf:-$cc}"
+			export AR_armv7_unknown_linux_musleabihf="${AR_armv7_unknown_linux_musleabihf:-$ar}"
+			export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER="${CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER:-$cc}"
+			;;
+	esac
+
+	printf 'Using toolchain: %s\n' "$tc_root"
+	printf '  CC  = %s\n' "${CC_aarch64_unknown_linux_musl:-${CC_armv7_unknown_linux_musleabihf:-<native>}}"
+}
+
 if [[ -z "$TARGET_TRIPLE" ]]; then
 	TARGET_TRIPLE="$(detect_target)"
 fi
@@ -51,20 +148,21 @@ if ! rustup target list --installed | grep -qx "$TARGET_TRIPLE"; then
 	rustup target add "$TARGET_TRIPLE"
 fi
 
+# Resolve toolchain: explicit OPENWRT_TOOLCHAIN > auto-detect > error.
 if [[ -n "$OPENWRT_TOOLCHAIN" ]]; then
-	TOOLCHAIN_BIN="$OPENWRT_TOOLCHAIN/bin"
-	if [[ ! -d "$TOOLCHAIN_BIN" ]]; then
-		printf 'OpenWrt toolchain bin directory not found: %s\n' "$TOOLCHAIN_BIN" >&2
+	if [[ ! -d "$OPENWRT_TOOLCHAIN/bin" ]]; then
+		printf 'OpenWrt toolchain bin directory not found: %s\n' "$OPENWRT_TOOLCHAIN/bin" >&2
 		exit 1
 	fi
-	export PATH="$TOOLCHAIN_BIN:$PATH"
-	case "$TARGET_TRIPLE" in
-		aarch64-unknown-linux-musl)
-			export CC_aarch64_unknown_linux_musl="${CC_aarch64_unknown_linux_musl:-$TOOLCHAIN_BIN/aarch64-openwrt-linux-musl-gcc}"
-			export AR_aarch64_unknown_linux_musl="${AR_aarch64_unknown_linux_musl:-$TOOLCHAIN_BIN/aarch64-openwrt-linux-musl-gcc-ar}"
-			export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER:-$TOOLCHAIN_BIN/aarch64-openwrt-linux-musl-gcc}"
-			;;
-	esac
+	apply_toolchain "$OPENWRT_TOOLCHAIN"
+else
+	detected="$(auto_detect_toolchain "$TARGET_TRIPLE")"
+	if [[ -n "$detected" ]]; then
+		apply_toolchain "$detected"
+	else
+		printf 'Warning: no cross-compiler found for %s; relying on PATH.\n' "$TARGET_TRIPLE" >&2
+		printf 'Set OPENWRT_TOOLCHAIN=/path/to/toolchain to override.\n' >&2
+	fi
 fi
 
 cargo build \

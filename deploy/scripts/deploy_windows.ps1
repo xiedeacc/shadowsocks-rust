@@ -323,22 +323,22 @@ function Get-ServerIps {
         $ip = Extract-Ip -Value $s.server
         if ($ip) { $ips += $ip }
     }
-    if ($config.route_rules) {
-        # ONLY domestic_dns belongs in the physical-bypass list. sslocal
-        # opens raw sockets directly to these (DnsClient::lookup_local),
-        # so they need a /32 exception so the packet doesn't loop back
-        # into the TUN catch-all.
-        #
-        # foreign_dns IPs (e.g. 8.8.8.8) MUST NOT be here: those queries
-        # are wrapped in the SS protocol and addressed to the SS server.
-        # sslocal never opens a raw socket to them, so a /32 exception
-        # would be at best wasted, at worst HARMFUL: OS-level tools
-        # (Chrome's DoH probe, `nslookup -server=8.8.8.8`, Steam, etc.)
-        # would then bypass the TUN-based DNS interceptor in
-        # `local/tun/udp.rs` and hit a GFW-poisoned 8.8.8.8 directly.
-        # Mirrors `windows_bypass_route_ips` in tun/mod.rs.
-        foreach ($d in @($config.route_rules.domestic_dns)) {
-            $ip = Extract-Ip -Value $d
+    # ONLY the listener's `local_dns_address` (= "domestic" upstream)
+    # belongs in the physical-bypass list. sslocal opens raw sockets
+    # directly to it (DnsClient::lookup_local), so it needs a /32
+    # exception otherwise the packet loops back into the TUN catch-all.
+    #
+    # The `remote_dns_address` (= "foreign" upstream, e.g. 8.8.8.8)
+    # MUST NOT be here: those queries are wrapped in the SS protocol
+    # and addressed to the SS server. sslocal never opens a raw socket
+    # to them, so a /32 exception would be at best wasted, at worst
+    # HARMFUL: OS-level tools (Chrome's DoH probe, `nslookup -server=
+    # 8.8.8.8`, Steam, etc.) would then bypass the TUN-based DNS
+    # interceptor in `local/tun/udp.rs` and hit a GFW-poisoned 8.8.8.8
+    # directly. Mirrors `windows_bypass_route_ips` in tun/mod.rs.
+    foreach ($l in @($config.locals)) {
+        if ($l.protocol -eq 'dns' -and $l.local_dns_address) {
+            $ip = Extract-Ip -Value $l.local_dns_address
             if ($ip) { $ips += $ip }
         }
     }

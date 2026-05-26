@@ -628,35 +628,6 @@ fn check_name_in_proxy_list(acl: &AccessControl, name: &Name) -> Option<bool> {
     }
 }
 
-#[cfg(feature = "local-web-admin")]
-fn parse_local_dns_addr(addr: &str) -> io::Result<NameServerAddr> {
-    addr.parse().map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid local DNS address {addr}: {err}"),
-        )
-    })
-}
-
-#[cfg(feature = "local-web-admin")]
-fn parse_remote_dns_addr(addr: &str) -> io::Result<Address> {
-    if let Ok(ip) = addr.parse::<IpAddr>() {
-        return Ok(Address::SocketAddress(SocketAddr::new(ip, 53)));
-    }
-    if let Ok(saddr) = addr.parse::<SocketAddr>() {
-        return Ok(Address::SocketAddress(saddr));
-    }
-    if addr.find(':').is_some() {
-        addr.parse::<Address>().map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid remote DNS address {addr}: {err}"),
-            )
-        })
-    } else {
-        Ok(Address::DomainNameAddress(addr.to_owned(), 53))
-    }
-}
 
 #[cfg(feature = "local-web-admin")]
 fn collect_answer_ips(message: &Message) -> Vec<IpAddr> {
@@ -1024,30 +995,8 @@ impl DnsClient {
                     decision
                 );
                 let response = match decision {
-                    RouteDecision::Direct => {
-                        let local_addr = match routing_state
-                            .domestic_dns()
-                            .await
-                            .into_iter()
-                            .find_map(|addr| parse_local_dns_addr(&addr).ok())
-                        {
-                            Some(addr) => addr,
-                            None => local_addr.clone(),
-                        };
-                        self.lookup_local(query, &local_addr).await
-                    }
-                    RouteDecision::Proxy => {
-                        let remote_addr = match routing_state
-                            .foreign_dns()
-                            .await
-                            .into_iter()
-                            .find_map(|addr| parse_remote_dns_addr(&addr).ok())
-                        {
-                            Some(addr) => addr,
-                            None => remote_addr.clone(),
-                        };
-                        self.lookup_remote(query, &remote_addr).await
-                    }
+                    RouteDecision::Direct => self.lookup_local(query, local_addr).await,
+                    RouteDecision::Proxy => self.lookup_remote(query, remote_addr).await,
                 };
                 if let Ok(mut msg) = response {
                     maybe_strip_proxy_ipv6_answers(&self.context, decision, &mut msg);

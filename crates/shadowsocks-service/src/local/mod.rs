@@ -5,7 +5,9 @@ use std::net::IpAddr;
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::future;
-use log::{info, trace, warn};
+use log::trace;
+#[cfg(all(windows, feature = "local-tun"))]
+use log::{info, warn};
 use shadowsocks::{
     config::Mode,
     net::{AcceptOpts, ConnectOpts},
@@ -43,9 +45,16 @@ use self::tun::{Tun, TunBuilder};
 use self::tunnel::{Tunnel, TunnelBuilder};
 #[cfg(feature = "local-web-admin")]
 use self::{
-    routing::RoutingState,
+    routing::{DnsRuntimeState, RoutingState},
     web_admin::{WebAdmin, WebAdminBuilder},
 };
+
+#[cfg(feature = "local-dns")]
+use shadowsocks::relay::socks5::Address;
+#[cfg(feature = "local-dns")]
+use self::dns::config::NameServerAddr;
+#[cfg(feature = "local-dns")]
+use crate::config::LocalConfig;
 
 pub mod context;
 #[cfg(feature = "local-dns")]
@@ -327,14 +336,40 @@ impl Server {
 
         #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
         let dns_intercept_mode = config.route_rules.dns_intercept_mode.clone();
+
+        // Derive runtime DNS endpoints (domestic / foreign upstreams +
+        // listen address) from the *first* `protocol: dns` listener.
+        // Used by:
+        //   * the firewall / TUN DNS interceptor — needs the listen
+        //     port to redirect to and the upstream IPs to exempt
+        //     (otherwise the local DNS server's own queries would loop
+        //     back into the redirect rule);
+        //   * the web admin `GET /api/dns` view.
+        // After this refactor `route_rules.{domestic,foreign}_dns` and
+        // `route_rules.dns_listen_*` no longer exist in the JSON
+        // schema — `locals[].dns` is the single source of truth.
+        #[cfg(feature = "local-dns")]
+        let primary_dns_listener = config
+            .local
+            .iter()
+            .find(|local| matches!(local.config.protocol, ProtocolType::Dns));
+        #[cfg(feature = "local-web-admin")]
+        let dns_runtime_state = {
+            #[cfg(feature = "local-dns")]
+            {
+                primary_dns_listener
+                    .map(|local| derive_dns_runtime_state(&local.config))
+                    .unwrap_or_default()
+            }
+            #[cfg(not(feature = "local-dns"))]
+            {
+                crate::local::routing::DnsRuntimeState::default()
+            }
+        };
+        #[cfg(feature = "local-web-admin")]
+        routing_state.set_dns_runtime(dns_runtime_state.clone()).await;
         #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
-        let dns_intercept_exempt_ips = dns_intercept_exempt_ips(
-            config
-                .route_rules
-                .domestic_dns
-                .iter()
-                .chain(config.route_rules.foreign_dns.iter()),
-        );
+        let dns_intercept_exempt_ips = collect_dns_intercept_exempt_ips(&dns_runtime_state);
         #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
         let dns_intercept_redir_port = config
             .local
@@ -741,8 +776,17 @@ impl Server {
 }
 
 #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
-fn dns_intercept_exempt_ips<'a>(servers: impl Iterator<Item = &'a String>) -> Vec<IpAddr> {
-    let mut ips = servers
+/// Build the IPs that the Linux DNS firewall interceptor must exempt
+/// from `dport 53 redirect` rules — namely the upstream resolvers that
+/// the local DNS server itself talks to. Without these exemptions, the
+/// local DNS server's outbound queries to e.g. `223.5.5.5:53` would be
+/// rewritten to `127.0.0.1:1053`, looping back into itself.
+#[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
+fn collect_dns_intercept_exempt_ips(state: &DnsRuntimeState) -> Vec<IpAddr> {
+    let mut ips = state
+        .domestic_dns
+        .iter()
+        .chain(state.foreign_dns.iter())
         .filter_map(|server| {
             let host = server
                 .rsplit_once(':')
@@ -757,6 +801,50 @@ fn dns_intercept_exempt_ips<'a>(servers: impl Iterator<Item = &'a String>) -> Ve
     ips.sort_unstable();
     ips.dedup();
     ips
+}
+
+/// Snapshot the DNS runtime state from a single `protocol: dns` listener.
+/// Returns the upstream resolver pair as `host:port` strings (matching
+/// the legacy `route_rules.{domestic,foreign}_dns` text format consumed
+/// by the rest of the routing layer) and the listener's bound address.
+#[cfg(feature = "local-dns")]
+fn derive_dns_runtime_state(local: &LocalConfig) -> DnsRuntimeState {
+    fn name_server_addr_to_string(addr: &NameServerAddr) -> Option<String> {
+        match addr {
+            NameServerAddr::SocketAddr(sa) => Some(sa.to_string()),
+            #[cfg(unix)]
+            NameServerAddr::UnixSocketAddr(_) => None,
+        }
+    }
+    fn address_to_string(addr: &Address) -> String {
+        match addr {
+            Address::SocketAddress(sa) => sa.to_string(),
+            Address::DomainNameAddress(host, port) => format!("{}:{}", host, port),
+        }
+    }
+
+    let domestic_dns = local
+        .local_dns_addr
+        .as_ref()
+        .and_then(name_server_addr_to_string)
+        .map(|s| vec![s])
+        .unwrap_or_default();
+    let foreign_dns = local
+        .remote_dns_addr
+        .as_ref()
+        .map(|addr| vec![address_to_string(addr)])
+        .unwrap_or_default();
+    let listen = local.addr.as_ref().and_then(|addr| match addr {
+        shadowsocks::config::ServerAddr::SocketAddr(sa) => Some(*sa),
+        // domain-typed local listen address is not supported here; the
+        // listener requires a numeric address anyway.
+        shadowsocks::config::ServerAddr::DomainName(..) => None,
+    });
+    DnsRuntimeState {
+        domestic_dns,
+        foreign_dns,
+        listen,
+    }
 }
 
 #[cfg(feature = "local-flow-stat")]

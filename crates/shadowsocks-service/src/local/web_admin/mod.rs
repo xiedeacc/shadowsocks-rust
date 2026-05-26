@@ -271,11 +271,16 @@ impl WebAdminHandler {
                 ))
             }
             (Method::PUT, "/api/dns") => {
-                let mut sources = self.routing_state.snapshot().await.sources;
+                // Hot-reload upstream resolvers chosen by the routing
+                // layer. Persists into the per-listener config slot
+                // ([`DnsRuntimeState`]) so it stays consistent with the
+                // `locals[].dns` source of truth — no `route_rules`
+                // duplication anymore.
                 let dns: DnsPayload = read_json(req).await?;
-                sources.domestic_dns = dns.domestic_dns;
-                sources.foreign_dns = dns.foreign_dns;
-                self.routing_state.set_sources(sources).await;
+                let mut state = self.routing_state.dns_runtime_snapshot().await;
+                state.domestic_dns = dns.domestic_dns;
+                state.foreign_dns = dns.foreign_dns;
+                self.routing_state.set_dns_runtime(state).await;
                 Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
             }
             (Method::GET, "/api/temp-rules") => Ok(json_response(
@@ -1080,7 +1085,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <script>
     let currentConfigPath='', currentRawConfig={}, rulesSnapshot={}, servicePlatform=null;
     const routeSourceKeys=['geoip_sources','geosite_sources','direct_domain_sources','bypass_domain_sources'];
-    const dnsKeys=['domestic_dns','foreign_dns','dns_cache_capacity','dns_cache_ttl_seconds','dns_cache_refresh_enabled','dns_cache_refresh_batch_size','dns_intercept_mode','dns_listen_address','dns_listen_port','dns_ipv4_only'];
+    const dnsKeys=['dns_cache_capacity','dns_cache_ttl_seconds','dns_cache_refresh_enabled','dns_cache_refresh_batch_size','dns_intercept_mode','dns_ipv4_only'];
     const sourceKeys=[...routeSourceKeys,...dnsKeys];
     function token(){return new URLSearchParams(location.search).get('token')||''}
     async function api(path,opt={}){opt.headers=Object.assign({'x-admin-token':token()},opt.headers||{});let r=await fetch(path,opt);let j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}
@@ -1126,11 +1131,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if(tun.protocol&&isWindowsService()){
         setSelect('dnsBind','0.0.0.0'); dnsPort.value=53; setSelect('dnsInterceptMode','tun');
       }else{
-        setSelect('dnsBind',dns.local_address||routeRules.dns_listen_address||'127.0.0.1'); dnsPort.value=dns.local_port||routeRules.dns_listen_port||1053;
+        setSelect('dnsBind',dns.local_address||'127.0.0.1'); dnsPort.value=dns.local_port||1053;
         setSelect('dnsInterceptMode',routeRules.dns_intercept_mode||'off');
       }
-      renderDnsList('dnsDomesticList',routeRules.domestic_dns||[(dns.local_dns_address||'223.5.5.5')+':'+(dns.local_dns_port||53)]);
-      renderDnsList('dnsForeignList',routeRules.foreign_dns||[(dns.remote_dns_address||'8.8.8.8')+':'+(dns.remote_dns_port||53)]);
+      renderDnsList('dnsDomesticList',[(dns.local_dns_address||'223.5.5.5')+':'+(dns.local_dns_port||53)]);
+      renderDnsList('dnsForeignList',[(dns.remote_dns_address||'8.8.8.8')+':'+(dns.remote_dns_port||53)]);
       dnsCacheCapacity.value=routeRules.dns_cache_capacity||10000;
       dnsCacheTtl.value=routeRules.dns_cache_ttl_seconds||604800;
       dnsCacheRefreshEnabled.checked=routeRules.dns_cache_refresh_enabled!==false;
@@ -1158,21 +1163,26 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       const windowsTun=redirEnable.checked&&isWindowsService();
       let routeRules=Object.assign({},currentRawConfig.route_rules||{});
+      // Strip the legacy duplicates that used to live in route_rules
+      // (now derived from `locals[].dns`) so old configs migrate
+      // automatically the next time they are saved.
+      delete routeRules.domestic_dns;
+      delete routeRules.foreign_dns;
+      delete routeRules.dns_listen_address;
+      delete routeRules.dns_listen_port;
       routeRules.dns_cache_capacity=num(dnsCacheCapacity.value,10000);
       routeRules.dns_cache_ttl_seconds=num(dnsCacheTtl.value,604800);
       routeRules.dns_cache_refresh_enabled=dnsCacheRefreshEnabled.checked;
       routeRules.dns_cache_refresh_batch_size=num(dnsCacheRefreshBatch.value,500);
       routeRules.dns_intercept_mode=windowsTun?'tun':(redirEnable.checked?(isWindowsService()&&dnsInterceptMode.value==='firewall'?'tun':dnsInterceptMode.value):'off');
-      routeRules.dns_listen_address=windowsTun?'127.0.0.1':dnsBind.value;
-      routeRules.dns_listen_port=num(dnsPort.value,windowsTun?53:1053);
       routeRules.dns_ipv4_only=(dnsIpv4Only.value!=='false');
       let domesticDns=readDns('dnsDomesticList');
       let foreignDns=readDns('dnsForeignList');
-      routeRules.domestic_dns=domesticDns.length?domesticDns:['223.5.5.5:53'];
-      routeRules.foreign_dns=foreignDns.length?foreignDns:['8.8.8.8:53'];
+      let domesticEntry=domesticDns.length?domesticDns[0]:'223.5.5.5:53';
+      let foreignEntry=foreignDns.length?foreignDns[0]:'8.8.8.8:53';
       if(dnsEnable.checked){
-        let domestic=parseHostPort(routeRules.domestic_dns[0],'223.5.5.5',53);
-        let foreign=parseHostPort(routeRules.foreign_dns[0],'8.8.8.8',53);
+        let domestic=parseHostPort(domesticEntry,'223.5.5.5',53);
+        let foreign=parseHostPort(foreignEntry,'8.8.8.8',53);
         const dnsPortValue=windowsTun?53:num(dnsPort.value,1053);
         const dnsBindValue=windowsTun?'0.0.0.0':dnsBind.value;
         locals.push({local_address:dnsBindValue,local_port:dnsPortValue,protocol:'dns',mode:'tcp_and_udp',local_dns_address:domestic.host,local_dns_port:domestic.port,remote_dns_address:foreign.host,remote_dns_port:foreign.port,client_cache_size:64});

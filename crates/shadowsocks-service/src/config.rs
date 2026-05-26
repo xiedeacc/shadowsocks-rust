@@ -640,10 +640,6 @@ struct SSRouteRulesConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     bypass_domain_sources: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    domestic_dns: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    foreign_dns: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     dns_cache_capacity: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dns_cache_ttl_seconds: Option<u64>,
@@ -653,10 +649,6 @@ struct SSRouteRulesConfig {
     dns_cache_refresh_batch_size: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dns_intercept_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dns_listen_address: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dns_listen_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dns_ipv4_only: Option<bool>,
 }
@@ -1603,15 +1595,11 @@ pub struct RouteRulesConfig {
     pub geosite_sources: Vec<String>,
     pub direct_domain_sources: Vec<String>,
     pub bypass_domain_sources: Vec<String>,
-    pub domestic_dns: Vec<String>,
-    pub foreign_dns: Vec<String>,
     pub dns_cache_capacity: usize,
     pub dns_cache_ttl_seconds: u64,
     pub dns_cache_refresh_enabled: bool,
     pub dns_cache_refresh_batch_size: usize,
     pub dns_intercept_mode: String,
-    pub dns_listen_address: String,
-    pub dns_listen_port: u16,
     /// Strip AAAA answers from local DNS responses. Useful on hosts
     /// without public IPv6 connectivity — otherwise browsers spend
     /// happy-eyeballs time trying v6 addresses that can never connect
@@ -1628,15 +1616,11 @@ impl Default for RouteRulesConfig {
             geosite_sources: vec![DEFAULT_GEOSITE_SOURCE.to_owned()],
             direct_domain_sources: DEFAULT_DIRECT_DOMAIN_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
             bypass_domain_sources: DEFAULT_BYPASS_DOMAIN_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
-            domestic_dns: vec!["223.5.5.5:53".to_owned(), "119.29.29.29:53".to_owned()],
-            foreign_dns: vec!["8.8.8.8:53".to_owned(), "1.1.1.1:53".to_owned()],
             dns_cache_capacity: 100_000,
             dns_cache_ttl_seconds: 7 * 24 * 60 * 60,
             dns_cache_refresh_enabled: true,
             dns_cache_refresh_batch_size: 500,
             dns_intercept_mode: "off".to_owned(),
-            dns_listen_address: "127.0.0.1".to_owned(),
-            dns_listen_port: 1053,
             dns_ipv4_only: true,
         }
     }
@@ -2840,12 +2824,6 @@ impl Config {
                 if let Some(sources) = route_rules.bypass_domain_sources {
                     parsed.bypass_domain_sources = sources;
                 }
-                if let Some(dns) = route_rules.domestic_dns {
-                    parsed.domestic_dns = dns;
-                }
-                if let Some(dns) = route_rules.foreign_dns {
-                    parsed.foreign_dns = dns;
-                }
                 if let Some(capacity) = route_rules.dns_cache_capacity {
                     parsed.dns_cache_capacity = capacity.max(1);
                 }
@@ -2860,12 +2838,6 @@ impl Config {
                 }
                 if let Some(mode) = route_rules.dns_intercept_mode {
                     parsed.dns_intercept_mode = mode;
-                }
-                if let Some(address) = route_rules.dns_listen_address {
-                    parsed.dns_listen_address = address;
-                }
-                if let Some(port) = route_rules.dns_listen_port {
-                    parsed.dns_listen_port = port;
                 }
                 if let Some(v4_only) = route_rules.dns_ipv4_only {
                     parsed.dns_ipv4_only = v4_only;
@@ -3661,15 +3633,11 @@ impl fmt::Display for Config {
                 geosite_sources: Some(self.route_rules.geosite_sources.clone()),
                 direct_domain_sources: Some(self.route_rules.direct_domain_sources.clone()),
                 bypass_domain_sources: Some(self.route_rules.bypass_domain_sources.clone()),
-                domestic_dns: Some(self.route_rules.domestic_dns.clone()),
-                foreign_dns: Some(self.route_rules.foreign_dns.clone()),
                 dns_cache_capacity: Some(self.route_rules.dns_cache_capacity),
                 dns_cache_ttl_seconds: Some(self.route_rules.dns_cache_ttl_seconds),
                 dns_cache_refresh_enabled: Some(self.route_rules.dns_cache_refresh_enabled),
                 dns_cache_refresh_batch_size: Some(self.route_rules.dns_cache_refresh_batch_size),
                 dns_intercept_mode: Some(self.route_rules.dns_intercept_mode.clone()),
-                dns_listen_address: Some(self.route_rules.dns_listen_address.clone()),
-                dns_listen_port: Some(self.route_rules.dns_listen_port),
                 dns_ipv4_only: Some(self.route_rules.dns_ipv4_only),
             });
         }

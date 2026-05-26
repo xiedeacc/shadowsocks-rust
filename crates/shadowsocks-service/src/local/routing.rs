@@ -81,8 +81,6 @@ pub struct RoutingSources {
     pub geosite_sources: Vec<String>,
     pub direct_domain_sources: Vec<String>,
     pub bypass_domain_sources: Vec<String>,
-    pub domestic_dns: Vec<String>,
-    pub foreign_dns: Vec<String>,
     #[serde(default = "default_dns_cache_capacity")]
     pub dns_cache_capacity: usize,
     #[serde(default = "default_dns_cache_ttl_seconds")]
@@ -93,12 +91,27 @@ pub struct RoutingSources {
     pub dns_cache_refresh_batch_size: usize,
     #[serde(default = "default_dns_intercept_mode")]
     pub dns_intercept_mode: String,
-    #[serde(default = "default_dns_listen_address")]
-    pub dns_listen_address: String,
-    #[serde(default = "default_dns_listen_port")]
-    pub dns_listen_port: u16,
     #[serde(default = "default_dns_ipv4_only")]
     pub dns_ipv4_only: bool,
+}
+
+/// Runtime DNS service endpoints derived from the *first* DNS listener in
+/// `locals[]` at startup. Single source of truth for "which upstream DNS
+/// server should the routing layer ask?" — kept as a dedicated runtime
+/// state slot (rather than in [`RoutingSources`] / `route_rules`) so the
+/// JSON config does not have to repeat what `locals[].dns` already
+/// declares.
+///
+/// Empty when no DNS listener is configured (e.g. server-mode binaries
+/// or local-mode without `protocol: "dns"`).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DnsRuntimeState {
+    pub domestic_dns: Vec<String>,
+    pub foreign_dns: Vec<String>,
+    /// Address+port the local DNS service is bound on. Used by the
+    /// firewall / TUN interceptor to know where to redirect captured
+    /// DNS traffic.
+    pub listen: Option<SocketAddr>,
 }
 
 fn default_dns_cache_capacity() -> usize {
@@ -121,14 +134,6 @@ fn default_dns_intercept_mode() -> String {
     "off".to_owned()
 }
 
-fn default_dns_listen_address() -> String {
-    "127.0.0.1".to_owned()
-}
-
-fn default_dns_listen_port() -> u16 {
-    1053
-}
-
 fn default_dns_ipv4_only() -> bool {
     true
 }
@@ -140,15 +145,11 @@ impl From<&RouteRulesConfig> for RoutingSources {
             geosite_sources: config.geosite_sources.clone(),
             direct_domain_sources: config.direct_domain_sources.clone(),
             bypass_domain_sources: config.bypass_domain_sources.clone(),
-            domestic_dns: config.domestic_dns.clone(),
-            foreign_dns: config.foreign_dns.clone(),
             dns_cache_capacity: config.dns_cache_capacity,
             dns_cache_ttl_seconds: config.dns_cache_ttl_seconds,
             dns_cache_refresh_enabled: config.dns_cache_refresh_enabled,
             dns_cache_refresh_batch_size: config.dns_cache_refresh_batch_size,
             dns_intercept_mode: config.dns_intercept_mode.clone(),
-            dns_listen_address: config.dns_listen_address.clone(),
-            dns_listen_port: config.dns_listen_port,
             dns_ipv4_only: config.dns_ipv4_only,
         })
     }
@@ -391,6 +392,11 @@ pub struct RoutingState {
     /// Mirror of `sources.dns_ipv4_only` so hot DNS hooks can check it
     /// without taking the async lock on `inner`.
     dns_ipv4_only_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Runtime DNS endpoints derived from `locals[]`'s DNS listener.
+    /// Populated at startup from the first DNS listener; mutable via
+    /// `/api/dns` so the web admin can hot-reload upstreams without
+    /// editing the config file.
+    dns_runtime: Arc<TokioRwLock<DnsRuntimeState>>,
 }
 
 impl RoutingState {
@@ -464,7 +470,17 @@ impl RoutingState {
             inner: Arc::new(TokioRwLock::new(inner)),
             progress: Arc::new(StdRwLock::new(RuleUpdateProgress::default())),
             dns_ipv4_only_flag: Arc::new(std::sync::atomic::AtomicBool::new(v4_only)),
+            dns_runtime: Arc::new(TokioRwLock::new(DnsRuntimeState::default())),
         })
+    }
+
+    /// Install runtime DNS endpoints (domestic / foreign upstreams + bound
+    /// listen address) derived from the first DNS listener parsed from
+    /// `locals[]`. Called once at startup before the DNS server task is
+    /// spawned. Subsequent calls overwrite, which the web admin uses for
+    /// hot-reload.
+    pub async fn set_dns_runtime(&self, state: DnsRuntimeState) {
+        *self.dns_runtime.write().await = state;
     }
 
     pub async fn snapshot(&self) -> RoutingSnapshot {
@@ -1237,11 +1253,15 @@ impl RoutingState {
     }
 
     pub async fn domestic_dns(&self) -> Vec<String> {
-        self.inner.read().await.sources.domestic_dns.clone()
+        self.dns_runtime.read().await.domestic_dns.clone()
     }
 
     pub async fn foreign_dns(&self) -> Vec<String> {
-        self.inner.read().await.sources.foreign_dns.clone()
+        self.dns_runtime.read().await.foreign_dns.clone()
+    }
+
+    pub async fn dns_runtime_snapshot(&self) -> DnsRuntimeState {
+        self.dns_runtime.read().await.clone()
     }
 
     /// Returns true when the user configured / defaulted to v4-only DNS
@@ -1258,16 +1278,17 @@ impl RoutingState {
     }
 
     pub async fn dns_tun_intercept_target(&self) -> Option<SocketAddr> {
-        let inner = self.inner.read().await;
-        if !matches!(inner.sources.dns_intercept_mode.as_str(), "tun" | "both") {
+        let mode = self.inner.read().await.sources.dns_intercept_mode.clone();
+        if !matches!(mode.as_str(), "tun" | "both") {
             return None;
         }
-        let ip = match inner.sources.dns_listen_address.parse::<IpAddr>().ok()? {
+        let listen = self.dns_runtime.read().await.listen?;
+        let ip = match listen.ip() {
             IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
             IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
             ip => ip,
         };
-        Some(SocketAddr::new(ip, inner.sources.dns_listen_port))
+        Some(SocketAddr::new(ip, listen.port()))
     }
 
     #[cfg(all(target_os = "linux", feature = "local-dns"))]

@@ -8,6 +8,22 @@
   //   DNS server MUST bind 53 - moving it to 1053 silently breaks Chrome.
   //   The deploy script checks for port-53 conflicts (Hyper-V vSwitch,
   //   Internet Connection Sharing, DNS Server role) and warns up front.
+
+  // no_delay / fast_open are PROCESS-WIDE flags. They MUST be at the
+  // top level: SSServerExtConfig (servers[]) does not declare these
+  // fields, so putting them inside a server entry is silently dropped
+  // by serde and has no effect. At the top level the same flags apply
+  // to BOTH:
+  //   * accept_opts on every locals[] listener (socks/http/dns/tun)
+  //     -> TCP_NODELAY on incoming proxy connections + TCP_FASTOPEN
+  //        cookies served from the listener
+  //   * connect_opts on every outbound connection to servers[]
+  //     -> TCP_NODELAY + client-side TCP_FASTOPEN on the sslocal
+  //        upstream socket to the SS server (saves ~1 RTT after the
+  //        kernel TFO cookie is warm)
+  "no_delay": true,
+  "fast_open": true,
+
   "locals": [
     {
       "local_address": "127.0.0.1",
@@ -70,20 +86,17 @@
     // dns_intercept_mode=tun means: trust the TUN catch-all + local DNS
     // listener to intercept DNS, no firewall rules required (Windows
     // does not have nftables).
+    //
+    // Upstream resolvers (`local_dns_address` / `remote_dns_address`)
+    // and the listen socket (`local_address` / `local_port`) are read
+    // directly from `locals[].dns` above — no `domestic_dns` /
+    // `foreign_dns` / `dns_listen_*` duplication here.
     "dns_intercept_mode": "tun",
-    "dns_listen_address": "127.0.0.1",
-    "dns_listen_port": 53,
     // Strip AAAA from DNS responses. Set false ONLY if the host
     // has working public IPv6 -- otherwise browsers spend happy-
     // eyeballs time on v6 attempts that never connect before
     // falling back to v4.
     "dns_ipv4_only": true,
-    "domestic_dns": [
-      "223.5.5.5:53"
-    ],
-    "foreign_dns": [
-      "8.8.8.8:53"
-    ],
     "rules_dir": "D:\\software\\shadowsocks\\data"
   },
   "servers": [
@@ -93,14 +106,8 @@
       "password": "change-me",
       "timeout": 300,
       "method": "aes-256-gcm",
-      // fast_open / no_delay: tells sslocal to set TCP_FASTOPEN + TCP_NODELAY
-      // on the upstream connection to the SS server. Combined with the
-      // xray-plugin "fast-open" plugin_opt below (which adds TFO on the
-      // plugin-managed inner socket), this saves ~1 RTT on every new
-      // tunnel handshake after the kernel has cached a TFO cookie for
-      // the server.
-      "fast_open": true,
-      "no_delay": true,
+      // NOTE: fast_open / no_delay live at the TOP level of the config,
+      // not here — see the comment block at the top of the file.
       // plugin_opts "mux=8;fast-open":
       //   * mux=8 lets the xray-plugin client multiplex up to 8 outbound
       //     TCP/UDP streams over a single WebSocket. Without it every
