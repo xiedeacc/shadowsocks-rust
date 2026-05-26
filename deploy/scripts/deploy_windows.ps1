@@ -104,38 +104,50 @@ function Test-IsAdmin {
 # If we are not running elevated, request UAC and re-launch the same
 # script in a new admin PowerShell window with the same arguments. We
 # pass -NoExit so the elevated window stays open for the user to read
-# the output (especially Stop's per-interface DNS restore log).
+# the output (especially Stop's per-interface DNS restore log) and a
+# `-WorkingDirectory` so cargo/etc. inherit the caller's CWD instead
+# of the C:\Windows\system32 default that elevated processes get.
+#
+# NOTE: $PSBoundParameters here MUST be the SCRIPT's bound parameters
+# (so we forward `-Action Restart` etc.), not the function's own
+# bound parameters. We accept it as an explicit argument because a
+# function's automatic `$PSBoundParameters` is local to the function
+# and would otherwise come back empty.
 function Invoke-SelfElevate {
+    param(
+        [hashtable]$BoundParams = @{},
+        [string]$WorkingDirectory = $null
+    )
     if (-not $PSCommandPath) {
         throw "Cannot self-elevate: \$PSCommandPath is unset (run via -File, not piped)."
     }
     $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-File', $PSCommandPath)
-    foreach ($k in $PSBoundParameters.Keys) {
-        $v = $PSBoundParameters[$k]
-        if ($v -is [switch]) {
+    foreach ($k in $BoundParams.Keys) {
+        $v = $BoundParams[$k]
+        if ($v -is [System.Management.Automation.SwitchParameter]) {
             if ($v.IsPresent) { $argList += "-$k" }
         } else {
             $argList += "-$k"
             $argList += "$v"
         }
     }
-    Write-Host "[deploy] not elevated; requesting UAC to relaunch with -Action $Action..." -ForegroundColor Yellow
+    $actionForMsg = if ($BoundParams.ContainsKey('Action')) { $BoundParams['Action'] } else { 'Start (default)' }
+    Write-Host "[deploy] not elevated; requesting UAC to relaunch with -Action $actionForMsg..." -ForegroundColor Yellow
     try {
-        Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs | Out-Null
+        $spArgs = @{
+            FilePath     = 'powershell.exe'
+            ArgumentList = $argList
+            Verb         = 'RunAs'
+        }
+        if ($WorkingDirectory -and (Test-Path -LiteralPath $WorkingDirectory)) {
+            $spArgs['WorkingDirectory'] = $WorkingDirectory
+        }
+        Start-Process @spArgs | Out-Null
     } catch {
         throw "UAC prompt was cancelled or failed: $($_.Exception.Message)"
     }
     Write-Host "[deploy] elevated window spawned; this shell is done." -ForegroundColor Green
     exit 0
-}
-
-function Assert-Admin {
-    if (-not (Test-IsAdmin)) {
-        Invoke-SelfElevate
-        # Invoke-SelfElevate calls exit; the line below is only reached
-        # if someone disables exit (defence in depth).
-        throw "Windows deployment requires an elevated PowerShell session."
-    }
 }
 
 function Write-Step {
@@ -429,10 +441,40 @@ function Invoke-Cleanup {
                     Write-Step "restoring $family DNS on '$alias' to $($servers -join ', ')"
                     # Set-DnsClientServerAddress detects family per address,
                     # so a v4-only or v6-only list updates only that family.
+                    #
+                    # InterfaceIndex can become stale between backup and restore
+                    # (Wi-Fi adapters re-enumerate when the radio cycles, VMware
+                    # vmnetN adapters reload when their service bounces, etc.).
+                    # Try the recorded index first, then fall back to the alias
+                    # which is more stable, then to netsh as a last resort.
+                    $set = $false
                     if ($idx) {
-                        Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses $servers -ErrorAction Stop | Out-Null
-                    } else {
-                        Set-DnsClientServerAddress -InterfaceAlias $alias -ServerAddresses $servers -ErrorAction Stop | Out-Null
+                        try {
+                            Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses $servers -ErrorAction Stop | Out-Null
+                            $set = $true
+                        } catch {
+                            Write-Warn "InterfaceIndex $idx no longer matches '$alias' ($($_.Exception.Message)); retrying by alias"
+                        }
+                    }
+                    if (-not $set) {
+                        try {
+                            Set-DnsClientServerAddress -InterfaceAlias $alias -ServerAddresses $servers -ErrorAction Stop | Out-Null
+                            $set = $true
+                        } catch {
+                            Write-Warn "alias-based DNS restore for '$alias' failed: $($_.Exception.Message); retrying via netsh"
+                        }
+                    }
+                    if (-not $set) {
+                        # netsh takes a literal alias (in quotes) and is less
+                        # picky than the CIM-backed cmdlet about adapter state.
+                        # `set dnsservers ... static <ip>` clears and sets the
+                        # primary; `add dnsservers ... index=N` appends the
+                        # rest in the original order.
+                        $proto = if ($family -eq 'IPv4') { 'ipv4' } else { 'ipv6' }
+                        & netsh interface $proto set dnsservers name="$alias" static $($servers[0]) *> $null
+                        for ($i = 1; $i -lt $servers.Count; $i++) {
+                            & netsh interface $proto add dnsservers name="$alias" $($servers[$i]) index=$($i + 1) *> $null
+                        }
                     }
                 } else {
                     # Backup was empty -> family was DHCP-managed.
@@ -905,9 +947,16 @@ function Invoke-RestartAction {
     # Restart = "I just rebuilt sslocal, swap the binary and bounce".
     # Routes and DNS overrides are deliberately preserved so the user
     # doesn't see DNS resolution flap during the restart.
+    #
+    # If the service hasn't been registered yet (or was removed by a
+    # previous -Action Stop), there is nothing to "restart" - in that
+    # case fall through to the full Start path which will register the
+    # service with start= auto, build + copy binaries, install routes
+    # and DNS overrides, and bring sslocal up.
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if (-not $svc) {
-        Write-Warn "service '$ServiceName' not registered; nothing to restart. Use -Action Start."
+        Write-Step "service '$ServiceName' not registered; delegating to -Action Start (register + enable autostart + install routes/DNS + start)"
+        Invoke-StartAction -Root $Root -RepoRoot $RepoRoot -TunName $TunName -ServiceName $ServiceName
         return
     }
 
@@ -1034,9 +1083,27 @@ function Invoke-StatusAction {
 # Main
 # ------------------------------------------------------------------
 
-Assert-Admin
+# Capture script-scope bound parameters BEFORE entering any function,
+# because automatic `$PSBoundParameters` is function-local and would
+# come back empty inside Invoke-SelfElevate.
+$ScriptBoundParameters = $PSBoundParameters
 
-$RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
+# `.Path` collapses PathInfo to a plain string; later interpolation
+# (Set-Location, "$RepoRoot\..", cargo --manifest-path, etc.) is much
+# better-behaved with a string than with a PathInfo wrapper.
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+
+# UAC-elevated PowerShell starts in C:\Windows\system32 by default.
+# Hop into the repo root so `cargo build`, relative paths, etc. all
+# resolve from the workspace as the un-elevated caller would expect.
+Set-Location -LiteralPath $RepoRoot
+
+if (-not (Test-IsAdmin)) {
+    Invoke-SelfElevate -BoundParams $ScriptBoundParameters -WorkingDirectory $RepoRoot
+    # Invoke-SelfElevate calls `exit`; defence-in-depth if not:
+    throw "Windows deployment requires an elevated PowerShell session."
+}
+
 Write-Step "repo: $RepoRoot"
 Write-Step "install: $InstallDir"
 Write-Step "action: $Action"
