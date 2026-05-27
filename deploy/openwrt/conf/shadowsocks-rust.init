@@ -10,11 +10,35 @@ CONF=/usr/local/shadowsocks/conf/shadowsocks-client.json
 DATA_DIR=/usr/local/shadowsocks/data
 LOG_DIR=/usr/local/shadowsocks/logs
 
+set_sysctl_persistent() {
+	key="$1"
+	value="$2"
+	file=/etc/sysctl.conf
+	tmp="${file}.$$"
+
+	touch "$file" 2>/dev/null || true
+	awk -v key="$key" '
+		{
+			line = $0
+			sub(/^[ \t]*/, "", line)
+			split(line, parts, "=")
+			gsub(/[ \t]+$/, "", parts[1])
+			if (parts[1] != key) print
+		}
+	' "$file" >"$tmp" 2>/dev/null || return 0
+	printf '%s = %s\n' "$key" "$value" >>"$tmp"
+	mv "$tmp" "$file" 2>/dev/null || {
+		rm -f "$tmp"
+		return 0
+	}
+	sysctl -w "$key=$value" >/dev/null 2>&1 || true
+}
+
 apply_network_tuning() {
 	# TCP Fast Open client+server. xray-plugin uses TFO on its inner socket
 	# (plugin_opts contains "fast-open"); with the kernel cookie cache
 	# warm this saves ~1 RTT on every new tunnel handshake.
-	sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1 || true
+	set_sysctl_persistent net.ipv4.tcp_fastopen 3
 
 	# Buffer ceilings + autotune ranges. These are the *kernel limits* that
 	# let TCP autotuning grow per-socket SO_SNDBUF / SO_RCVBUF up to the BDP.
@@ -22,32 +46,32 @@ apply_network_tuning() {
 	# JSON config — that calls setsockopt(SO_RCVBUF/SO_SNDBUF) explicitly,
 	# which DISABLES tcp autotune for that socket and pins the buffer at a
 	# fixed (usually wrong) size. Let the kernel adapt to RTT instead.
-	sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1 || true
-	sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1 || true
-	sysctl -w 'net.ipv4.tcp_rmem=4096 262144 16777216' >/dev/null 2>&1 || true
-	sysctl -w 'net.ipv4.tcp_wmem=4096 262144 16777216' >/dev/null 2>&1 || true
+	set_sysctl_persistent net.core.rmem_max 16777216
+	set_sysctl_persistent net.core.wmem_max 16777216
+	set_sysctl_persistent net.ipv4.tcp_rmem "4096 262144 16777216"
+	set_sysctl_persistent net.ipv4.tcp_wmem "4096 262144 16777216"
 
 	# Persistent xray-plugin WebSocket tunnels regularly go idle for >RTO.
 	# Default behaviour resets cwnd to ~10 segments after an idle period,
 	# which adds an extra RTT slow-start ramp on top of every "first click
 	# after a pause" and is one of the biggest sources of perceived lag.
-	sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || true
+	set_sysctl_persistent net.ipv4.tcp_slow_start_after_idle 0
 
 	# Limit unsent bytes queued in the send buffer so TLS records / WS
 	# frames don't pile up behind one another; helps interactive latency.
-	sysctl -w net.ipv4.tcp_notsent_lowat=131072 >/dev/null 2>&1 || true
+	set_sysctl_persistent net.ipv4.tcp_notsent_lowat 131072
 
 	# PMTU discovery hardening — some carriers black-hole "fragmentation
 	# needed" ICMPs, which strands long TLS records.
-	sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || true
+	set_sysctl_persistent net.ipv4.tcp_mtu_probing 1
 
 	# Listener accept queue + conntrack table for redir / TPROXY bursts.
-	sysctl -w net.core.somaxconn=8192 >/dev/null 2>&1 || true
-	sysctl -w net.netfilter.nf_conntrack_max=262144 >/dev/null 2>&1 || true
+	set_sysctl_persistent net.core.somaxconn 8192
+	set_sysctl_persistent net.netfilter.nf_conntrack_max 262144
 
 	# Re-use TIME-WAIT for outbound connections (xray-plugin opens many
 	# short-lived loopback connections to ssserver in mux mode).
-	sysctl -w net.ipv4.tcp_tw_reuse=1 >/dev/null 2>&1 || true
+	set_sysctl_persistent net.ipv4.tcp_tw_reuse 1
 }
 
 start_service() {

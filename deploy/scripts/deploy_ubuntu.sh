@@ -5,8 +5,7 @@
 #
 # Design contract (per user instruction):
 #   * sslocal binary  — rebuilt and OVERWRITTEN every invocation.
-#   * everything else — installed ONLY IF MISSING. Conf, data, helper
-#                       scripts (sslocal-watch.sh / sslocal-probe.sh),
+#   * everything else — installed ONLY IF MISSING. Conf, data,
 #                       xray-plugin, and systemd units are all treated
 #                       as one-time setup. The script never clobbers
 #                       them once the operator has touched them.
@@ -24,8 +23,6 @@ UBUNTU_DIR="$ROOT_DIR/deploy/ubuntu"
 
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/shadowsocks}"
 SERVICE_NAME="${SERVICE_NAME:-shadowsocks-client}"
-WATCH_SERVICE_NAME="${WATCH_SERVICE_NAME:-sslocal-watch}"
-PROBE_SERVICE_NAME="${PROBE_SERVICE_NAME:-sslocal-probe}"
 FEATURES="${FEATURES:-full local-web-admin local-http-rustls}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 RESTART_SERVICE="${RESTART_SERVICE:-1}"
@@ -61,8 +58,6 @@ log() { printf '[deploy] %s\n' "$*"; }
 # cannot recreate the table mid-flush.
 cleanup_firewall_state() {
 	log "stopping services before firewall cleanup"
-	"${SUDO[@]}" systemctl stop "$PROBE_SERVICE_NAME.service" >/dev/null 2>&1 || true
-	"${SUDO[@]}" systemctl stop "$WATCH_SERVICE_NAME.service" >/dev/null 2>&1 || true
 	"${SUDO[@]}" systemctl stop "$SERVICE_NAME.service"       >/dev/null 2>&1 || true
 
 	if command -v nft >/dev/null 2>&1; then
@@ -148,8 +143,6 @@ log "installed $INSTALL_DIR/bin/sslocal ($("$BINARY" --version 2>&1))"
 # 4) Everything else — install-if-missing only.
 log "syncing auxiliary files (install-if-missing)"
 install_if_missing "$UBUNTU_DIR/bin/xray-plugin"          "$INSTALL_DIR/bin/xray-plugin"          755
-install_if_missing "$UBUNTU_DIR/conf/sslocal-watch.sh"    "$INSTALL_DIR/bin/sslocal-watch.sh"     755
-install_if_missing "$UBUNTU_DIR/conf/sslocal-probe.sh"    "$INSTALL_DIR/bin/sslocal-probe.sh"     755
 install_if_missing "$UBUNTU_DIR/conf/shadowsocks-client.json" "$INSTALL_DIR/conf/shadowsocks-client.json" 644
 
 # Conf is the source of truth — refuse to start without it.
@@ -217,48 +210,8 @@ StandardError=append:$INSTALL_DIR/logs/shadowsocks-client.stderr.log
 WantedBy=multi-user.target
 "
 
-if [[ -x "$INSTALL_DIR/bin/sslocal-watch.sh" ]]; then
-	write_unit_if_missing "/etc/systemd/system/$WATCH_SERVICE_NAME.service" "[Unit]
-Description=shadowsocks-rust passive diagnostic sampler
-After=$SERVICE_NAME.service
-Wants=$SERVICE_NAME.service
-
-[Service]
-Type=simple
-ExecStart=$INSTALL_DIR/bin/sslocal-watch.sh
-Restart=on-failure
-RestartSec=5
-Nice=10
-
-[Install]
-WantedBy=multi-user.target
-"
-fi
-
-if [[ -x "$INSTALL_DIR/bin/sslocal-probe.sh" ]]; then
-	write_unit_if_missing "/etc/systemd/system/$PROBE_SERVICE_NAME.service" "[Unit]
-Description=shadowsocks-rust active liveness probe (curl through redir)
-After=$SERVICE_NAME.service
-Wants=$SERVICE_NAME.service
-
-[Service]
-Type=simple
-ExecStart=$INSTALL_DIR/bin/sslocal-probe.sh
-Restart=on-failure
-RestartSec=5
-AmbientCapabilities=CAP_KILL
-
-[Install]
-WantedBy=multi-user.target
-"
-fi
-
 "${SUDO[@]}" systemctl daemon-reload
 "${SUDO[@]}" systemctl enable "$SERVICE_NAME.service" >/dev/null 2>&1 || true
-[[ -e "/etc/systemd/system/$WATCH_SERVICE_NAME.service" ]] && \
-	"${SUDO[@]}" systemctl enable "$WATCH_SERVICE_NAME.service" >/dev/null 2>&1 || true
-[[ -e "/etc/systemd/system/$PROBE_SERVICE_NAME.service" ]] && \
-	"${SUDO[@]}" systemctl enable "$PROBE_SERVICE_NAME.service" >/dev/null 2>&1 || true
 
 # 7) Restart cycle with log wipe in between.
 #
@@ -268,8 +221,6 @@ fi
 # from a previous run).
 if [[ "$RESTART_SERVICE" = 1 ]]; then
 	log "stopping services"
-	"${SUDO[@]}" systemctl stop "$PROBE_SERVICE_NAME.service" >/dev/null 2>&1 || true
-	"${SUDO[@]}" systemctl stop "$WATCH_SERVICE_NAME.service" >/dev/null 2>&1 || true
 	"${SUDO[@]}" systemctl stop "$SERVICE_NAME.service"       >/dev/null 2>&1 || true
 fi
 
@@ -293,15 +244,6 @@ if [[ "$RESTART_SERVICE" = 1 ]]; then
 	"${SUDO[@]}" systemctl start "$SERVICE_NAME.service"
 	sleep 2
 	"${SUDO[@]}" systemctl --no-pager --full status "$SERVICE_NAME.service" || true
-
-	if [[ -e "/etc/systemd/system/$WATCH_SERVICE_NAME.service" ]]; then
-		log "starting $WATCH_SERVICE_NAME"
-		"${SUDO[@]}" systemctl start "$WATCH_SERVICE_NAME.service" || true
-	fi
-	if [[ -e "/etc/systemd/system/$PROBE_SERVICE_NAME.service" ]]; then
-		log "starting $PROBE_SERVICE_NAME"
-		"${SUDO[@]}" systemctl start "$PROBE_SERVICE_NAME.service" || true
-	fi
 fi
 
 cat <<EOF
@@ -314,8 +256,6 @@ Logs were wiped: $INSTALL_DIR/logs/
 
 Tail / inspect:
   journalctl -u $SERVICE_NAME.service -f
-  tail -F $INSTALL_DIR/logs/sslocal-watch.log
-  tail -F $INSTALL_DIR/logs/sslocal-probe.log
   ls -lt $INSTALL_DIR/logs/dumps/ | head
   curl -sS http://127.0.0.1:9090/api/dns/cache/stats | jq .
 EOF

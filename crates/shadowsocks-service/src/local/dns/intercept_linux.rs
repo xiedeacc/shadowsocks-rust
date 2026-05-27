@@ -72,8 +72,13 @@ pub fn cleanup_stale_nft_table() {
     }
 }
 
-pub fn setup_firewall_redirect(port: u16, redir_port: Option<u16>, dns_exempt_ips: &[IpAddr]) -> io::Result<DnsInterceptGuard> {
-    match setup_nft(port, redir_port, dns_exempt_ips) {
+pub fn setup_firewall_redirect(
+    port: u16,
+    redir_port: Option<u16>,
+    dns_exempt_ips: &[IpAddr],
+    tcp_exempt_endpoints: &[(IpAddr, u16)],
+) -> io::Result<DnsInterceptGuard> {
+    match setup_nft(port, redir_port, dns_exempt_ips, tcp_exempt_endpoints) {
         Ok(()) => {
             info!("installed nftables DNS interception rules on local port {}", port);
             Ok(DnsInterceptGuard { backend: Backend::Nft })
@@ -371,7 +376,12 @@ fn write_add_elements(file: &mut File, decision: RouteDecision, nets: &[IpNet]) 
     Ok(())
 }
 
-fn setup_nft(port: u16, redir_port: Option<u16>, dns_exempt_ips: &[IpAddr]) -> io::Result<()> {
+fn setup_nft(
+    port: u16,
+    redir_port: Option<u16>,
+    dns_exempt_ips: &[IpAddr],
+    tcp_exempt_endpoints: &[(IpAddr, u16)],
+) -> io::Result<()> {
     let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
     command("nft", &["add", "table", "inet", NFT_TABLE])?;
     add_nft_sets()?;
@@ -501,26 +511,79 @@ fn setup_nft(port: u16, redir_port: Option<u16>, dns_exempt_ips: &[IpAddr]) -> i
                 &format!(":{port}"),
             ],
         )?;
-        // INTENTIONAL: do NOT add a `daddr @bypass{4,6} ... redirect to :redir_port`
-        // rule in the OUTPUT chain. That rule belongs only in PREROUTING (where
-        // it matches LAN-client traffic destined for proxied IPs).
-        //
-        // Why output is dangerous: bypass4/bypass6 are populated with every
-        // proxied IP sslocal has resolved, which includes Google / Cloudflare /
-        // GitHub IPs *but also* IPs from the same AWS / Azure / Apple ranges
-        // that the upstream ssserver itself often sits in. The moment sslocal
-        // (or xray-plugin) opens an outbound TCP connection to the ssserver
-        // address, this rule would match in the output hook and DNAT that
-        // packet straight back to 127.0.0.1:<redir_port> = sslocal's redir
-        // listener. sslocal then tries to proxy that connection — by opening
-        // another outbound to the ssserver — which gets caught by the same
-        // rule again. Result: an unbounded redirect loop that piles up
-        // conntrack entries, saturates the netlink path, and ultimately
-        // wedges the whole router so it stops responding to ICMP / SSH and
-        // only recovers on reboot. Keeping the bypass4/6 redirect in
-        // PREROUTING only is sufficient, because LAN-originated client
-        // packets always traverse prerouting first, while sslocal's own
-        // outbound never does.
+        if proto == "tcp"
+            && let Some(redir_port) = redir_port
+        {
+            for (ip, exempt_port) in tcp_exempt_endpoints {
+                let family_expr = match ip {
+                    IpAddr::V4(..) => "ip",
+                    IpAddr::V6(..) => "ip6",
+                };
+                command(
+                    "nft",
+                    &[
+                        "add",
+                        "rule",
+                        "inet",
+                        NFT_TABLE,
+                        "output",
+                        family_expr,
+                        "daddr",
+                        &ip.to_string(),
+                        "tcp",
+                        "dport",
+                        &exempt_port.to_string(),
+                        "return",
+                    ],
+                )?;
+            }
+
+            // OUTPUT is required for Ubuntu's local-machine transparent proxy:
+            // packets generated on the box itself never traverse PREROUTING.
+            // The ssserver endpoint exemptions above keep OpenWrt safe from
+            // redirecting sslocal/xray-plugin's own upstream TCP connection
+            // back into the local redir listener.
+            command(
+                "nft",
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    NFT_TABLE,
+                    "output",
+                    "ip",
+                    "daddr",
+                    "@bypass4",
+                    "tcp",
+                    "dport",
+                    "!=",
+                    "53",
+                    "redirect",
+                    "to",
+                    &format!(":{redir_port}"),
+                ],
+            )?;
+            command(
+                "nft",
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    NFT_TABLE,
+                    "output",
+                    "ip6",
+                    "daddr",
+                    "@bypass6",
+                    "tcp",
+                    "dport",
+                    "!=",
+                    "53",
+                    "redirect",
+                    "to",
+                    &format!(":{redir_port}"),
+                ],
+            )?;
+        }
     }
     Ok(())
 }
@@ -692,4 +755,3 @@ fn command(program: &str, args: &[&str]) -> io::Result<()> {
         Err(io::Error::other(format!("{program} exited with {status}")))
     }
 }
-
