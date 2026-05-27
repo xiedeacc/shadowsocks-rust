@@ -7,8 +7,11 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, RwLock as StdRwLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, RwLock as StdRwLock,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use hickory_resolver::proto::op::Message;
@@ -17,6 +20,40 @@ use log::warn;
 use serde::{Deserialize, Serialize};
 use shadowsocks::relay::socks5::Address;
 use tokio::{sync::RwLock as TokioRwLock, time};
+
+// =====================================================================
+// Hot-path instrumentation counters.
+//
+// Why these are global atomics rather than living on `RoutingState`:
+// the diagnostic logger we ship in this build needs to be cheap enough
+// to run in production (counters bumped on every DNS query), and it
+// needs to keep working even if every call site holds the routing lock
+// at once. `AtomicU64::fetch_add(_, Relaxed)` compiles to a single
+// inlined LOCK XADD on x86 / LDADD on aarch64 — practically free vs.
+// the wall-clock cost of the operations they instrument (subprocess
+// fork, file write, full-table prune).
+//
+// All `*_NS` counters are cumulative wall-clock nanoseconds since
+// process start. The 60s diagnostic logger emits the deltas, so we get
+// per-minute "% time spent in this hot section" without keeping a
+// histogram in memory. `Relaxed` is intentional — we don't need
+// happens-before ordering across counters; each is independent.
+// =====================================================================
+static PRUNE_DNS_CACHE_CALLS: AtomicU64 = AtomicU64::new(0);
+static PRUNE_DNS_CACHE_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static NFT_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
+static NFT_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static APPEND_LINES_CALLS: AtomicU64 = AtomicU64::new(0);
+static APPEND_LINES_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static ADD_DNS_RESULTS_CALLS: AtomicU64 = AtomicU64::new(0);
+static ADD_DNS_RESULTS_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+
+// Threshold above which a single hot-path operation is logged at
+// `warn!` level. Picked low enough to flag pathological cases without
+// drowning the log on a healthy system: the 99p we expect on this
+// hardware is well under 10ms per `nft add element`, and `prune` should
+// be sub-millisecond at modest cache sizes.
+const SLOW_HOT_PATH_MS: u128 = 100;
 
 use crate::config::RouteRulesConfig;
 
@@ -37,7 +74,12 @@ const MAX_EVENTS: usize = 4096;
 const DEFAULT_WINDOW: Duration = Duration::from_secs(300);
 const BYPASS_IP_PERSIST_DELAY: Duration = Duration::from_secs(30);
 const DNS_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const CONNECTION_ACTIVITY_TTL: Duration = Duration::from_secs(10);
+/// How long an authoritative per-flow decision (Redir/Tun/Proxy/etc.)
+/// is retained so the kernel-snapshot scraper can re-label a long-lived
+/// flow even after its `ConnectionEvent` aged out of `DEFAULT_WINDOW`.
+/// Long enough to cover persistent TLS/HLS/WebSocket connections but
+/// bounded so stale tuples don't leak forever.
+const FLOW_DECISION_TTL: Duration = Duration::from_secs(3600);
 const PRIVATE_DIRECT_IP_RULES: [&str; 13] = [
     "0.0.0.0/8",
     "127.0.0.0/8",
@@ -213,7 +255,17 @@ pub enum ConnectionDecision {
     Socks5Proxy,
     Redir,
     Tun,
+    /// Flow observed in the kernel (conntrack / /proc/net/{tcp,udp})
+    /// but sslocal did not handle it itself in the in-memory decision
+    /// log. Distinct from `Direct` (which means "ACL said bypass" in the
+    /// SOCKS/HTTP/UDP-association code paths).
+    Snapshot,
 }
+
+/// Five-tuple identifying a kernel-visible flow, used as the key of
+/// the `flow_decisions` map so scraper rows can be re-labeled from the
+/// authoritative `record_connection` decision.
+type FlowKey = (IpAddr, u16, IpAddr, u16, &'static str);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct DnsEvent {
@@ -248,6 +300,61 @@ pub struct DnsCacheStats {
     pub ttl_seconds: u64,
     pub refresh_enabled: bool,
     pub refresh_batch_size: usize,
+}
+
+/// Lightweight snapshot of the routing state's most leak-prone collections.
+/// Designed to be cheap to gather (read lock, no pruning) so it can be
+/// emitted from a 60s background logger without adding to lock contention.
+#[derive(Clone, Debug)]
+pub struct RuntimeDiagnostics {
+    pub dns_cache_size: usize,
+    /// Length of the FIFO order queue used to enforce capacity. A growing
+    /// gap between this and `dns_cache_size` indicates duplicate-key leaks.
+    pub dns_cache_order_len: usize,
+    pub dns_cache_capacity: usize,
+    pub dns_cache_ttl_seconds: u64,
+    pub dns_events: usize,
+    pub connections: usize,
+    /// Size of the authoritative per-flow decision map. Bounded by
+    /// `MAX_EVENTS` and `FLOW_DECISION_TTL`; surfaced here so the
+    /// periodic logger flags unexpected growth.
+    pub flow_decisions: usize,
+    /// Reverse-DNS map. Never pruned today — included here so the
+    /// periodic logger flags growth.
+    pub reverse_domains: usize,
+    pub unhit_ips: usize,
+    pub unhit_domains: usize,
+    pub persistent_direct_ip: usize,
+    pub persistent_bypass_ip: usize,
+    pub temporary_direct_ip: usize,
+    pub temporary_bypass_ip: usize,
+    /// Cumulative hot-path counters (since process start). The diagnostic
+    /// task computes per-tick deltas so we can compute "% of wall clock
+    /// spent in this section" or "rate of nft fork+exec / sec".
+    pub prune_dns_cache_calls: u64,
+    pub prune_dns_cache_total_ns: u64,
+    pub nft_invocations: u64,
+    pub nft_total_ns: u64,
+    pub append_lines_calls: u64,
+    pub append_lines_total_ns: u64,
+    pub add_dns_results_calls: u64,
+    pub add_dns_results_total_ns: u64,
+}
+
+/// Snapshot the cumulative hot-path counters. Cheap (8 relaxed atomic
+/// loads); intended to be called from the periodic logger once per
+/// minute, and from any future SIGUSR1 dump path.
+pub fn hot_path_counters() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    (
+        PRUNE_DNS_CACHE_CALLS.load(AtomicOrdering::Relaxed),
+        PRUNE_DNS_CACHE_TOTAL_NS.load(AtomicOrdering::Relaxed),
+        NFT_INVOCATIONS.load(AtomicOrdering::Relaxed),
+        NFT_TOTAL_NS.load(AtomicOrdering::Relaxed),
+        APPEND_LINES_CALLS.load(AtomicOrdering::Relaxed),
+        APPEND_LINES_TOTAL_NS.load(AtomicOrdering::Relaxed),
+        ADD_DNS_RESULTS_CALLS.load(AtomicOrdering::Relaxed),
+        ADD_DNS_RESULTS_TOTAL_NS.load(AtomicOrdering::Relaxed),
+    )
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -374,7 +481,12 @@ struct RoutingInner {
     ip_conflicts: VecDeque<ConflictEvent>,
     domain_conflicts: VecDeque<ConflictEvent>,
     connections: VecDeque<ConnectionEvent>,
-    connection_activity_until: u64,
+    /// Flow-keyed authoritative decision map. Survives independently of
+    /// `connections` (which is bounded by `DEFAULT_WINDOW`) so the
+    /// kernel-snapshot scraper in `recent_connections` can re-label
+    /// long-lived flows whose original `Redir`/`Tun` event has already
+    /// been trimmed. Pruned by `FLOW_DECISION_TTL` and `MAX_EVENTS`.
+    flow_decisions: HashMap<FlowKey, (ConnectionDecision, u64)>,
     dns: VecDeque<DnsEvent>,
     reverse_domains: HashMap<IpAddr, String>,
     dns_cache: HashMap<DnsCacheKey, DnsCacheEntry>,
@@ -454,7 +566,7 @@ impl RoutingState {
             ip_conflicts: VecDeque::new(),
             domain_conflicts: VecDeque::new(),
             connections: VecDeque::new(),
-            connection_activity_until: 0,
+            flow_decisions: HashMap::new(),
             dns: VecDeque::new(),
             reverse_domains: HashMap::new(),
             dns_cache: HashMap::new(),
@@ -594,6 +706,14 @@ impl RoutingState {
     }
 
     pub async fn add_dns_results(&self, decision: RouteDecision, domain: &str, results: &[IpAddr]) -> io::Result<()> {
+        // Whole-function timing — we suspect this path of holding the
+        // routing write lock too long because it does (a) sync file
+        // append on the Direct branch and (b) sync `nft` fork+exec on
+        // the Proxy branch, both inside / right next to the lock. The
+        // counter is read by the periodic diagnostic logger.
+        let total_start = Instant::now();
+        ADD_DNS_RESULTS_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+
         let mut schedule_bypass_persist = false;
         let additions = {
             let mut inner = self.inner.write().await;
@@ -636,13 +756,33 @@ impl RoutingState {
             }
 
             if additions.is_empty() {
+                let elapsed = total_start.elapsed();
+                ADD_DNS_RESULTS_TOTAL_NS.fetch_add(elapsed.as_nanos() as u64, AtomicOrdering::Relaxed);
                 return Ok(());
             }
 
             let lines = additions.iter().map(ToString::to_string).collect::<Vec<_>>();
             match decision {
                 RouteDecision::Direct => {
-                    append_lines(&inner.rules_dir.join(DIRECT_IP_FILE), &lines)?;
+                    // append_lines is a *blocking* file write done while
+                    // holding the routing write lock. We time it
+                    // explicitly so we can answer "is the lock being held
+                    // for tens of ms because of disk?" from log alone.
+                    let started = Instant::now();
+                    let result = append_lines(&inner.rules_dir.join(DIRECT_IP_FILE), &lines);
+                    let elapsed = started.elapsed();
+                    APPEND_LINES_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+                    APPEND_LINES_TOTAL_NS.fetch_add(elapsed.as_nanos() as u64, AtomicOrdering::Relaxed);
+                    if elapsed.as_millis() >= SLOW_HOT_PATH_MS {
+                        warn!(
+                            "append_lines slow: {}ms ({} lines, file={}, domain={})",
+                            elapsed.as_millis(),
+                            lines.len(),
+                            DIRECT_IP_FILE,
+                            domain
+                        );
+                    }
+                    result?;
                     inner.persistent_raw.direct_ip.extend(lines);
                     inner.persistent.direct_ip_exact.extend(additions.iter().copied());
                     inner.persistent.direct_ip.extend(additions.iter().copied().map(IpNet::from));
@@ -669,21 +809,69 @@ impl RoutingState {
         );
         #[cfg(all(target_os = "linux", feature = "local-dns"))]
         {
-            match decision {
-                RouteDecision::Direct => {
-                    if let Err(err) = crate::local::dns::intercept_linux::remove_route_ips(RouteDecision::Proxy, &additions) {
-                        warn!("failed to remove direct DNS result IPs from nft bypass set: {}", err);
-                    }
+            // Move the nft fork+exec onto a blocking-pool thread so the
+            // tokio worker that's running the DNS handler isn't stalled
+            // for the duration of the syscall. The helpers
+            // `add_route_ips` / `remove_route_ips` were also reworked
+            // to issue a single `nft -f -` per call instead of N
+            // per-IP invocations, so this is now one fork+exec total
+            // for the whole resolution batch.
+            let nft_start = Instant::now();
+            let additions_for_nft = additions.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<(), io::Error> {
+                match decision {
+                    RouteDecision::Direct => crate::local::dns::intercept_linux::remove_route_ips(
+                        RouteDecision::Proxy,
+                        &additions_for_nft,
+                    ),
+                    RouteDecision::Proxy => crate::local::dns::intercept_linux::add_route_ips(
+                        decision,
+                        &additions_for_nft,
+                    ),
                 }
-                RouteDecision::Proxy => {
-                    if let Err(err) = crate::local::dns::intercept_linux::add_route_ips(decision, &additions) {
-                        warn!("failed to sync DNS result IPs to nft set: {}", err);
+            })
+            .await
+            .unwrap_or_else(|join_err| Err(io::Error::other(format!("nft join error: {join_err}"))));
+            let nft_elapsed = nft_start.elapsed();
+            // One invocation per call now (batched), regardless of
+            // additions.len(). The per-IP cost has effectively
+            // collapsed into a single fork+exec.
+            NFT_INVOCATIONS.fetch_add(1, AtomicOrdering::Relaxed);
+            NFT_TOTAL_NS.fetch_add(nft_elapsed.as_nanos() as u64, AtomicOrdering::Relaxed);
+            if nft_elapsed.as_millis() >= SLOW_HOT_PATH_MS {
+                warn!(
+                    "nft sync slow: {}ms ({} IPs, decision={:?}, domain={})",
+                    nft_elapsed.as_millis(),
+                    additions.len(),
+                    decision,
+                    domain
+                );
+            }
+            if let Err(err) = result {
+                match decision {
+                    RouteDecision::Direct => {
+                        warn!("failed to remove direct DNS result IPs from nft bypass set: {}", err)
+                    }
+                    RouteDecision::Proxy => {
+                        warn!("failed to sync DNS result IPs to nft set: {}", err)
                     }
                 }
             }
         }
         if schedule_bypass_persist {
             self.schedule_bypass_ip_persist();
+        }
+
+        let elapsed = total_start.elapsed();
+        ADD_DNS_RESULTS_TOTAL_NS.fetch_add(elapsed.as_nanos() as u64, AtomicOrdering::Relaxed);
+        if elapsed.as_millis() >= SLOW_HOT_PATH_MS {
+            warn!(
+                "add_dns_results slow: {}ms (decision={:?}, domain={}, additions={})",
+                elapsed.as_millis(),
+                decision,
+                domain,
+                additions.len(),
+            );
         }
         Ok(())
     }
@@ -1312,9 +1500,6 @@ impl RoutingState {
             Address::DomainNameAddress(domain, port) => (None, Some(domain.clone()), *port),
         };
         let mut inner = self.inner.write().await;
-        if inner.connection_activity_until < now() {
-            return;
-        }
         if destination_ip.is_some_and(|ip| is_private_connection_ip(&ip)) {
             return;
         }
@@ -1323,10 +1508,37 @@ impl RoutingState {
                 .as_ref()
                 .and_then(|ip| inner.reverse_domains.get(ip).cloned())
         });
+        let ts = now();
+        // Record an authoritative flow->decision entry so the kernel
+        // snapshot scraper in `recent_connections` can re-label this
+        // 5-tuple even after the ConnectionEvent ages out of
+        // DEFAULT_WINDOW. Domain-only targets (no resolved IP) can't be
+        // matched against /proc/net/* rows, so we skip those.
+        let proto_static = match protocol {
+            "tcp" => Some("tcp"),
+            "udp" => Some("udp"),
+            _ => None,
+        };
+        if let (Some(dst_ip), Some(p)) = (destination_ip, proto_static) {
+            let key: FlowKey = (source.ip(), source.port(), dst_ip, destination_port, p);
+            inner.flow_decisions.insert(key, (decision, ts));
+            if inner.flow_decisions.len() > MAX_EVENTS {
+                // Evict the oldest entry to keep the map bounded
+                // (record_connection is on the hot accept path).
+                if let Some(oldest_key) = inner
+                    .flow_decisions
+                    .iter()
+                    .min_by_key(|(_, (_, ts))| *ts)
+                    .map(|(k, _)| *k)
+                {
+                    inner.flow_decisions.remove(&oldest_key);
+                }
+            }
+        }
         push_event(
             &mut inner.connections,
             ConnectionEvent {
-                timestamp: now(),
+                timestamp: ts,
                 source_ip: source.ip(),
                 source_port: source.port(),
                 destination_ip,
@@ -1338,11 +1550,6 @@ impl RoutingState {
             },
         );
         trim_old(&mut inner.connections, DEFAULT_WINDOW);
-    }
-
-    pub async fn enable_connection_activity(&self) {
-        let mut inner = self.inner.write().await;
-        inner.connection_activity_until = now().saturating_add(CONNECTION_ACTIVITY_TTL.as_secs());
     }
 
     pub async fn record_dns(
@@ -1471,6 +1678,43 @@ impl RoutingState {
         }
     }
 
+    /// Cheap, lock-light snapshot used by the periodic in-process diagnostic
+    /// logger. Takes a *read* lock and intentionally skips `prune_dns_cache`
+    /// so it does not add to the write-lock contention that already shows up
+    /// on hot DNS paths when the cache grows large. Reports raw container
+    /// sizes only — including `dns_cache_order` so a runaway append (a known
+    /// failure mode if duplicate keys ever leak in) is visible directly in
+    /// the log.
+    pub async fn runtime_diagnostics(&self) -> RuntimeDiagnostics {
+        let inner = self.inner.read().await;
+        let (prune_calls, prune_ns, nft_calls, nft_ns, append_calls, append_ns, add_calls, add_ns) =
+            hot_path_counters();
+        RuntimeDiagnostics {
+            dns_cache_size: inner.dns_cache.len(),
+            dns_cache_order_len: inner.dns_cache_order.len(),
+            dns_cache_capacity: inner.sources.dns_cache_capacity,
+            dns_cache_ttl_seconds: inner.sources.dns_cache_ttl_seconds,
+            dns_events: inner.dns.len(),
+            connections: inner.connections.len(),
+            flow_decisions: inner.flow_decisions.len(),
+            reverse_domains: inner.reverse_domains.len(),
+            unhit_ips: inner.unhit_ips.len(),
+            unhit_domains: inner.unhit_domains.len(),
+            persistent_direct_ip: inner.persistent.direct_ip.len(),
+            persistent_bypass_ip: inner.persistent.bypass_ip.len(),
+            temporary_direct_ip: inner.temporary.direct_ip.len(),
+            temporary_bypass_ip: inner.temporary.bypass_ip.len(),
+            prune_dns_cache_calls: prune_calls,
+            prune_dns_cache_total_ns: prune_ns,
+            nft_invocations: nft_calls,
+            nft_total_ns: nft_ns,
+            append_lines_calls: append_calls,
+            append_lines_total_ns: append_ns,
+            add_dns_results_calls: add_calls,
+            add_dns_results_total_ns: add_ns,
+        }
+    }
+
     pub async fn dns_cache_query(&self, domain: &str) -> Vec<DnsCacheView> {
         let mut inner = self.inner.write().await;
         prune_dns_cache(&mut inner);
@@ -1578,9 +1822,13 @@ impl RoutingState {
 
     pub async fn recent_connections(&self, excluded_remotes: &[IpAddr]) -> Vec<ConnectionEvent> {
         let mut inner = self.inner.write().await;
-        inner.connection_activity_until = now().saturating_add(CONNECTION_ACTIVITY_TTL.as_secs());
         trim_old(&mut inner.connections, DEFAULT_WINDOW);
+        // Prune stale flow decisions so the relabel map stays bounded
+        // even on a router with high TCP/UDP churn.
+        let ttl_cutoff = now().saturating_sub(FLOW_DECISION_TTL.as_secs());
+        inner.flow_decisions.retain(|_, (_, ts)| *ts >= ttl_cutoff);
         let reverse_domains = inner.reverse_domains.clone();
+        let flow_decisions = inner.flow_decisions.clone();
         let mut rows = inner
             .connections
             .iter()
@@ -1589,9 +1837,26 @@ impl RoutingState {
             .cloned()
             .collect::<Vec<_>>();
         let mut seen = rows.iter().map(connection_key).collect::<HashSet<_>>();
-        for event in collect_system_connections(&reverse_domains) {
+        for mut event in collect_system_connections(&reverse_domains) {
             if is_excluded_remote(&event, excluded_remotes) {
                 continue;
+            }
+            // Re-label scraper rows from the authoritative in-memory
+            // decision map when the 5-tuple matches. Without this, the
+            // scraper's default `Snapshot` would hide the fact that
+            // sslocal handled this flow via redir/tun/proxy.
+            if let Some(dst_ip) = event.destination_ip {
+                let proto_static = match event.protocol.as_str() {
+                    "tcp" => Some("tcp"),
+                    "udp" => Some("udp"),
+                    _ => None,
+                };
+                if let Some(p) = proto_static {
+                    let key: FlowKey = (event.source_ip, event.source_port, dst_ip, event.destination_port, p);
+                    if let Some((decision, _)) = flow_decisions.get(&key) {
+                        event.decision = *decision;
+                    }
+                }
             }
             if seen.insert(connection_key(&event)) {
                 rows.push(event);
@@ -2157,7 +2422,7 @@ fn parse_conntrack_line(line: &str, reverse_domains: &HashMap<IpAddr, String>) -
         domain: reverse_domains.get(&destination_ip).cloned(),
         destination_port: destination_port?,
         protocol,
-        decision: ConnectionDecision::Direct,
+        decision: ConnectionDecision::Snapshot,
     })
 }
 
@@ -2211,7 +2476,7 @@ fn parse_proc_net_line(
         domain: reverse_domains.get(&destination_ip).cloned(),
         destination_port,
         protocol: protocol.to_owned(),
-        decision: ConnectionDecision::Direct,
+        decision: ConnectionDecision::Snapshot,
     })
 }
 
@@ -3213,6 +3478,17 @@ fn trim_old<T: Timestamped>(events: &mut VecDeque<T>, window: Duration) {
 }
 
 fn prune_dns_cache(inner: &mut RoutingInner) {
+    // Instrumentation rationale: this function is called on every
+    // DNS lookup *under the routing write lock*. If it's the actual
+    // hot-path bottleneck we suspect, the cumulative time spent here
+    // — divided by elapsed wall clock — gives the duty cycle of the
+    // routing lock spent on pruning alone. The periodic logger reports
+    // both call count and total ns, so we can divide and read off
+    // average duration too.
+    let started = Instant::now();
+    let cache_before = inner.dns_cache.len();
+    let order_before = inner.dns_cache_order.len();
+
     let now = now();
     let expired = inner
         .dns_cache
@@ -3223,6 +3499,20 @@ fn prune_dns_cache(inner: &mut RoutingInner) {
         inner.dns_cache.remove(&key);
     }
     inner.dns_cache_order.retain(|key| inner.dns_cache.contains_key(key));
+
+    let elapsed = started.elapsed();
+    PRUNE_DNS_CACHE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+    PRUNE_DNS_CACHE_TOTAL_NS.fetch_add(elapsed.as_nanos() as u64, AtomicOrdering::Relaxed);
+    if elapsed.as_millis() >= SLOW_HOT_PATH_MS {
+        warn!(
+            "prune_dns_cache slow: {}ms (cache {} -> {}, order {} -> {})",
+            elapsed.as_millis(),
+            cache_before,
+            inner.dns_cache.len(),
+            order_before,
+            inner.dns_cache_order.len(),
+        );
+    }
 }
 
 fn enforce_dns_cache_capacity(inner: &mut RoutingInner) {

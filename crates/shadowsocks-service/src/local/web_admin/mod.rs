@@ -401,7 +401,6 @@ impl WebAdminHandler {
         let url = normalize_debug_url(&url)?;
         let host = debug_url_host(&url)?;
         let started_at = unix_now();
-        self.routing_state.enable_connection_activity().await;
         let decision = self.routing_state.route_domain(&host).await;
         let cached_before = self
             .routing_state

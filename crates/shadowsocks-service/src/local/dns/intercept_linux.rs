@@ -5,6 +5,7 @@
 //! firewall mode.
 
 use std::{
+    fmt::Write as _,
     fs::{self, File},
     io::{self, Write},
     net::IpAddr,
@@ -70,29 +71,57 @@ pub fn add_route_ips(decision: RouteDecision, ips: &[IpAddr]) -> io::Result<()> 
         return Ok(());
     }
     ensure_nft_sets()?;
-    for ip in ips {
-        let set_name = match (decision, ip) {
-            (RouteDecision::Direct, IpAddr::V4(..)) => DIRECT4_SET,
-            (RouteDecision::Direct, IpAddr::V6(..)) => DIRECT6_SET,
-            (RouteDecision::Proxy, IpAddr::V4(..)) => BYPASS4_SET,
-            (RouteDecision::Proxy, IpAddr::V6(..)) => BYPASS6_SET,
-        };
-        // Ignore duplicate element errors. The rule files remain the source of truth.
-        let _ = command(
-            "nft",
-            &[
-                "add",
-                "element",
-                "inet",
-                NFT_TABLE,
-                set_name,
-                "{",
-                &ip.to_string(),
-                "}",
-            ],
-        );
+    // Build a single nft script that adds every IP in one fork+exec.
+    // Previously this was N separate `nft add element` invocations — at
+    // ~30-80ms per fork+exec on this hardware, an A record with 8 IPs
+    // could take 600ms of wall clock and saturate the tokio worker that
+    // runs the DNS handler. One `nft -f -` call handles the whole batch
+    // in roughly the cost of a single invocation.
+    let mut script = String::new();
+    for (set_name, family_ips) in nft_set_buckets(decision, ips) {
+        for chunk in family_ips.chunks(512) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let _ = write!(&mut script, "add element inet {NFT_TABLE} {set_name} {{ ");
+            for (idx, ip) in chunk.iter().enumerate() {
+                if idx > 0 {
+                    let _ = script.write_str(", ");
+                }
+                let _ = write!(&mut script, "{ip}");
+            }
+            let _ = script.write_str(" }\n");
+        }
     }
+    // `nft -f -` returns non-zero on any duplicate element. We want
+    // duplicates to be ignored (rule files are the source of truth),
+    // so map the failure to Ok — same semantics as the per-IP loop.
+    let _ = nft_apply_script(&script);
     Ok(())
+}
+
+/// Group IPs by the nft set they belong to, returning one bucket per
+/// (set_name, ipv4_or_ipv6_subset). Order is stable so the caller can
+/// build a deterministic script.
+fn nft_set_buckets(decision: RouteDecision, ips: &[IpAddr]) -> Vec<(&'static str, Vec<IpAddr>)> {
+    let v4_set = match decision {
+        RouteDecision::Direct => DIRECT4_SET,
+        RouteDecision::Proxy => BYPASS4_SET,
+    };
+    let v6_set = match decision {
+        RouteDecision::Direct => DIRECT6_SET,
+        RouteDecision::Proxy => BYPASS6_SET,
+    };
+    let v4: Vec<IpAddr> = ips.iter().copied().filter(|ip| matches!(ip, IpAddr::V4(_))).collect();
+    let v6: Vec<IpAddr> = ips.iter().copied().filter(|ip| matches!(ip, IpAddr::V6(_))).collect();
+    let mut out = Vec::with_capacity(2);
+    if !v4.is_empty() {
+        out.push((v4_set, v4));
+    }
+    if !v6.is_empty() {
+        out.push((v6_set, v6));
+    }
+    out
 }
 
 pub fn add_route_nets(decision: RouteDecision, nets: &[IpNet]) -> io::Result<()> {
@@ -129,28 +158,53 @@ pub fn remove_route_ips(decision: RouteDecision, ips: &[IpAddr]) -> io::Result<(
         return Ok(());
     }
     ensure_nft_sets()?;
-    for ip in ips {
-        let set_name = match (decision, ip) {
-            (RouteDecision::Direct, IpAddr::V4(..)) => DIRECT4_SET,
-            (RouteDecision::Direct, IpAddr::V6(..)) => DIRECT6_SET,
-            (RouteDecision::Proxy, IpAddr::V4(..)) => BYPASS4_SET,
-            (RouteDecision::Proxy, IpAddr::V6(..)) => BYPASS6_SET,
-        };
-        let _ = command(
-            "nft",
-            &[
-                "delete",
-                "element",
-                "inet",
-                NFT_TABLE,
-                set_name,
-                "{",
-                &ip.to_string(),
-                "}",
-            ],
-        );
+    // Same single-script optimisation as add_route_ips — see comment
+    // there. `delete` of a missing element returns non-zero, which we
+    // intentionally swallow.
+    let mut script = String::new();
+    for (set_name, family_ips) in nft_set_buckets(decision, ips) {
+        for chunk in family_ips.chunks(512) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let _ = write!(&mut script, "delete element inet {NFT_TABLE} {set_name} {{ ");
+            for (idx, ip) in chunk.iter().enumerate() {
+                if idx > 0 {
+                    let _ = script.write_str(", ");
+                }
+                let _ = write!(&mut script, "{ip}");
+            }
+            let _ = script.write_str(" }\n");
+        }
     }
+    let _ = nft_apply_script(&script);
     Ok(())
+}
+
+/// Single fork+exec of `nft -f -` with the given script piped on stdin.
+/// Returns Err if nft itself can't be spawned; non-zero exits are
+/// returned as Err so callers can choose to swallow them (most callers
+/// do, because duplicate-element errors are benign here).
+fn nft_apply_script(script: &str) -> io::Result<()> {
+    if script.is_empty() {
+        return Ok(());
+    }
+    let mut child = Command::new("nft")
+        .arg("-f")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(script.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("nft -f - exited with {status}")))
+    }
 }
 
 pub fn replace_route_nets(work_dir: &Path, direct: &[IpNet], bypass: &[IpNet]) -> io::Result<()> {

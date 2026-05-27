@@ -234,6 +234,238 @@ impl Server {
         let routing_state = {
             let routing_state = RoutingState::load(config.route_rules.clone()).await?;
             context.set_routing_state(routing_state.clone());
+
+            // -----------------------------------------------------------
+            // Diagnostic task #1 — periodic snapshot logger.
+            //
+            // Once a minute we read collection sizes and the cumulative
+            // hot-path counters and emit two structured lines into the
+            // log. We *also* keep the previous tick's counter values so
+            // we can print per-minute deltas — this is what tells us
+            // whether `prune_dns_cache` / nft fork+exec / sync file
+            // append are eating wall-clock under load.
+            //
+            // The task is detached: it lives for the process lifetime
+            // and is aborted cleanly when the runtime shuts down.
+            // -----------------------------------------------------------
+            tokio::spawn({
+                let state = routing_state.clone();
+                async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(60));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    // Skip the immediate first tick to avoid emitting a
+                    // useless "all zeros" snapshot during boot.
+                    interval.tick().await;
+                    let mut prev_prune_calls: u64 = 0;
+                    let mut prev_prune_ns: u64 = 0;
+                    let mut prev_nft_calls: u64 = 0;
+                    let mut prev_nft_ns: u64 = 0;
+                    let mut prev_append_calls: u64 = 0;
+                    let mut prev_append_ns: u64 = 0;
+                    let mut prev_add_calls: u64 = 0;
+                    let mut prev_add_ns: u64 = 0;
+                    let mut prev_tick = std::time::Instant::now();
+                    loop {
+                        interval.tick().await;
+                        let d = state.runtime_diagnostics().await;
+
+                        let now = std::time::Instant::now();
+                        let elapsed_ms = now.duration_since(prev_tick).as_millis().max(1);
+                        prev_tick = now;
+
+                        // Per-tick deltas. Saturating subtraction so we
+                        // can't underflow even if some future caller
+                        // resets a counter (none do today).
+                        let dprune_calls = d.prune_dns_cache_calls.saturating_sub(prev_prune_calls);
+                        let dprune_ns = d.prune_dns_cache_total_ns.saturating_sub(prev_prune_ns);
+                        let dnft_calls = d.nft_invocations.saturating_sub(prev_nft_calls);
+                        let dnft_ns = d.nft_total_ns.saturating_sub(prev_nft_ns);
+                        let dappend_calls = d.append_lines_calls.saturating_sub(prev_append_calls);
+                        let dappend_ns = d.append_lines_total_ns.saturating_sub(prev_append_ns);
+                        let dadd_calls = d.add_dns_results_calls.saturating_sub(prev_add_calls);
+                        let dadd_ns = d.add_dns_results_total_ns.saturating_sub(prev_add_ns);
+
+                        prev_prune_calls = d.prune_dns_cache_calls;
+                        prev_prune_ns = d.prune_dns_cache_total_ns;
+                        prev_nft_calls = d.nft_invocations;
+                        prev_nft_ns = d.nft_total_ns;
+                        prev_append_calls = d.append_lines_calls;
+                        prev_append_ns = d.append_lines_total_ns;
+                        prev_add_calls = d.add_dns_results_calls;
+                        prev_add_ns = d.add_dns_results_total_ns;
+
+                        // Wall-clock duty cycle: how many ms out of the
+                        // tick window did each hot path occupy. >100ms /
+                        // 60_000ms ≈ 0.17% so we can spot >1% trivially.
+                        let dprune_ms = dprune_ns / 1_000_000;
+                        let dnft_ms = dnft_ns / 1_000_000;
+                        let dappend_ms = dappend_ns / 1_000_000;
+                        let dadd_ms = dadd_ns / 1_000_000;
+
+                        log::info!(
+                            "routing diagnostics: dns_cache={}/{} order={} ttl={}s \
+                             dns_events={} conns={} flow_dec={} reverse={} unhit_ip={} unhit_dom={} \
+                             persist_direct_ip={} persist_bypass_ip={} \
+                             tmp_direct_ip={} tmp_bypass_ip={}",
+                            d.dns_cache_size,
+                            d.dns_cache_capacity,
+                            d.dns_cache_order_len,
+                            d.dns_cache_ttl_seconds,
+                            d.dns_events,
+                            d.connections,
+                            d.flow_decisions,
+                            d.reverse_domains,
+                            d.unhit_ips,
+                            d.unhit_domains,
+                            d.persistent_direct_ip,
+                            d.persistent_bypass_ip,
+                            d.temporary_direct_ip,
+                            d.temporary_bypass_ip,
+                        );
+                        log::info!(
+                            "routing hot-paths (last {}ms): \
+                             prune calls={} time={}ms | \
+                             nft invocations={} time={}ms | \
+                             append calls={} time={}ms | \
+                             add_dns_results calls={} time={}ms",
+                            elapsed_ms,
+                            dprune_calls,
+                            dprune_ms,
+                            dnft_calls,
+                            dnft_ms,
+                            dappend_calls,
+                            dappend_ms,
+                            dadd_calls,
+                            dadd_ms,
+                        );
+                    }
+                }
+            });
+
+            // -----------------------------------------------------------
+            // Diagnostic task #2 — passive routing-lock health probe.
+            //
+            // Every 5s we attempt a *read* lock with a 2s timeout. If
+            // the lock isn't granted in 2s, the routing RwLock is
+            // effectively wedged: some writer is holding it for >2s,
+            // which on this hardware means a thread is blocked on disk
+            // I/O, a stuck `nft` subprocess, or a deadlock. The probe
+            // is read-only and never blocks any other path, so it's
+            // safe to leave on in production.
+            //
+            // The lock-wait latency itself is logged whenever it
+            // exceeds 50ms — at that point we know writers are
+            // dominating the lock and the next forensic step is to
+            // check the hot-path delta logger above.
+            // -----------------------------------------------------------
+            tokio::spawn({
+                let state = routing_state.clone();
+                async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(5));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        interval.tick().await;
+                        let started = std::time::Instant::now();
+                        match tokio::time::timeout(
+                            Duration::from_secs(2),
+                            state.runtime_diagnostics(),
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                let waited = started.elapsed();
+                                if waited >= Duration::from_millis(50) {
+                                    log::warn!(
+                                        "routing read probe took {}ms (lock contended)",
+                                        waited.as_millis()
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                log::error!(
+                                    "routing read probe TIMED OUT (>2s) — write lock is wedged \
+                                     or runtime is starved; check sslocal-probe diagnostics dump"
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+
+            // -----------------------------------------------------------
+            // Diagnostic task #3 — SIGUSR1 force-dump.
+            //
+            // The OpenWrt-side probe script (sslocal-probe.sh) sends
+            // SIGUSR1 to sslocal the moment it detects 5 consecutive
+            // 2-second timeouts on www.google.com via the transparent
+            // proxy. On receipt we (a) immediately emit a full
+            // diagnostic snapshot at error level so it's hard to miss
+            // when grepping the log, and (b) try a non-blocking 1.5s
+            // read-lock attempt so we can tell — at the exact moment
+            // probes started failing — whether the routing lock was
+            // already stuck.
+            // -----------------------------------------------------------
+            #[cfg(unix)]
+            tokio::spawn({
+                let state = routing_state.clone();
+                async move {
+                    let mut sig =
+                        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                        {
+                            Ok(s) => s,
+                            Err(err) => {
+                                log::warn!("failed to install SIGUSR1 handler: {}", err);
+                                return;
+                            }
+                        };
+                    log::info!("SIGUSR1 routing-state dump handler installed");
+                    while sig.recv().await.is_some() {
+                        let started = std::time::Instant::now();
+                        let snapshot =
+                            tokio::time::timeout(Duration::from_millis(1500), state.runtime_diagnostics())
+                                .await;
+                        let waited_ms = started.elapsed().as_millis();
+                        match snapshot {
+                            Ok(d) => log::error!(
+                                "SIGUSR1 dump (lock waited {}ms): \
+                                 dns_cache={}/{} order={} \
+                                 dns_events={} conns={} flow_dec={} reverse={} \
+                                 persist_direct_ip={} persist_bypass_ip={} \
+                                 tmp_direct_ip={} tmp_bypass_ip={} | \
+                                 cumulative: prune calls={} time_ns={} | \
+                                 nft invocations={} time_ns={} | \
+                                 append calls={} time_ns={} | \
+                                 add_dns_results calls={} time_ns={}",
+                                waited_ms,
+                                d.dns_cache_size,
+                                d.dns_cache_capacity,
+                                d.dns_cache_order_len,
+                                d.dns_events,
+                                d.connections,
+                                d.flow_decisions,
+                                d.reverse_domains,
+                                d.persistent_direct_ip,
+                                d.persistent_bypass_ip,
+                                d.temporary_direct_ip,
+                                d.temporary_bypass_ip,
+                                d.prune_dns_cache_calls,
+                                d.prune_dns_cache_total_ns,
+                                d.nft_invocations,
+                                d.nft_total_ns,
+                                d.append_lines_calls,
+                                d.append_lines_total_ns,
+                                d.add_dns_results_calls,
+                                d.add_dns_results_total_ns,
+                            ),
+                            Err(_) => log::error!(
+                                "SIGUSR1 dump: routing read lock timed out after 1.5s — \
+                                 writer holding the lock for >1.5s"
+                            ),
+                        }
+                    }
+                }
+            });
+
             routing_state
         };
 
