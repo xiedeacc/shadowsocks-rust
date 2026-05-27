@@ -98,12 +98,15 @@ worker() {
 		# the router's transparent-redirect path, not whatever HTTP/SOCKS
 		# proxy Cursor / the shell happens to have exported.
 		local out
+		# NOTE: deliberately do NOT pass --dns-servers. Most distro curl
+		# builds lack c-ares and reject the flag at argv parse, silently
+		# turning every iteration into ERR. Rely on /etc/resolv.conf — on
+		# a LAN client of the OpenWrt that already points at the router.
 		out=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
 			-u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
 			curl -sS -k -o /dev/null \
 			--connect-timeout "$CONNECT_TIMEOUT" \
 			--max-time "$MAX_TIME" \
-			--dns-servers "$ROUTER" \
 			-w '%{http_code} %{remote_ip} %{time_total}' \
 			"https://$dom/" 2>/dev/null || echo "ERR - -")
 		printf '%(%H:%M:%S)T w=%d iter=%d dom=%s out=%s\n' \
