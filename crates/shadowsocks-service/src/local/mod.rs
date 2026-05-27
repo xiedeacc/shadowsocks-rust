@@ -569,6 +569,20 @@ impl Server {
         #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
         let dns_intercept_mode = config.route_rules.dns_intercept_mode.clone();
 
+        // If the active config does NOT request firewall-mode DNS
+        // interception, scrub any leftover `inet ssrust_dns` nft table
+        // from a previous run. Drop-based cleanup only fires on graceful
+        // shutdown; procd SIGKILL-on-timeout, panics, and power loss all
+        // skip it and would otherwise leave every DNS query redirected
+        // to a port nothing is listening on (= no internet at all).
+        #[cfg(all(feature = "local-dns", target_os = "linux"))]
+        {
+            let mode = config.route_rules.dns_intercept_mode.as_str();
+            if mode != "firewall" && mode != "both" {
+                self::dns::intercept_linux::cleanup_stale_nft_table();
+            }
+        }
+
         // Derive runtime DNS endpoints (domestic / foreign upstreams +
         // listen address) from the *first* `protocol: dns` listener.
         // Used by:

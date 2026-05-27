@@ -33,6 +33,19 @@ APPLY_SYSCTL="${APPLY_SYSCTL:-1}"
 NOFILE_LIMIT="${NOFILE_LIMIT:-1048576}"
 CLEAN_LOGS="${CLEAN_LOGS:-1}"
 
+CLEANUP_ONLY=0
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--cleanup|--cleanup-nft)
+			CLEANUP_ONLY=1; shift ;;
+		-h|--help)
+			sed -n '2,/^set -euo pipefail/p' "$0"
+			printf '\nFlags:\n  --cleanup    stop services and wipe the inet ssrust_dns nft table + iptables remnants, then exit.\n'
+			exit 0 ;;
+		*) printf 'unknown arg: %s\n' "$1" >&2; exit 2 ;;
+	esac
+done
+
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
 	SUDO=()
 else
@@ -40,6 +53,53 @@ else
 fi
 
 log() { printf '[deploy] %s\n' "$*"; }
+
+# Best-effort wipe of any firewall remnants left behind by a previous
+# sslocal run (table inet ssrust_dns + the legacy iptables DNS-redirect
+# rules). Safe to run any number of times; missing tables / rules are
+# silently ignored. We stop the services first so the running process
+# cannot recreate the table mid-flush.
+cleanup_firewall_state() {
+	log "stopping services before firewall cleanup"
+	"${SUDO[@]}" systemctl stop "$PROBE_SERVICE_NAME.service" >/dev/null 2>&1 || true
+	"${SUDO[@]}" systemctl stop "$WATCH_SERVICE_NAME.service" >/dev/null 2>&1 || true
+	"${SUDO[@]}" systemctl stop "$SERVICE_NAME.service"       >/dev/null 2>&1 || true
+
+	if command -v nft >/dev/null 2>&1; then
+		if "${SUDO[@]}" nft list table inet ssrust_dns >/dev/null 2>&1; then
+			log "deleting nft table: inet ssrust_dns"
+			"${SUDO[@]}" nft delete table inet ssrust_dns || true
+		else
+			log "no stale nft table inet ssrust_dns"
+		fi
+	else
+		log "nft not installed; skipping nftables cleanup"
+	fi
+
+	# iptables fallback path: remove every rule referencing 127.0.0.1:5353
+	# (or whatever DNS port the previous run picked up). Match by jump
+	# target prefix DNAT/REDIRECT + dport 53 in the nat OUTPUT/PREROUTING
+	# chains. Silent if iptables is absent or no rule matches.
+	if command -v iptables >/dev/null 2>&1; then
+		for chain in OUTPUT PREROUTING; do
+			while "${SUDO[@]}" iptables -t nat -L "$chain" -n --line-numbers 2>/dev/null \
+				| awk '/dpt:53/ && (/REDIRECT|DNAT/) {print $1; exit}' \
+				| grep -q .; do
+				line=$("${SUDO[@]}" iptables -t nat -L "$chain" -n --line-numbers 2>/dev/null \
+					| awk '/dpt:53/ && (/REDIRECT|DNAT/) {print $1; exit}')
+				[[ -z "$line" ]] && break
+				log "iptables -t nat -D $chain $line"
+				"${SUDO[@]}" iptables -t nat -D "$chain" "$line" || break
+			done
+		done
+	fi
+}
+
+if [[ "$CLEANUP_ONLY" = 1 ]]; then
+	cleanup_firewall_state
+	log "cleanup complete; not redeploying. Run without --cleanup to redeploy."
+	exit 0
+fi
 
 # Install if missing — never overwrite. Used for everything except the
 # sslocal binary itself.

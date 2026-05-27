@@ -14,6 +14,31 @@ FEATURES="${FEATURES:-full local-web-admin local-http-rustls}"
 TARGET_TRIPLE="${TARGET_TRIPLE:-}"
 OPENWRT_TOOLCHAIN="${OPENWRT_TOOLCHAIN:-}"
 DISABLE_LEGACY="${DISABLE_LEGACY:-0}"
+CLEANUP_ONLY=0
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--cleanup|--cleanup-nft)
+			CLEANUP_ONLY=1; shift ;;
+		-h|--help)
+			cat <<'EOF'
+deploy_openwrt.sh — cross-build sslocal and push it to the OpenWrt router.
+
+Flags:
+  --cleanup    SSH to the router, stop /etc/init.d/shadowsocks-rust,
+               flush the inet ssrust_dns nft table + iptables remnants,
+               then exit without rebuilding/redeploying.
+
+Env knobs:
+  HOST=root@192.168.2.1   SSH_PORT=10022
+  REMOTE_DIR=/usr/local/shadowsocks
+  SERVICE_NAME=shadowsocks-rust
+  TARGET_TRIPLE / OPENWRT_TOOLCHAIN / FEATURES / DISABLE_LEGACY
+EOF
+			exit 0 ;;
+		*) printf 'unknown arg: %s\n' "$1" >&2; exit 2 ;;
+	esac
+done
 
 # Known toolchain search roots, in preference order:
 #   1. OpenWrt SDK toolchain (exact ABI match for the target device)
@@ -30,6 +55,49 @@ ssh_cmd() {
 scp_cmd() {
 	scp -O -P "$SSH_PORT" "$@"
 }
+
+# Best-effort cleanup of leftover sslocal firewall state on the router:
+#   * stop /etc/init.d/shadowsocks-rust so it can't recreate the table
+#     while we're flushing,
+#   * delete `inet ssrust_dns` (the only nft table sslocal ever creates),
+#   * delete any iptables nat rules redirecting dport 53 to localhost
+#     (the iptables fallback path uses these).
+# Idempotent; missing services / tables / rules are silently ignored.
+cleanup_remote_firewall() {
+	ssh_cmd "set -e
+		if [ -x /etc/init.d/$SERVICE_NAME ]; then
+			echo '[cleanup] stopping $SERVICE_NAME'
+			/etc/init.d/$SERVICE_NAME stop 2>/dev/null || true
+		fi
+		if command -v nft >/dev/null 2>&1; then
+			if nft list table inet ssrust_dns >/dev/null 2>&1; then
+				echo '[cleanup] deleting nft table inet ssrust_dns'
+				nft delete table inet ssrust_dns || true
+			else
+				echo '[cleanup] no stale nft table inet ssrust_dns'
+			fi
+		fi
+		if command -v iptables >/dev/null 2>&1; then
+			for chain in OUTPUT PREROUTING; do
+				while iptables -t nat -L \$chain -n --line-numbers 2>/dev/null \
+					| awk '/dpt:53/ && (/REDIRECT|DNAT/) {print \$1; exit}' | grep -q .; do
+					line=\$(iptables -t nat -L \$chain -n --line-numbers 2>/dev/null \
+						| awk '/dpt:53/ && (/REDIRECT|DNAT/) {print \$1; exit}')
+					[ -z \"\$line\" ] && break
+					echo \"[cleanup] iptables -t nat -D \$chain \$line\"
+					iptables -t nat -D \$chain \$line || break
+				done
+			done
+		fi
+		echo '[cleanup] done'
+	"
+}
+
+if [[ "$CLEANUP_ONLY" = 1 ]]; then
+	cleanup_remote_firewall
+	printf 'Cleanup complete on %s. Run without --cleanup to redeploy.\n' "$HOST"
+	exit 0
+fi
 
 detect_target() {
 	local arch
