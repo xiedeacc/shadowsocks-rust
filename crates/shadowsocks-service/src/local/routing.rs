@@ -672,7 +672,7 @@ impl RoutingState {
                     }
                 }
             }
-            rebuild_conflicts(&mut inner);
+            rebuild_ip_conflicts(&mut inner);
             additions
         };
         warn!(
@@ -1790,9 +1790,12 @@ fn refresh_rule_files_from_disk_inner(inner: &mut RoutingInner) -> io::Result<()
 }
 
 fn rebuild_conflicts(inner: &mut RoutingInner) {
-    inner.ip_conflicts.clear();
-    inner.domain_conflicts.clear();
+    rebuild_ip_conflicts(inner);
+    rebuild_domain_conflicts(inner);
+}
 
+fn rebuild_ip_conflicts(inner: &mut RoutingInner) {
+    inner.ip_conflicts.clear();
     for rule in ip_net_conflicts(&inner.persistent.direct_ip, &inner.persistent.bypass_ip) {
         push_event(
             &mut inner.ip_conflicts,
@@ -1816,7 +1819,10 @@ fn rebuild_conflicts(inner: &mut RoutingInner) {
             ),
         );
     }
+}
 
+fn rebuild_domain_conflicts(inner: &mut RoutingInner) {
+    inner.domain_conflicts.clear();
     for rule in domain_rule_conflicts(&inner.persistent.direct_domain, &inner.persistent.bypass_domain) {
         push_event(
             &mut inner.domain_conflicts,
@@ -1859,23 +1865,103 @@ fn ip_nets_overlap(left: &IpNet, right: &IpNet) -> bool {
 }
 
 fn ip_net_conflicts(direct: &[IpNet], bypass: &[IpNet]) -> Vec<String> {
-    let mut conflicts = Vec::new();
-    for direct in direct {
-        for bypass in bypass {
-            if ip_nets_overlap(direct, bypass) {
-                let direct = display_ip_net(direct);
-                let bypass = display_ip_net(bypass);
-                conflicts.push(if direct == bypass {
-                    direct
-                } else {
-                    format!("{direct} <-> {bypass}")
-                });
-            }
+    let mut direct_v4 = Vec::new();
+    let mut direct_v6 = Vec::new();
+    let mut bypass_v4 = Vec::new();
+    let mut bypass_v6 = Vec::new();
+    for net in direct {
+        let range = ip_net_range(net);
+        if range.is_v4 {
+            direct_v4.push(range);
+        } else {
+            direct_v6.push(range);
         }
     }
+    for net in bypass {
+        let range = ip_net_range(net);
+        if range.is_v4 {
+            bypass_v4.push(range);
+        } else {
+            bypass_v6.push(range);
+        }
+    }
+
+    let mut conflicts = ip_range_conflicts(direct_v4, bypass_v4);
+    conflicts.extend(ip_range_conflicts(direct_v6, bypass_v6));
     conflicts.sort_unstable();
     conflicts.dedup();
     conflicts
+}
+
+#[derive(Clone, Debug)]
+struct IpRange {
+    start: u128,
+    end: u128,
+    label: String,
+    is_v4: bool,
+}
+
+fn ip_net_range(net: &IpNet) -> IpRange {
+    match net {
+        IpNet::V4(net) => {
+            let start = u32::from(net.network()) as u128;
+            IpRange {
+                start,
+                end: ip_range_end(start, 32, net.prefix_len()),
+                label: display_ip_net(&IpNet::V4(*net)),
+                is_v4: true,
+            }
+        }
+        IpNet::V6(net) => {
+            let start = u128::from(net.network());
+            IpRange {
+                start,
+                end: ip_range_end(start, 128, net.prefix_len()),
+                label: display_ip_net(&IpNet::V6(*net)),
+                is_v4: false,
+            }
+        }
+    }
+}
+
+fn ip_range_end(start: u128, bits: u8, prefix_len: u8) -> u128 {
+    let host_bits = bits.saturating_sub(prefix_len);
+    if host_bits == 0 {
+        start
+    } else if host_bits >= 128 {
+        u128::MAX
+    } else {
+        start | ((1u128 << host_bits) - 1)
+    }
+}
+
+fn ip_range_conflicts(mut direct: Vec<IpRange>, mut bypass: Vec<IpRange>) -> Vec<String> {
+    direct.sort_unstable_by_key(|range| (range.start, range.end));
+    bypass.sort_unstable_by_key(|range| (range.start, range.end));
+
+    let mut conflicts = Vec::new();
+    let mut first_possible = 0usize;
+    for direct in &direct {
+        while first_possible < bypass.len() && bypass[first_possible].end < direct.start {
+            first_possible += 1;
+        }
+        let mut idx = first_possible;
+        while idx < bypass.len() && bypass[idx].start <= direct.end {
+            if bypass[idx].end >= direct.start {
+                conflicts.push(format_ip_conflict(&direct.label, &bypass[idx].label));
+            }
+            idx += 1;
+        }
+    }
+    conflicts
+}
+
+fn format_ip_conflict(direct: &str, bypass: &str) -> String {
+    if direct == bypass {
+        direct.to_owned()
+    } else {
+        format!("{direct} <-> {bypass}")
+    }
 }
 
 fn display_ip_net(net: &IpNet) -> String {
@@ -3028,6 +3114,24 @@ mod tests {
                 && conflict.regions == ["direct".to_owned(), "bypass".to_owned()]
                 && conflict.sources == [DIRECT_IP_FILE.to_owned(), BYPASS_IP_FILE.to_owned()]
         }));
+    }
+
+    #[test]
+    fn ip_conflicts_handle_exact_and_cidr_overlaps() {
+        let direct = vec![
+            parse_ip_net("203.0.113.10").unwrap(),
+            parse_ip_net("2001:db8:1::/48").unwrap(),
+        ];
+        let bypass = vec![
+            parse_ip_net("203.0.113.0/24").unwrap(),
+            parse_ip_net("2001:db8:1:1::1").unwrap(),
+            parse_ip_net("198.51.100.0/24").unwrap(),
+        ];
+
+        let conflicts = ip_net_conflicts(&direct, &bypass);
+        assert!(conflicts.contains(&"203.0.113.10 <-> 203.0.113.0/24".to_owned()));
+        assert!(conflicts.contains(&"2001:db8:1::/48 <-> 2001:db8:1:1::1".to_owned()));
+        assert_eq!(conflicts.len(), 2);
     }
 
     #[tokio::test]
