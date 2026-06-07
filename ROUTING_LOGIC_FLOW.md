@@ -56,7 +56,8 @@ flowchart TD
 
 IP rules handle exact IPs and CIDRs. `direct_ip.txt` has priority over
 `bypass_ip.txt`, including CIDR overlaps. `bypass_ip.txt` may include an
-optional second domain column, and routing uses the first IP/CIDR column.
+optional second domain column, stores one row per IP/CIDR, and routing uses the
+first IP/CIDR column.
 
 ## Source Update And Reindex
 

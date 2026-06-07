@@ -631,13 +631,25 @@ impl RoutingState {
                     }
                     RouteDecision::Proxy => {
                         let line = format_bypass_ip_domain_line(ip, domain);
-                        if !inner
+                        match inner
                             .persistent_raw
                             .bypass_ip
                             .iter()
-                            .any(|rule| bypass_ip_domain_line_matches(rule, ip, domain))
+                            .position(|rule| bypass_ip_line_matches_ip(rule, ip))
                         {
-                            lines.push(line);
+                            Some(idx) => {
+                                if bypass_ip_line_domain(&inner.persistent_raw.bypass_ip[idx]).is_none() {
+                                    inner.persistent_raw.bypass_ip[idx] = line;
+                                    inner.bypass_ip_dirty = true;
+                                    if !inner.bypass_ip_persist_scheduled {
+                                        inner.bypass_ip_persist_scheduled = true;
+                                        schedule_bypass_persist = true;
+                                    }
+                                }
+                            }
+                            None => {
+                                lines.push(line);
+                            }
                         }
                         if !target_exists {
                             additions.push(*ip);
@@ -2210,19 +2222,16 @@ fn format_bypass_ip_domain_line(ip: &IpAddr, domain: &str) -> String {
     }
 }
 
-fn bypass_ip_domain_line_matches(rule: &str, ip: &IpAddr, domain: &str) -> bool {
+fn bypass_ip_line_matches_ip(rule: &str, ip: &IpAddr) -> bool {
     let Some(rule_net) = parse_ip_net(rule) else {
         return false;
     };
-    if !rule_net.contains(ip) {
-        return false;
-    }
-    let rule_domain = rule
-        .split_whitespace()
-        .nth(1)
-        .map(normalize_dns_domain)
-        .unwrap_or_default();
-    rule_domain == normalize_dns_domain(domain)
+    rule_net.contains(ip)
+}
+
+fn bypass_ip_line_domain(rule: &str) -> Option<String> {
+    let domain = rule.split_whitespace().nth(1).map(normalize_dns_domain)?;
+    (!domain.is_empty()).then_some(domain)
 }
 
 #[derive(Clone, Debug)]
@@ -2478,12 +2487,23 @@ fn normalize_rule_lists(lists: RuleLists) -> RuleLists {
 }
 
 fn normalize_bypass_ip_lines(lines: Vec<String>) -> Vec<String> {
-    let mut lines: Vec<_> = lines
-        .into_iter()
-        .filter_map(|line| normalize_bypass_ip_line(&line))
-        .collect();
+    let mut by_ip = HashMap::new();
+    for line in lines {
+        let Some(line) = normalize_bypass_ip_line(&line) else {
+            continue;
+        };
+        let Some(ip) = ip_rule_value(&line).map(ToOwned::to_owned) else {
+            continue;
+        };
+        let replace = by_ip.get(&ip).is_none_or(|current: &String| {
+            bypass_ip_line_domain(current).is_none() && bypass_ip_line_domain(&line).is_some()
+        });
+        if replace {
+            by_ip.insert(ip, line);
+        }
+    }
+    let mut lines = by_ip.into_values().collect::<Vec<_>>();
     lines.sort_unstable();
-    lines.dedup();
     lines
 }
 
@@ -3227,7 +3247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dns_learned_bypass_ip_records_multiple_domains_for_same_ip() {
+    async fn dns_learned_bypass_ip_records_once_for_same_ip() {
         let dir = temp_rules_dir("dns-learned-domain-column");
         write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
         write_lines_atomic(dir.join(BYPASS_IP_FILE), &[]).unwrap();
@@ -3253,7 +3273,34 @@ mod tests {
 
         let lines = read_lines(dir.join(BYPASS_IP_FILE)).unwrap();
         assert!(lines.contains(&"203.0.113.10 a.example.com".to_owned()));
-        assert!(lines.contains(&"203.0.113.10 b.example.com".to_owned()));
+        assert!(!lines.contains(&"203.0.113.10 b.example.com".to_owned()));
+        assert_eq!(lines.iter().filter(|line| parse_ip_addr(line) == Some(ip)).count(), 1);
+        assert_eq!(state.route_ip(&ip).await, Some(RouteDecision::Proxy));
+    }
+
+    #[tokio::test]
+    async fn dns_learned_bypass_ip_upgrades_legacy_one_column_row() {
+        let dir = temp_rules_dir("dns-learned-upgrade");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_IP_FILE), &["203.0.113.10".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+        let ip = "203.0.113.10".parse().unwrap();
+
+        state
+            .add_dns_results(RouteDecision::Proxy, "a.example.com.", &[ip])
+            .await
+            .unwrap();
+        state.persist_bypass_ip_if_dirty().await;
+
+        let lines = read_lines(dir.join(BYPASS_IP_FILE)).unwrap();
+        assert_eq!(lines, vec!["203.0.113.10 a.example.com".to_owned()]);
         assert_eq!(state.route_ip(&ip).await, Some(RouteDecision::Proxy));
     }
 
