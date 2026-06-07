@@ -8,7 +8,9 @@ Route rule generation uses only two downloaded source files:
 
 `direct_domain.txt` is preserved as a local rule file. It is not generated from
 downloaded source lists. `bypass_ip.txt` is preserved as the runtime learned IP
-file populated from remote DNS answers for bypass domains.
+file populated from remote DNS answers for bypass domains. Runtime learned rows
+use `IP_OR_CIDR domain`, for example `142.250.72.14 www.google.com`; old
+one-column IP/CIDR rows remain valid.
 
 Temporary admin rules are persisted in:
 

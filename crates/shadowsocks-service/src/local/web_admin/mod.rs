@@ -1046,7 +1046,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
               <label>Bypass Domain<textarea id="tmp_bypass_domain"></textarea></label>
             </fieldset>
           </div>
-          <p class="hint" style="padding:0 9px 9px">Temporary lists have priority over generated direct/bypass files. 一行一个配置，无需分隔符。</p>
+          <p class="hint" style="padding:0 9px 9px">Temporary lists have priority over generated direct/bypass files. bypass_ip supports "IP_OR_CIDR domain"; old one-column rows still work.</p>
         </div>
       </div>
     </div>

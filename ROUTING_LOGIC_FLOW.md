@@ -14,7 +14,7 @@ flowchart TD
     E --> F[DIRECT wins]
     D -- no --> F
     C -- no --> G{Temporary bypass_domain.temp matches?}
-    G -- yes --> H[PROXY: use remote DNS, add resolved IPs to bypass_ip.txt]
+    G -- yes --> H[PROXY: use remote DNS, add resolved IP/domain rows to bypass_ip.txt]
     G -- no --> I{direct_domain.txt matches?}
     I -- yes --> J{bypass_domain.txt also matches?}
     J -- yes --> K[Record Domain Conflict]
@@ -55,7 +55,8 @@ flowchart TD
 ```
 
 IP rules handle exact IPs and CIDRs. `direct_ip.txt` has priority over
-`bypass_ip.txt`, including CIDR overlaps.
+`bypass_ip.txt`, including CIDR overlaps. `bypass_ip.txt` may include an
+optional second domain column, and routing uses the first IP/CIDR column.
 
 ## Source Update And Reindex
 
@@ -98,9 +99,9 @@ flowchart TD
     J --> L[Admin Domain Conflicts]
 ```
 
-IP conflict checks use CIDR overlap. Domain conflict checks use exact, subdomain,
-and wildcard overlap matching. Single-label rules do not act as top-level-domain
-wildcards.
+IP conflict checks use CIDR overlap and read the first IP/CIDR column from
+`bypass_ip.txt`. Domain conflict checks use exact, subdomain, and wildcard
+overlap matching. Single-label rules do not act as top-level-domain wildcards.
 
 ## Debug URL
 

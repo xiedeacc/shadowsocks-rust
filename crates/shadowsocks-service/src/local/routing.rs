@@ -607,6 +607,7 @@ impl RoutingState {
         let additions = {
             let mut inner = self.inner.write().await;
             let mut additions = Vec::new();
+            let mut lines = Vec::new();
             for ip in results {
                 let target_exists = match decision {
                     RouteDecision::Direct => {
@@ -616,20 +617,37 @@ impl RoutingState {
                         compiled_rules_match_ip(&inner.persistent.bypass_ip_exact, &inner.persistent.bypass_ip, ip)
                     }
                 };
-                if target_exists {
-                    continue;
+                match decision {
+                    RouteDecision::Direct => {
+                        if target_exists {
+                            continue;
+                        }
+                        additions.push(*ip);
+                        lines.push(ip.to_string());
+                    }
+                    RouteDecision::Proxy => {
+                        let line = format_bypass_ip_domain_line(ip, domain);
+                        if !inner
+                            .persistent_raw
+                            .bypass_ip
+                            .iter()
+                            .any(|rule| bypass_ip_domain_line_matches(rule, ip, domain))
+                        {
+                            lines.push(line);
+                        }
+                        if !target_exists {
+                            additions.push(*ip);
+                        }
+                    }
                 }
-
-                additions.push(*ip);
             }
 
-            if additions.is_empty() {
+            if lines.is_empty() && additions.is_empty() {
                 let elapsed = total_start.elapsed();
                 ADD_DNS_RESULTS_TOTAL_NS.fetch_add(elapsed.as_nanos() as u64, AtomicOrdering::Relaxed);
                 return Ok(());
             }
 
-            let lines = additions.iter().map(ToString::to_string).collect::<Vec<_>>();
             match decision {
                 RouteDecision::Direct => {
                     // append_lines is a *blocking* file write done while
@@ -766,7 +784,7 @@ impl RoutingState {
             inner.bypass_ip_dirty = false;
             (
                 inner.rules_dir.join(BYPASS_IP_FILE),
-                normalize_lines(inner.persistent_raw.bypass_ip.clone()),
+                normalize_bypass_ip_lines(inner.persistent_raw.bypass_ip.clone()),
             )
         };
 
@@ -2131,7 +2149,7 @@ fn wildcard_domain_matches(pattern: &str, value: &str) -> bool {
 fn compile_rules(raw: &RuleLists) -> CompiledRules {
     CompiledRules {
         direct_ip: raw.direct_ip.iter().filter_map(|s| parse_ip_net(s)).collect(),
-        direct_ip_exact: raw.direct_ip.iter().filter_map(|s| s.parse::<IpAddr>().ok()).collect(),
+        direct_ip_exact: raw.direct_ip.iter().filter_map(|s| parse_ip_addr(s)).collect(),
         direct_domain: raw
             .direct_domain
             .iter()
@@ -2139,7 +2157,7 @@ fn compile_rules(raw: &RuleLists) -> CompiledRules {
             .filter(|s| !s.is_empty())
             .collect(),
         bypass_ip: raw.bypass_ip.iter().filter_map(|s| parse_ip_net(s)).collect(),
-        bypass_ip_exact: raw.bypass_ip.iter().filter_map(|s| s.parse::<IpAddr>().ok()).collect(),
+        bypass_ip_exact: raw.bypass_ip.iter().filter_map(|s| parse_ip_addr(s)).collect(),
         bypass_domain: raw
             .bypass_domain
             .iter()
@@ -2150,10 +2168,43 @@ fn compile_rules(raw: &RuleLists) -> CompiledRules {
 }
 
 fn parse_ip_net(value: &str) -> Option<IpNet> {
+    let value = ip_rule_value(value)?;
     if let Ok(net) = value.parse::<IpNet>() {
         return Some(net);
     }
     value.parse::<IpAddr>().ok().map(IpNet::from)
+}
+
+fn parse_ip_addr(value: &str) -> Option<IpAddr> {
+    ip_rule_value(value)?.parse::<IpAddr>().ok()
+}
+
+fn ip_rule_value(value: &str) -> Option<&str> {
+    value.split_whitespace().next().filter(|value| !value.is_empty())
+}
+
+fn format_bypass_ip_domain_line(ip: &IpAddr, domain: &str) -> String {
+    let domain = normalize_dns_domain(domain);
+    if domain.is_empty() {
+        ip.to_string()
+    } else {
+        format!("{ip} {domain}")
+    }
+}
+
+fn bypass_ip_domain_line_matches(rule: &str, ip: &IpAddr, domain: &str) -> bool {
+    let Some(rule_net) = parse_ip_net(rule) else {
+        return false;
+    };
+    if !rule_net.contains(ip) {
+        return false;
+    }
+    let rule_domain = rule
+        .split_whitespace()
+        .nth(1)
+        .map(normalize_dns_domain)
+        .unwrap_or_default();
+    rule_domain == normalize_dns_domain(domain)
 }
 
 #[derive(Clone, Debug)]
@@ -2403,9 +2454,31 @@ fn normalize_rule_lists(lists: RuleLists) -> RuleLists {
     RuleLists {
         direct_ip: normalize_lines(lists.direct_ip),
         direct_domain: normalize_domains(lists.direct_domain),
-        bypass_ip: normalize_lines(lists.bypass_ip),
+        bypass_ip: normalize_bypass_ip_lines(lists.bypass_ip),
         bypass_domain: normalize_domains(lists.bypass_domain),
     }
+}
+
+fn normalize_bypass_ip_lines(lines: Vec<String>) -> Vec<String> {
+    let mut lines: Vec<_> = lines
+        .into_iter()
+        .filter_map(|line| normalize_bypass_ip_line(&line))
+        .collect();
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
+fn normalize_bypass_ip_line(line: &str) -> Option<String> {
+    let mut parts = line.split_whitespace();
+    let ip = parts.next()?;
+    parse_ip_net(ip)?;
+    let domain = parts.next().map(normalize_dns_domain).unwrap_or_default();
+    Some(if domain.is_empty() {
+        ip.to_owned()
+    } else {
+        format!("{ip} {domain}")
+    })
 }
 
 fn with_private_direct_rules(mut lists: RuleLists) -> RuleLists {
@@ -3102,7 +3175,7 @@ mod tests {
         assert!(
             read_lines(dir.join(BYPASS_IP_FILE))
                 .unwrap()
-                .contains(&"203.0.113.10".to_owned())
+                .contains(&"203.0.113.10 www.example.com".to_owned())
         );
         assert_eq!(
             state.route_ip(&"203.0.113.10".parse().unwrap()).await,
@@ -3114,6 +3187,37 @@ mod tests {
                 && conflict.regions == ["direct".to_owned(), "bypass".to_owned()]
                 && conflict.sources == [DIRECT_IP_FILE.to_owned(), BYPASS_IP_FILE.to_owned()]
         }));
+    }
+
+    #[tokio::test]
+    async fn dns_learned_bypass_ip_records_multiple_domains_for_same_ip() {
+        let dir = temp_rules_dir("dns-learned-domain-column");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+        let ip = "203.0.113.10".parse().unwrap();
+
+        state
+            .add_dns_results(RouteDecision::Proxy, "a.example.com.", &[ip])
+            .await
+            .unwrap();
+        state
+            .add_dns_results(RouteDecision::Proxy, "b.example.com.", &[ip])
+            .await
+            .unwrap();
+        state.persist_bypass_ip_if_dirty().await;
+
+        let lines = read_lines(dir.join(BYPASS_IP_FILE)).unwrap();
+        assert!(lines.contains(&"203.0.113.10 a.example.com".to_owned()));
+        assert!(lines.contains(&"203.0.113.10 b.example.com".to_owned()));
+        assert_eq!(state.route_ip(&ip).await, Some(RouteDecision::Proxy));
     }
 
     #[test]
