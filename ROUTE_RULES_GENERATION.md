@@ -14,14 +14,19 @@ one-column IP/CIDR rows remain valid.
 
 Temporary admin rules are persisted in:
 
-- `direct_ip.temp`
-- `direct_domain.temp`
-- `bypass_ip.temp`
-- `bypass_domain.temp`
+- `data/temp/direct_ip.temp`
+- `data/temp/direct_domain.temp`
+- `data/temp/bypass_ip.temp`
+- `data/temp/bypass_domain.temp`
 
 Temporary rules are loaded on startup and have priority over persistent files.
 When a direct and bypass temporary rule both match, direct wins and a conflict is
 recorded.
+
+Conflict results are persisted as JSON Lines in:
+
+- `data/temp/ip_conflicts.jsonl`
+- `data/temp/domain_conflicts.jsonl`
 
 Downloaded URL sources are cached for one week. Refresh downloads first into
 `data/source/temp`; only a successful non-empty download replaces the current

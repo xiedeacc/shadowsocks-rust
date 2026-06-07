@@ -288,7 +288,7 @@ SERVICE_NAME='$SERVICE_NAME'
 REMOTE_TMP='$REMOTE_TMP'
 DISABLE_LEGACY='$DISABLE_LEGACY'
 
-mkdir -p \"\$REMOTE_DIR/bin\" \"\$REMOTE_DIR/conf\" \"\$REMOTE_DIR/data\" \"\$REMOTE_DIR/logs\"
+mkdir -p \"\$REMOTE_DIR/bin\" \"\$REMOTE_DIR/conf\" \"\$REMOTE_DIR/data\" \"\$REMOTE_DIR/data/temp\" \"\$REMOTE_DIR/logs\"
 cp -f \"\$REMOTE_TMP/sslocal\" \"\$REMOTE_DIR/bin/sslocal\"
 chmod 755 \"\$REMOTE_DIR/bin/sslocal\"
 cp -f \"\$REMOTE_TMP/shadowsocks-client.json\" \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
@@ -318,6 +318,15 @@ for rule_file in direct_ip.txt direct_domain.txt bypass_ip.txt bypass_domain.txt
 		cp -f \"\$REMOTE_TMP/\$rule_file\" \"\$REMOTE_DIR/data/\$rule_file\"
 	fi
 done
+if [ -d \"\$REMOTE_TMP/temp\" ]; then
+	mkdir -p \"\$REMOTE_DIR/data/temp\"
+	find \"\$REMOTE_TMP/temp\" -maxdepth 1 -type f | while IFS= read -r temp_file; do
+		temp_name=\$(basename \"\$temp_file\")
+		if [ ! -e \"\$REMOTE_DIR/data/temp/\$temp_name\" ]; then
+			cp -f \"\$temp_file\" \"\$REMOTE_DIR/data/temp/\$temp_name\"
+		fi
+	done
+fi
 if [ -d \"\$REMOTE_TMP/source\" ]; then
 	mkdir -p \"\$REMOTE_DIR/data/source\"
 	cp -rf \"\$REMOTE_TMP/source/.\" \"\$REMOTE_DIR/data/source/\"

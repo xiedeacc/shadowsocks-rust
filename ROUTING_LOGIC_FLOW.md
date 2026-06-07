@@ -8,12 +8,12 @@ admin routing state.
 ```mermaid
 flowchart TD
     A[Domain query or connection target] --> B[Normalize domain]
-    B --> C{Temporary direct_domain.temp matches?}
-    C -- yes --> D{Temporary bypass_domain.temp also matches?}
+    B --> C{Temporary data/temp/direct_domain.temp matches?}
+    C -- yes --> D{Temporary data/temp/bypass_domain.temp also matches?}
     D -- yes --> E[Record Domain Conflict]
     E --> F[DIRECT wins]
     D -- no --> F
-    C -- no --> G{Temporary bypass_domain.temp matches?}
+    C -- no --> G{Temporary data/temp/bypass_domain.temp matches?}
     G -- yes --> H[PROXY: use remote DNS, add resolved IP/domain rows to bypass_ip.txt]
     G -- no --> I{direct_domain.txt matches?}
     I -- yes --> J{bypass_domain.txt also matches?}
@@ -37,12 +37,12 @@ the admin page shows a Domain Conflict and the direct rule wins. Example:
 
 ```mermaid
 flowchart TD
-    A[Destination IP] --> B{Temporary direct_ip.temp matches?}
-    B -- yes --> C{Temporary bypass_ip.temp also matches?}
+    A[Destination IP] --> B{Temporary data/temp/direct_ip.temp matches?}
+    B -- yes --> C{Temporary data/temp/bypass_ip.temp also matches?}
     C -- yes --> D[Record IP Conflict]
     D --> E[DIRECT wins]
     C -- no --> E
-    B -- no --> F{Temporary bypass_ip.temp matches?}
+    B -- no --> F{Temporary data/temp/bypass_ip.temp matches?}
     F -- yes --> G[PROXY: nft sends traffic to sslocal transparent proxy]
     F -- no --> H{direct_ip.txt matches?}
     H -- yes --> I{bypass_ip.txt also matches?}
@@ -94,9 +94,9 @@ flowchart TD
     G --> H[Detect IP overlaps: direct_ip.txt vs bypass_ip.txt]
     G --> I[Detect IP overlaps: geoip.dat CN vs bypass_ip.txt]
     G --> J[Detect domain overlaps: direct_domain.txt vs bypass_domain.txt]
-    H --> K[Admin IP Conflicts]
+    H --> K[Admin IP Conflicts and data/temp/ip_conflicts.jsonl]
     I --> K
-    J --> L[Admin Domain Conflicts]
+    J --> L[Admin Domain Conflicts and data/temp/domain_conflicts.jsonl]
 ```
 
 IP conflict checks use CIDR overlap and read the first IP/CIDR column from

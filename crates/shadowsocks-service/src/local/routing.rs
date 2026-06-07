@@ -65,6 +65,9 @@ const TEMP_DIRECT_IP_FILE: &str = "direct_ip.temp";
 const TEMP_DIRECT_DOMAIN_FILE: &str = "direct_domain.temp";
 const TEMP_BYPASS_IP_FILE: &str = "bypass_ip.temp";
 const TEMP_BYPASS_DOMAIN_FILE: &str = "bypass_domain.temp";
+const TEMP_DIR: &str = "temp";
+const TEMP_IP_CONFLICTS_FILE: &str = "ip_conflicts.jsonl";
+const TEMP_DOMAIN_CONFLICTS_FILE: &str = "domain_conflicts.jsonl";
 const RECORD_FILE: &str = "record.txt";
 const SOURCE_DIR: &str = "source";
 const SOURCE_TEMP_DIR: &str = "temp";
@@ -470,14 +473,15 @@ pub struct RoutingState {
 impl RoutingState {
     pub async fn load(config: RouteRulesConfig) -> io::Result<Self> {
         fs::create_dir_all(&config.rules_dir)?;
+        fs::create_dir_all(config.rules_dir.join(TEMP_DIR))?;
         ensure_file(config.rules_dir.join(DIRECT_IP_FILE))?;
         ensure_file(config.rules_dir.join(DIRECT_DOMAIN_FILE))?;
         ensure_file(config.rules_dir.join(BYPASS_IP_FILE))?;
         ensure_file(config.rules_dir.join(BYPASS_DOMAIN_FILE))?;
-        ensure_file(config.rules_dir.join(TEMP_DIRECT_IP_FILE))?;
-        ensure_file(config.rules_dir.join(TEMP_DIRECT_DOMAIN_FILE))?;
-        ensure_file(config.rules_dir.join(TEMP_BYPASS_IP_FILE))?;
-        ensure_file(config.rules_dir.join(TEMP_BYPASS_DOMAIN_FILE))?;
+        ensure_file(temp_file_path(&config.rules_dir, TEMP_DIRECT_IP_FILE))?;
+        ensure_file(temp_file_path(&config.rules_dir, TEMP_DIRECT_DOMAIN_FILE))?;
+        ensure_file(temp_file_path(&config.rules_dir, TEMP_BYPASS_IP_FILE))?;
+        ensure_file(temp_file_path(&config.rules_dir, TEMP_BYPASS_DOMAIN_FILE))?;
 
         let persistent_raw = read_rule_lists(&config.rules_dir)?;
         let persistent = compile_rules(&persistent_raw);
@@ -1837,6 +1841,7 @@ fn rebuild_ip_conflicts(inner: &mut RoutingInner) {
             ),
         );
     }
+    persist_conflict_events(&inner.rules_dir, TEMP_IP_CONFLICTS_FILE, &inner.ip_conflicts);
 }
 
 fn rebuild_domain_conflicts(inner: &mut RoutingInner) {
@@ -1851,6 +1856,19 @@ fn rebuild_domain_conflicts(inner: &mut RoutingInner) {
                 vec![DIRECT_DOMAIN_FILE.to_owned(), BYPASS_DOMAIN_FILE.to_owned()],
             ),
         );
+    }
+    persist_conflict_events(&inner.rules_dir, TEMP_DOMAIN_CONFLICTS_FILE, &inner.domain_conflicts);
+}
+
+fn persist_conflict_events(dir: &Path, file_name: &str, conflicts: &VecDeque<ConflictEvent>) {
+    let lines = conflicts
+        .iter()
+        .filter_map(|conflict| serde_json::to_string(conflict).ok())
+        .collect::<Vec<_>>();
+    if let Err(err) =
+        fs::create_dir_all(dir.join(TEMP_DIR)).and_then(|()| write_lines_atomic(temp_file_path(dir, file_name), &lines))
+    {
+        warn!("failed to persist {}: {}", file_name, err);
     }
 }
 
@@ -2585,19 +2603,38 @@ fn read_rule_lists(dir: &Path) -> io::Result<RuleLists> {
 
 fn read_temporary_rule_lists(dir: &Path) -> io::Result<RuleLists> {
     Ok(RuleLists {
-        direct_ip: read_lines(dir.join(TEMP_DIRECT_IP_FILE))?,
-        direct_domain: read_lines(dir.join(TEMP_DIRECT_DOMAIN_FILE))?,
-        bypass_ip: read_lines(dir.join(TEMP_BYPASS_IP_FILE))?,
-        bypass_domain: read_lines(dir.join(TEMP_BYPASS_DOMAIN_FILE))?,
+        direct_ip: read_temp_lines(dir, TEMP_DIRECT_IP_FILE)?,
+        direct_domain: read_temp_lines(dir, TEMP_DIRECT_DOMAIN_FILE)?,
+        bypass_ip: read_temp_lines(dir, TEMP_BYPASS_IP_FILE)?,
+        bypass_domain: read_temp_lines(dir, TEMP_BYPASS_DOMAIN_FILE)?,
     })
 }
 
 fn write_temporary_rule_lists(dir: &Path, lists: &RuleLists) -> io::Result<()> {
-    write_lines_atomic(dir.join(TEMP_DIRECT_IP_FILE), &lists.direct_ip)?;
-    write_lines_atomic(dir.join(TEMP_DIRECT_DOMAIN_FILE), &lists.direct_domain)?;
-    write_lines_atomic(dir.join(TEMP_BYPASS_IP_FILE), &lists.bypass_ip)?;
-    write_lines_atomic(dir.join(TEMP_BYPASS_DOMAIN_FILE), &lists.bypass_domain)?;
+    fs::create_dir_all(dir.join(TEMP_DIR))?;
+    write_lines_atomic(temp_file_path(dir, TEMP_DIRECT_IP_FILE), &lists.direct_ip)?;
+    write_lines_atomic(temp_file_path(dir, TEMP_DIRECT_DOMAIN_FILE), &lists.direct_domain)?;
+    write_lines_atomic(temp_file_path(dir, TEMP_BYPASS_IP_FILE), &lists.bypass_ip)?;
+    write_lines_atomic(temp_file_path(dir, TEMP_BYPASS_DOMAIN_FILE), &lists.bypass_domain)?;
     Ok(())
+}
+
+fn read_temp_lines(dir: &Path, file_name: &str) -> io::Result<Vec<String>> {
+    let current = read_lines(temp_file_path(dir, file_name))?;
+    if !current.is_empty() {
+        return Ok(current);
+    }
+    let legacy = read_lines(dir.join(file_name))?;
+    if legacy.is_empty() {
+        Ok(current)
+    } else {
+        write_lines_atomic(temp_file_path(dir, file_name), &legacy)?;
+        Ok(legacy)
+    }
+}
+
+fn temp_file_path(dir: &Path, file_name: &str) -> PathBuf {
+    dir.join(TEMP_DIR).join(file_name)
 }
 
 fn sanitize_sources(sources: RoutingSources) -> RoutingSources {
@@ -3258,12 +3295,12 @@ mod tests {
             .unwrap();
 
         assert!(
-            read_lines(dir.join(TEMP_DIRECT_IP_FILE))
+            read_lines(temp_file_path(&dir, TEMP_DIRECT_IP_FILE))
                 .unwrap()
                 .contains(&"203.0.113.0/24".to_owned())
         );
         assert!(
-            read_lines(dir.join(TEMP_BYPASS_DOMAIN_FILE))
+            read_lines(temp_file_path(&dir, TEMP_BYPASS_DOMAIN_FILE))
                 .unwrap()
                 .contains(&"*.temp.example".to_owned())
         );
@@ -3276,6 +3313,34 @@ mod tests {
         assert_eq!(
             reloaded.route_domain("direct.temp.example").await,
             Some(RouteDecision::Direct)
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_results_persist_to_temp_dir() {
+        let dir = temp_rules_dir("conflict-persist");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &["203.0.113.10".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_IP_FILE), &["203.0.113.0/24 example.com".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["direct.example.com".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+
+        assert!(!state.ip_conflicts().await.is_empty());
+        assert!(!state.domain_conflicts().await.is_empty());
+        assert!(
+            !read_lines(temp_file_path(&dir, TEMP_IP_CONFLICTS_FILE))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !read_lines(temp_file_path(&dir, TEMP_DOMAIN_CONFLICTS_FILE))
+                .unwrap()
+                .is_empty()
         );
     }
 
