@@ -307,7 +307,7 @@ impl Server {
 
                         log::info!(
                             "routing diagnostics: dns_cache={}/{} order={} ttl={}s \
-                             dns_events={} conns={} flow_dec={} reverse={} unhit_ip={} unhit_dom={} \
+                             dns_events={} conns={} flow_dec={} reverse={} \
                              persist_direct_ip={} persist_bypass_ip={} \
                              tmp_direct_ip={} tmp_bypass_ip={}",
                             d.dns_cache_size,
@@ -318,8 +318,6 @@ impl Server {
                             d.connections,
                             d.flow_decisions,
                             d.reverse_domains,
-                            d.unhit_ips,
-                            d.unhit_domains,
                             d.persistent_direct_ip,
                             d.persistent_bypass_ip,
                             d.temporary_direct_ip,

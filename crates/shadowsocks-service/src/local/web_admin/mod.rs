@@ -1,13 +1,17 @@
 //! Embedded web admin for routing rules and DNS split.
 
 use std::{
+    collections::HashSet,
     convert::Infallible,
     fs, io,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     pin::Pin,
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -22,7 +26,7 @@ use tokio::{net::TcpListener, time};
 
 use crate::{
     config::WebAdminConfig,
-    local::routing::{RoutingState, RuleLists},
+    local::routing::{ConnectionEvent, RoutingState, RuleLists},
 };
 
 type ResponseBody = Full<Bytes>;
@@ -62,6 +66,8 @@ impl WebAdmin {
             token: self.token,
             client_config_path: self.client_config_path,
             routing_state: self.routing_state,
+            activity_recording: Arc::new(AtomicBool::new(false)),
+            activity_recorded: Arc::new(Mutex::new(HashSet::new())),
         });
 
         loop {
@@ -93,6 +99,8 @@ struct WebAdminHandler {
     token: Option<String>,
     client_config_path: PathBuf,
     routing_state: RoutingState,
+    activity_recording: Arc<AtomicBool>,
+    activity_recorded: Arc<Mutex<HashSet<String>>>,
 }
 
 impl WebAdminHandler {
@@ -295,23 +303,20 @@ impl WebAdminHandler {
             )),
             (Method::GET, "/api/activity/connections") => Ok(json_response(
                 StatusCode::OK,
-                &self.routing_state.recent_connections(&self.server_filters()).await,
+                &self.recordable_recent_connections().await?,
             )),
-            (Method::GET, "/api/activity/unhit-ip") => {
-                let server_filters = self.server_filters();
-                let rows = self
-                    .routing_state
-                    .recent_unhit_ips()
-                    .await
-                    .into_iter()
-                    .filter(|event| !server_filters.iter().any(|ip| *ip == event.ip))
-                    .collect::<Vec<_>>();
-                Ok(json_response(StatusCode::OK, &rows))
+            (Method::POST, "/api/activity/record/start") => {
+                self.routing_state.truncate_record_file().await?;
+                if let Ok(mut recorded) = self.activity_recorded.lock() {
+                    recorded.clear();
+                }
+                self.activity_recording.store(true, Ordering::Relaxed);
+                Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
             }
-            (Method::GET, "/api/activity/unhit-dns") => Ok(json_response(
-                StatusCode::OK,
-                &self.routing_state.recent_unhit_domains().await,
-            )),
+            (Method::POST, "/api/activity/record/stop") => {
+                self.activity_recording.store(false, Ordering::Relaxed);
+                Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
+            }
             (Method::GET, "/api/activity/dns") => {
                 Ok(json_response(StatusCode::OK, &self.routing_state.recent_dns().await))
             }
@@ -420,6 +425,26 @@ impl WebAdminHandler {
             "curl_exit_code": curl_result.exit_code,
             "curl_error": curl_result.error,
         }))
+    }
+
+    async fn recordable_recent_connections(&self) -> io::Result<Vec<ConnectionEvent>> {
+        let rows = self.routing_state.recent_connections(&self.server_filters()).await;
+        if !self.activity_recording.load(Ordering::Relaxed) {
+            return Ok(rows);
+        }
+
+        let unseen = if let Ok(mut recorded) = self.activity_recorded.lock() {
+            rows.iter()
+                .filter(|row| recorded.insert(connection_record_key(row)))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if !unseen.is_empty() {
+            self.routing_state.append_record_connections(&unseen).await?;
+        }
+        Ok(rows)
     }
 
     fn server_filters(&self) -> Vec<IpAddr> {
@@ -648,6 +673,20 @@ fn domain_matches_debug_host(domain: &str, host: &str) -> bool {
     domain
         .trim_end_matches('.')
         .eq_ignore_ascii_case(host.trim_end_matches('.'))
+}
+
+fn connection_record_key(row: &ConnectionEvent) -> String {
+    format!(
+        "{}|{}|{}|{:?}|{:?}|{}|{}|{:?}",
+        row.timestamp,
+        row.source_ip,
+        row.source_port,
+        row.destination_ip,
+        row.destination_domain,
+        row.destination_port,
+        row.protocol,
+        row.decision
+    )
 }
 
 fn run_debug_curl(url: &str) -> io::Result<DebugCurlResult> {
@@ -956,7 +995,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
   <section id="connections" class="tab">
     <div class="activity-toolbar">
-      <label class="inline-check"><input id="activityRecord" type="checkbox" checked onchange="if(this.checked)refresh('connections')"> Record</label>
+      <label class="inline-check"><input id="activityRecord" type="checkbox" onchange="toggleActivityRecord(this.checked)"> Record</label>
     </div>
     <div class="activity-grid">
       <div class="activity-card">
@@ -966,14 +1005,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <div class="activity-card">
         <h3 class="card-title">Recent Connections</h3>
         <div id="connOut" class="scroll-panel section-scroll"></div>
-      </div>
-      <div class="activity-card">
-        <h3 class="card-title">Unhit DNS</h3>
-        <div id="unhitDnsOut" class="scroll-panel section-scroll"></div>
-      </div>
-      <div class="activity-card">
-        <h3 class="card-title">Unhit IP</h3>
-        <div id="unhitIpOut" class="scroll-panel section-scroll"></div>
       </div>
     </div>
   </section>
@@ -1252,36 +1283,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function table(rows,cols,cls=''){return `<table class="${cls}"><thead><tr>`+cols.map(c=>'<th>'+c[0]+'</th>').join('')+'</tr></thead><tbody>'+(rows.length?rows.map(r=>'<tr>'+cols.map(c=>'<td>'+String(c[1](r)??'')+'</td>').join('')+'</tr>').join(''):`<tr><td colspan="${cols.length}" class="hint">No data</td></tr>` )+'</tbody></table>'}
     function fmtTime(ts){return ts?new Date(ts*1000).toLocaleString():''}
     function cleanDomain(v){return (v||'').replace(/\.$/,'')}
-    let manualSelectEditing=false;
-    function beginManualSelectEdit(){manualSelectEditing=true}
-    function endManualSelectEdit(){setTimeout(()=>{manualSelectEditing=false},400)}
-    async function setManualIp(cidr,region){manualSelectEditing=false;await api('/api/manual-ip',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({cidr,region})});await renderConflicts('ipOut','/api/conflicts/ip',{force:true})}
-    async function setManualDomain(domain,region){manualSelectEditing=false;await api('/api/manual-domain',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({domain,region})});await renderConflicts('domainOut','/api/conflicts/domain',{force:true})}
-    function manualSelect(row,manual,onchange){
-      let regions=['direct','bypass'];
-      let selected=manual[row.value]||'';
-      return `<select onpointerdown="beginManualSelectEdit()" onfocus="beginManualSelectEdit()" onblur="endManualSelectEdit()" onchange="${onchange}('${row.value}',this.value)"><option value="">Auto</option>${regions.map(region=>`<option value="${region}"${region===selected?' selected':''}>${region}</option>`).join('')}</select>`;
-    }
-    async function renderConflicts(id,path,opt={}){
-      if(manualSelectEditing&&!opt.force)return;
+    async function renderConflicts(id,path){
       let rows=await api(path);
-      if(manualSelectEditing&&!opt.force)return;
-      let manual={};
-      let cols=[['Value',r=>r.value]];
-      if(id==='ipOut'){
-        (await api('/api/manual-ip')).forEach(rule=>manual[rule.cidr]=rule.region);
-        cols.push(['Regions',r=>(r.regions||[]).join(', ')],['Sources',r=>(r.sources||[]).join(', ')],['Select',r=>manualSelect(r,manual,'setManualIp')]);
-      }
-      if(id==='domainOut'){
-        (await api('/api/manual-domain')).forEach(rule=>manual[rule.domain]=rule.region);
-        cols.push(['Regions',r=>(r.regions||[]).join(', ')],['Sources',r=>(r.sources||[]).join(', ')],['Select',r=>manualSelect(r,manual,'setManualDomain')]);
-      }
+      let cols=[['Value',r=>r.value],['Regions',r=>(r.regions||[]).join(', ')],['Sources',r=>(r.sources||[]).join(', ')]];
       document.getElementById(id).innerHTML=table(rows,cols,'conflict-table')
     }
-    function activityRecording(){let el=document.getElementById('activityRecord');return !el||el.checked}
+    async function toggleActivityRecord(checked){await api(checked?'/api/activity/record/start':'/api/activity/record/stop',{method:'POST'});if(checked)refresh('connections')}
     async function renderConnections(){let rows=await api('/api/activity/connections');connOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Source',r=>r.source_ip+':'+r.source_port],['Destination',r=>(r.destination_ip||r.destination_domain)+':'+r.destination_port],['Domain',r=>r.domain||'-'],['Protocol',r=>r.protocol],['Decision',r=>r.decision]])}
-    async function renderUnhitIp(){let rows=await api('/api/activity/unhit-ip');unhitIpOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['IP',r=>r.ip]])}
-    async function renderUnhitDns(){let rows=await api('/api/activity/unhit-dns');unhitDnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>r.domain]])}
     async function renderDns(){let el=document.getElementById('recentDnsRecord');if(el&&!el.checked)return;let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']])}
     async function renderRouteConflicts(){await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip')}
     async function renderSys(){let s=await api('/api/sys/status');let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p><p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body+`<h3 class="card-title">direct_ip.txt / bypass_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / bypass_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
@@ -1294,7 +1302,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function queryDnsCacheIp(){await renderDnsCacheStats();let ip=dnsQueryIp.value.trim();if(!ip){dnsCacheOut.innerHTML='<p class="hint">Enter an IP</p>';return}let rows=await api('/api/dns/cache/query-ip?ip='+encodeURIComponent(ip));dnsCacheOut.innerHTML=table(rows,[['IP',r=>r.ip],['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Expires',r=>fmtTime(r.expires_at)]])}
     async function clearDnsDomain(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheMessage.textContent='Enter a domain first';return}let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({domain})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';await queryDnsCache()}
     async function clearDnsAll(){let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';dnsCacheOut.innerHTML='';await renderDnsCacheStats()}
-    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='dns')await renderDnsCacheStats();if(id==='routeConfig'){await loadRules();await renderRouteConflicts()}if(id==='sys')await renderSys();if(id==='connections'){if(!activityRecording())return;await renderDns();await renderConnections();await renderUnhitDns();await renderUnhitIp()}}catch(e){alert(e.message)}}
+    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='dns')await renderDnsCacheStats();if(id==='routeConfig'){await loadRules();await renderRouteConflicts()}if(id==='sys')await renderSys();if(id==='connections'){await renderDns();await renderConnections()}}catch(e){alert(e.message)}}
     document.querySelector("nav button[data-tab=\"basic\"]").classList.add('active');
     window.addEventListener('resize',updateNavIndicator);
     requestAnimationFrame(updateNavIndicator);

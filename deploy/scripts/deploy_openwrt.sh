@@ -302,7 +302,22 @@ find \"\$REMOTE_TMP\" -maxdepth 1 -type f \\
 	! -name sslocal-watch.init \\
 	! -name sslocal-probe.sh \\
 	! -name sslocal-probe.init \\
+	! -name direct_ip.txt \\
+	! -name direct_domain.txt \\
+	! -name bypass_ip.txt \\
+	! -name bypass_domain.txt \\
+	! -name direct_ip.temp \\
+	! -name direct_domain.temp \\
+	! -name bypass_ip.temp \\
+	! -name bypass_domain.temp \\
+	! -name record.txt \\
 	-exec cp -f {} \"\$REMOTE_DIR/data/\" \\;
+for rule_file in direct_ip.txt direct_domain.txt bypass_ip.txt bypass_domain.txt \\
+	direct_ip.temp direct_domain.temp bypass_ip.temp bypass_domain.temp record.txt; do
+	if [ ! -e \"\$REMOTE_DIR/data/\$rule_file\" ] && [ -e \"\$REMOTE_TMP/\$rule_file\" ]; then
+		cp -f \"\$REMOTE_TMP/\$rule_file\" \"\$REMOTE_DIR/data/\$rule_file\"
+	fi
+done
 if [ -d \"\$REMOTE_TMP/source\" ]; then
 	mkdir -p \"\$REMOTE_DIR/data/source\"
 	cp -rf \"\$REMOTE_TMP/source/.\" \"\$REMOTE_DIR/data/source/\"

@@ -61,6 +61,11 @@ const DIRECT_IP_FILE: &str = "direct_ip.txt";
 const DIRECT_DOMAIN_FILE: &str = "direct_domain.txt";
 const BYPASS_IP_FILE: &str = "bypass_ip.txt";
 const BYPASS_DOMAIN_FILE: &str = "bypass_domain.txt";
+const TEMP_DIRECT_IP_FILE: &str = "direct_ip.temp";
+const TEMP_DIRECT_DOMAIN_FILE: &str = "direct_domain.temp";
+const TEMP_BYPASS_IP_FILE: &str = "bypass_ip.temp";
+const TEMP_BYPASS_DOMAIN_FILE: &str = "bypass_domain.temp";
+const RECORD_FILE: &str = "record.txt";
 const SOURCE_DIR: &str = "source";
 const SOURCE_TEMP_DIR: &str = "temp";
 const GENERATED_RULE_FILES: [&str; 4] = [DIRECT_IP_FILE, DIRECT_DOMAIN_FILE, BYPASS_IP_FILE, BYPASS_DOMAIN_FILE];
@@ -102,14 +107,6 @@ impl RouteDecision {
     pub fn is_bypassed(self) -> bool {
         matches!(self, Self::Direct)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuleLayer {
-    Temporary,
-    Persistent,
-    Dns,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -234,11 +231,9 @@ pub enum ConnectionDecision {
     Socks5Proxy,
     Redir,
     Tun,
-    /// Flow observed in the kernel (conntrack / /proc/net/{tcp,udp})
-    /// but sslocal did not handle it itself in the in-memory decision
-    /// log. Distinct from `Direct` (which means "ACL said bypass" in the
-    /// SOCKS/HTTP/UDP-association code paths).
-    Snapshot,
+    /// Flow observed in the kernel (conntrack / /proc/net/{tcp,udp}) but not
+    /// matched to an in-memory sslocal decision.
+    Observed,
 }
 
 /// Five-tuple identifying a kernel-visible flow, used as the key of
@@ -301,8 +296,6 @@ pub struct RuntimeDiagnostics {
     /// Reverse-DNS map. Never pruned today — included here so the
     /// periodic logger flags growth.
     pub reverse_domains: usize,
-    pub unhit_ips: usize,
-    pub unhit_domains: usize,
     pub persistent_direct_ip: usize,
     pub persistent_bypass_ip: usize,
     pub temporary_direct_ip: usize,
@@ -373,18 +366,6 @@ pub struct IpMembershipDebug {
     pub nft_bypass: bool,
     pub nft_matches: Vec<String>,
     pub nft_error: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct UnhitIpEvent {
-    pub timestamp: u64,
-    pub ip: IpAddr,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct UnhitDomainEvent {
-    pub timestamp: u64,
-    pub domain: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -468,8 +449,6 @@ struct RoutingInner {
     reverse_domains: HashMap<IpAddr, String>,
     dns_cache: HashMap<DnsCacheKey, DnsCacheEntry>,
     dns_cache_order: VecDeque<DnsCacheKey>,
-    unhit_ips: VecDeque<UnhitIpEvent>,
-    unhit_domains: VecDeque<UnhitDomainEvent>,
     bypass_ip_dirty: bool,
     bypass_ip_persist_scheduled: bool,
 }
@@ -495,6 +474,10 @@ impl RoutingState {
         ensure_file(config.rules_dir.join(DIRECT_DOMAIN_FILE))?;
         ensure_file(config.rules_dir.join(BYPASS_IP_FILE))?;
         ensure_file(config.rules_dir.join(BYPASS_DOMAIN_FILE))?;
+        ensure_file(config.rules_dir.join(TEMP_DIRECT_IP_FILE))?;
+        ensure_file(config.rules_dir.join(TEMP_DIRECT_DOMAIN_FILE))?;
+        ensure_file(config.rules_dir.join(TEMP_BYPASS_IP_FILE))?;
+        ensure_file(config.rules_dir.join(TEMP_BYPASS_DOMAIN_FILE))?;
 
         let persistent_raw = read_rule_lists(&config.rules_dir)?;
         let persistent = compile_rules(&persistent_raw);
@@ -505,7 +488,7 @@ impl RoutingState {
         let bypass_ip_modified = file_modified(&config.rules_dir.join(BYPASS_IP_FILE))?;
         let direct_domain_modified = file_modified(&config.rules_dir.join(DIRECT_DOMAIN_FILE))?;
         let bypass_domain_modified = file_modified(&config.rules_dir.join(BYPASS_DOMAIN_FILE))?;
-        let temporary_raw = with_private_direct_rules(RuleLists::default());
+        let temporary_raw = with_private_direct_rules(read_temporary_rule_lists(&config.rules_dir)?);
         let temporary = compile_rules(&temporary_raw);
         let mut inner = RoutingInner {
             sources: RoutingSources::from(&config),
@@ -528,8 +511,6 @@ impl RoutingState {
             reverse_domains: HashMap::new(),
             dns_cache: HashMap::new(),
             dns_cache_order: VecDeque::new(),
-            unhit_ips: VecDeque::new(),
-            unhit_domains: VecDeque::new(),
             bypass_ip_dirty: false,
             bypass_ip_persist_scheduled: false,
         };
@@ -582,6 +563,7 @@ impl RoutingState {
             (inner.rules_dir.clone(), temporary_nft_bypass_nets(&inner, &rules))
         };
         let mut inner = self.inner.write().await;
+        write_temporary_rule_lists(&inner.rules_dir, &rules)?;
         inner.temporary_raw = rules;
         inner.temporary = compile_rules(&inner.temporary_raw);
         rebuild_conflicts(&mut inner);
@@ -638,21 +620,6 @@ impl RoutingState {
                     continue;
                 }
 
-                let opposite_exists = match decision {
-                    RouteDecision::Direct => {
-                        compiled_rules_match_ip(&inner.persistent.bypass_ip_exact, &inner.persistent.bypass_ip, ip)
-                            || compiled_rules_match_ip(&inner.temporary.bypass_ip_exact, &inner.temporary.bypass_ip, ip)
-                    }
-                    RouteDecision::Proxy => {
-                        compiled_rules_match_ip(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip, ip)
-                            || compiled_rules_match_ip(&inner.temporary.direct_ip_exact, &inner.temporary.direct_ip, ip)
-                    }
-                };
-                if opposite_exists {
-                    push_conflict(&mut inner, ConflictKind::Ip, ip.to_string(), RuleLayer::Dns);
-                    continue;
-                }
-
                 additions.push(*ip);
             }
 
@@ -705,7 +672,7 @@ impl RoutingState {
                     }
                 }
             }
-            warn_if_domain_conflict(&mut inner, domain, RuleLayer::Dns);
+            rebuild_conflicts(&mut inner);
             additions
         };
         warn!(
@@ -1493,8 +1460,6 @@ impl RoutingState {
             connections: inner.connections.len(),
             flow_decisions: inner.flow_decisions.len(),
             reverse_domains: inner.reverse_domains.len(),
-            unhit_ips: inner.unhit_ips.len(),
-            unhit_domains: inner.unhit_domains.len(),
             persistent_direct_ip: inner.persistent.direct_ip.len(),
             persistent_bypass_ip: inner.persistent.bypass_ip.len(),
             temporary_direct_ip: inner.temporary.direct_ip.len(),
@@ -1615,9 +1580,7 @@ impl RoutingState {
                 continue;
             }
             // Re-label scraper rows from the authoritative in-memory
-            // decision map when the 5-tuple matches. Without this, the
-            // scraper's default `Snapshot` would hide the fact that
-            // sslocal handled this flow via redir/tun/proxy.
+            // decision map when the 5-tuple matches.
             if let Some(dst_ip) = event.destination_ip {
                 let proto_static = match event.protocol.as_str() {
                     "tcp" => Some("tcp"),
@@ -1639,22 +1602,24 @@ impl RoutingState {
         rows
     }
 
+    pub async fn truncate_record_file(&self) -> io::Result<()> {
+        let path = self.inner.read().await.rules_dir.join(RECORD_FILE);
+        write_lines_atomic(path, &[])
+    }
+
+    pub async fn append_record_connections(&self, rows: &[ConnectionEvent]) -> io::Result<()> {
+        let path = self.inner.read().await.rules_dir.join(RECORD_FILE);
+        let lines = rows
+            .iter()
+            .filter_map(|row| serde_json::to_string(row).ok())
+            .collect::<Vec<_>>();
+        append_lines(&path, &lines)
+    }
+
     pub async fn recent_dns(&self) -> Vec<DnsEvent> {
         let mut inner = self.inner.write().await;
         trim_old(&mut inner.dns, DEFAULT_WINDOW);
         inner.dns.iter().rev().cloned().collect()
-    }
-
-    pub async fn recent_unhit_ips(&self) -> Vec<UnhitIpEvent> {
-        let mut inner = self.inner.write().await;
-        trim_old(&mut inner.unhit_ips, DEFAULT_WINDOW);
-        inner.unhit_ips.iter().rev().cloned().collect()
-    }
-
-    pub async fn recent_unhit_domains(&self) -> Vec<UnhitDomainEvent> {
-        let mut inner = self.inner.write().await;
-        trim_old(&mut inner.unhit_domains, DEFAULT_WINDOW);
-        inner.unhit_domains.iter().rev().cloned().collect()
     }
 
     pub async fn direct_bypass_file_conflicts(&self) -> (Vec<String>, Vec<String>) {
@@ -1687,8 +1652,7 @@ impl RoutingState {
             .map(|domain| normalize_domain(domain))
             .filter(|domain| !domain.is_empty())
             .collect::<HashSet<_>>();
-        let mut domain_conflicts = direct_domain.intersection(&bypass_domain).cloned().collect::<Vec<_>>();
-        domain_conflicts.sort_unstable();
+        let domain_conflicts = domain_rule_conflicts(&direct_domain, &bypass_domain);
 
         (ip_conflicts, domain_conflicts)
     }
@@ -1743,20 +1707,18 @@ fn route_ip_inner(inner: &mut RoutingInner, ip: &IpAddr) -> Option<RouteDecision
     let temp_direct = compiled_rules_match_ip(&inner.temporary.direct_ip_exact, &inner.temporary.direct_ip, ip);
     let temp_proxy = compiled_rules_match_ip(&inner.temporary.bypass_ip_exact, &inner.temporary.bypass_ip, ip);
     if temp_direct && temp_proxy {
-        push_conflict(inner, ConflictKind::Ip, ip.to_string(), RuleLayer::Temporary);
-        return Some(RouteDecision::Proxy);
-    }
-    if temp_proxy {
-        return Some(RouteDecision::Proxy);
+        return Some(RouteDecision::Direct);
     }
     if temp_direct {
         return Some(RouteDecision::Direct);
+    }
+    if temp_proxy {
+        return Some(RouteDecision::Proxy);
     }
 
     let direct = compiled_rules_match_ip(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip, ip);
     let proxy = compiled_rules_match_ip(&inner.persistent.bypass_ip_exact, &inner.persistent.bypass_ip, ip);
     if direct && proxy {
-        push_conflict(inner, ConflictKind::Ip, ip.to_string(), RuleLayer::Persistent);
         return Some(RouteDecision::Direct);
     }
     if direct {
@@ -1764,14 +1726,6 @@ fn route_ip_inner(inner: &mut RoutingInner, ip: &IpAddr) -> Option<RouteDecision
     } else if proxy {
         Some(RouteDecision::Proxy)
     } else {
-        push_event(
-            &mut inner.unhit_ips,
-            UnhitIpEvent {
-                timestamp: now(),
-                ip: *ip,
-            },
-        );
-        trim_old(&mut inner.unhit_ips, DEFAULT_WINDOW);
         None
     }
 }
@@ -1781,35 +1735,25 @@ fn route_domain_inner(inner: &mut RoutingInner, domain: &str) -> Option<RouteDec
     let temp_direct = rules_match_domain(&inner.temporary.direct_domain, &domain);
     let temp_proxy = rules_match_domain(&inner.temporary.bypass_domain, &domain);
     if temp_direct && temp_proxy {
-        push_conflict(inner, ConflictKind::Domain, domain.clone(), RuleLayer::Temporary);
-        return Some(RouteDecision::Proxy);
-    }
-    if temp_proxy {
-        return Some(RouteDecision::Proxy);
+        return Some(RouteDecision::Direct);
     }
     if temp_direct {
         return Some(RouteDecision::Direct);
+    }
+    if temp_proxy {
+        return Some(RouteDecision::Proxy);
     }
 
     let direct = rules_match_domain(&inner.persistent.direct_domain, &domain);
     let proxy = rules_match_domain(&inner.persistent.bypass_domain, &domain);
     if direct && proxy {
-        push_conflict(inner, ConflictKind::Domain, domain.clone(), RuleLayer::Persistent);
-        return Some(RouteDecision::Proxy);
+        return Some(RouteDecision::Direct);
     }
-    if proxy {
-        Some(RouteDecision::Proxy)
-    } else if direct {
+    if direct {
         Some(RouteDecision::Direct)
+    } else if proxy {
+        Some(RouteDecision::Proxy)
     } else {
-        push_event(
-            &mut inner.unhit_domains,
-            UnhitDomainEvent {
-                timestamp: now(),
-                domain,
-            },
-        );
-        trim_old(&mut inner.unhit_domains, DEFAULT_WINDOW);
         None
     }
 }
@@ -1886,28 +1830,6 @@ fn rebuild_conflicts(inner: &mut RoutingInner) {
     }
 }
 
-fn warn_if_domain_conflict(inner: &mut RoutingInner, domain: &str, layer: RuleLayer) {
-    let domain = normalize_domain(domain);
-    if rules_match_domain(&inner.persistent.direct_domain, &domain)
-        && rules_match_domain(&inner.persistent.bypass_domain, &domain)
-    {
-        push_conflict(inner, ConflictKind::Domain, domain, layer);
-    }
-}
-
-fn push_conflict(inner: &mut RoutingInner, kind: ConflictKind, value: String, layer: RuleLayer) {
-    let _ = layer;
-    let event = new_conflict_event(kind, value);
-    match kind {
-        ConflictKind::Ip => push_event(&mut inner.ip_conflicts, event),
-        ConflictKind::Domain => push_event(&mut inner.domain_conflicts, event),
-    }
-}
-
-fn new_conflict_event(kind: ConflictKind, value: String) -> ConflictEvent {
-    new_conflict_event_with_metadata(kind, value, Vec::new(), Vec::new())
-}
-
 fn new_conflict_event_with_metadata(
     kind: ConflictKind,
     value: String,
@@ -1941,13 +1863,27 @@ fn ip_net_conflicts(direct: &[IpNet], bypass: &[IpNet]) -> Vec<String> {
     for direct in direct {
         for bypass in bypass {
             if ip_nets_overlap(direct, bypass) {
-                conflicts.push(format!("{direct} <-> {bypass}"));
+                let direct = display_ip_net(direct);
+                let bypass = display_ip_net(bypass);
+                conflicts.push(if direct == bypass {
+                    direct
+                } else {
+                    format!("{direct} <-> {bypass}")
+                });
             }
         }
     }
     conflicts.sort_unstable();
     conflicts.dedup();
     conflicts
+}
+
+fn display_ip_net(net: &IpNet) -> String {
+    match net {
+        IpNet::V4(net) if net.prefix_len() == 32 => net.addr().to_string(),
+        IpNet::V6(net) if net.prefix_len() == 128 => net.addr().to_string(),
+        _ => net.to_string(),
+    }
 }
 
 fn compiled_rules_match_ip(exact: &HashSet<IpAddr>, nets: &[IpNet], ip: &IpAddr) -> bool {
@@ -2015,6 +1951,8 @@ fn join_wildcard_candidate(prefix: &str, suffix: &str) -> String {
 fn domain_matches_rule(rule: &str, domain: &str) -> bool {
     if rule.contains('*') {
         wildcard_domain_matches(rule, domain)
+    } else if !rule.contains('.') {
+        domain == rule
     } else {
         domain == rule
             || (domain.len() > rule.len()
@@ -2225,7 +2163,7 @@ fn parse_conntrack_line(line: &str, reverse_domains: &HashMap<IpAddr, String>) -
         domain: reverse_domains.get(&destination_ip).cloned(),
         destination_port: destination_port?,
         protocol,
-        decision: ConnectionDecision::Snapshot,
+        decision: ConnectionDecision::Observed,
     })
 }
 
@@ -2276,7 +2214,7 @@ fn parse_proc_net_line(
         domain: reverse_domains.get(&destination_ip).cloned(),
         destination_port,
         protocol: protocol.to_owned(),
-        decision: ConnectionDecision::Snapshot,
+        decision: ConnectionDecision::Observed,
     })
 }
 
@@ -2340,50 +2278,7 @@ fn with_private_direct_rules(mut lists: RuleLists) -> RuleLists {
 }
 
 fn validate_temporary_rules(lists: &RuleLists) -> io::Result<()> {
-    let direct_ip = lists
-        .direct_ip
-        .iter()
-        .filter_map(|rule| parse_ip_net(rule))
-        .collect::<Vec<_>>();
-    let bypass_ip = lists
-        .bypass_ip
-        .iter()
-        .filter_map(|rule| parse_ip_net(rule))
-        .collect::<Vec<_>>();
-    let ip_conflicts = ip_net_conflicts(&direct_ip, &bypass_ip);
-    if !ip_conflicts.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "Temporary direct_ip and bypass_ip conflict: {}",
-                ip_conflicts.join(", ")
-            ),
-        ));
-    }
-
-    let direct_domain = lists
-        .direct_domain
-        .iter()
-        .map(|domain| normalize_domain(domain))
-        .filter(|domain| !domain.is_empty())
-        .collect::<HashSet<_>>();
-    let bypass_domain = lists
-        .bypass_domain
-        .iter()
-        .map(|domain| normalize_domain(domain))
-        .filter(|domain| !domain.is_empty())
-        .collect::<HashSet<_>>();
-    let domain_conflicts = domain_rule_conflicts(&direct_domain, &bypass_domain);
-    if !domain_conflicts.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "Temporary direct_domain and bypass_domain conflict: {}",
-                domain_conflicts.join(", ")
-            ),
-        ));
-    }
-
+    let _ = lists;
     Ok(())
 }
 
@@ -2475,6 +2370,23 @@ fn read_rule_lists(dir: &Path) -> io::Result<RuleLists> {
         bypass_ip: read_lines(dir.join(BYPASS_IP_FILE))?,
         bypass_domain: read_lines(dir.join(BYPASS_DOMAIN_FILE))?,
     })
+}
+
+fn read_temporary_rule_lists(dir: &Path) -> io::Result<RuleLists> {
+    Ok(RuleLists {
+        direct_ip: read_lines(dir.join(TEMP_DIRECT_IP_FILE))?,
+        direct_domain: read_lines(dir.join(TEMP_DIRECT_DOMAIN_FILE))?,
+        bypass_ip: read_lines(dir.join(TEMP_BYPASS_IP_FILE))?,
+        bypass_domain: read_lines(dir.join(TEMP_BYPASS_DOMAIN_FILE))?,
+    })
+}
+
+fn write_temporary_rule_lists(dir: &Path, lists: &RuleLists) -> io::Result<()> {
+    write_lines_atomic(dir.join(TEMP_DIRECT_IP_FILE), &lists.direct_ip)?;
+    write_lines_atomic(dir.join(TEMP_DIRECT_DOMAIN_FILE), &lists.direct_domain)?;
+    write_lines_atomic(dir.join(TEMP_BYPASS_IP_FILE), &lists.bypass_ip)?;
+    write_lines_atomic(dir.join(TEMP_BYPASS_DOMAIN_FILE), &lists.bypass_domain)?;
+    Ok(())
 }
 
 fn sanitize_sources(sources: RoutingSources) -> RoutingSources {
@@ -2882,18 +2794,6 @@ impl Timestamped for DnsEvent {
     }
 }
 
-impl Timestamped for UnhitIpEvent {
-    fn timestamp(&self) -> u64 {
-        self.timestamp
-    }
-}
-
-impl Timestamped for UnhitDomainEvent {
-    fn timestamp(&self) -> u64 {
-        self.timestamp
-    }
-}
-
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2926,7 +2826,7 @@ mod tests {
             state.route_ip(&"1.1.1.1".parse().unwrap()).await,
             Some(RouteDecision::Direct)
         );
-        assert_eq!(state.route_domain("www.example.com").await, Some(RouteDecision::Direct));
+        assert_eq!(state.route_domain("example.com").await, Some(RouteDecision::Direct));
 
         state
             .set_temporary_rules(RuleLists {
@@ -2941,7 +2841,7 @@ mod tests {
             state.route_ip(&"1.1.1.1".parse().unwrap()).await,
             Some(RouteDecision::Proxy)
         );
-        assert_eq!(state.route_domain("www.example.com").await, Some(RouteDecision::Proxy));
+        assert_eq!(state.route_domain("example.com").await, Some(RouteDecision::Proxy));
     }
 
     #[tokio::test]
@@ -2988,7 +2888,7 @@ mod tests {
         let state = RoutingState::load(config).await.unwrap();
 
         assert_eq!(state.route_domain("www.example.com").await, Some(RouteDecision::Direct));
-        assert_eq!(state.route_domain("api.example.com").await, Some(RouteDecision::Proxy));
+        assert_eq!(state.route_domain("api.example.com").await, Some(RouteDecision::Direct));
         let conflicts = state.domain_conflicts().await;
         assert!(conflicts.iter().any(|conflict| {
             matches!(
@@ -2996,6 +2896,127 @@ mod tests {
                 "*.example.com <-> api.*" | "api.* <-> *.example.com"
             ) && conflict.sources == [DIRECT_DOMAIN_FILE.to_owned(), BYPASS_DOMAIN_FILE.to_owned()]
         }));
+    }
+
+    #[tokio::test]
+    async fn single_label_domain_rules_do_not_match_tlds() {
+        let dir = temp_rules_dir("single-label-domain");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["cn".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_DOMAIN_FILE), &["google.cn".to_owned()]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+
+        assert_eq!(state.route_domain("cn").await, Some(RouteDecision::Direct));
+        assert_eq!(state.route_domain("google.cn").await, Some(RouteDecision::Proxy));
+        assert!(state.domain_conflicts().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_label_domain_rules_match_subdomains() {
+        let dir = temp_rules_dir("suffix-domain");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["c.pki.goog".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_DOMAIN_FILE), &["pki.goog".to_owned()]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+
+        assert_eq!(state.route_domain("pki.goog").await, Some(RouteDecision::Proxy));
+        assert_eq!(state.route_domain("c.pki.goog").await, Some(RouteDecision::Direct));
+        assert!(!state.domain_conflicts().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dns_learned_bypass_ip_keeps_direct_priority_and_indexes_conflict() {
+        let dir = temp_rules_dir("dns-learned-conflict");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &["203.0.113.10".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+
+        state
+            .add_dns_results(
+                RouteDecision::Proxy,
+                "www.example.com",
+                &["203.0.113.10".parse().unwrap()],
+            )
+            .await
+            .unwrap();
+
+        state.persist_bypass_ip_if_dirty().await;
+
+        assert!(
+            read_lines(dir.join(BYPASS_IP_FILE))
+                .unwrap()
+                .contains(&"203.0.113.10".to_owned())
+        );
+        assert_eq!(
+            state.route_ip(&"203.0.113.10".parse().unwrap()).await,
+            Some(RouteDecision::Direct)
+        );
+        let conflicts = state.ip_conflicts().await;
+        assert!(conflicts.iter().any(|conflict| {
+            conflict.value == "203.0.113.10"
+                && conflict.regions == ["direct".to_owned(), "bypass".to_owned()]
+                && conflict.sources == [DIRECT_IP_FILE.to_owned(), BYPASS_IP_FILE.to_owned()]
+        }));
+    }
+
+    #[tokio::test]
+    async fn temporary_rules_persist_to_temp_files() {
+        let dir = temp_rules_dir("temporary-persist");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+
+        let state = RoutingState::load(config.clone()).await.unwrap();
+        state
+            .set_temporary_rules(RuleLists {
+                direct_ip: vec!["203.0.113.0/24".to_owned()],
+                direct_domain: vec!["direct.temp.example".to_owned()],
+                bypass_ip: vec!["198.51.100.10".to_owned()],
+                bypass_domain: vec!["*.temp.example".to_owned()],
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            read_lines(dir.join(TEMP_DIRECT_IP_FILE))
+                .unwrap()
+                .contains(&"203.0.113.0/24".to_owned())
+        );
+        assert!(
+            read_lines(dir.join(TEMP_BYPASS_DOMAIN_FILE))
+                .unwrap()
+                .contains(&"*.temp.example".to_owned())
+        );
+
+        let reloaded = RoutingState::load(config).await.unwrap();
+        assert_eq!(
+            reloaded.route_ip(&"198.51.100.10".parse().unwrap()).await,
+            Some(RouteDecision::Proxy)
+        );
+        assert_eq!(
+            reloaded.route_domain("direct.temp.example").await,
+            Some(RouteDecision::Direct)
+        );
     }
 
     #[tokio::test]
