@@ -1896,20 +1896,72 @@ fn rules_match_domain(rules: &HashSet<String>, domain: &str) -> bool {
 
 fn domain_rule_conflicts(direct: &HashSet<String>, bypass: &HashSet<String>) -> Vec<String> {
     let mut conflicts = Vec::new();
+    let direct_wildcards = direct.iter().filter(|rule| rule.contains('*')).collect::<Vec<_>>();
+    let bypass_wildcards = bypass.iter().filter(|rule| rule.contains('*')).collect::<Vec<_>>();
+
     for direct in direct {
-        for bypass in bypass {
-            if domain_rules_overlap(direct, bypass) {
-                conflicts.push(if direct == bypass {
-                    direct.clone()
-                } else {
-                    format!("{direct} <-> {bypass}")
-                });
+        if direct.contains('*') {
+            continue;
+        }
+        for bypass_candidate in domain_match_candidates(direct) {
+            if bypass.contains(&bypass_candidate) {
+                conflicts.push(format_domain_conflict(direct, &bypass_candidate));
             }
         }
     }
+
+    for bypass in bypass {
+        if bypass.contains('*') {
+            continue;
+        }
+        for direct_candidate in domain_match_candidates(bypass) {
+            if direct.contains(&direct_candidate) {
+                conflicts.push(format_domain_conflict(&direct_candidate, bypass));
+            }
+        }
+    }
+
+    for direct in &direct_wildcards {
+        for bypass in bypass {
+            if domain_rules_overlap(direct, bypass) {
+                conflicts.push(format_domain_conflict(direct, bypass));
+            }
+        }
+    }
+
+    for bypass in &bypass_wildcards {
+        for direct in direct {
+            if direct.contains('*') {
+                continue;
+            }
+            if domain_rules_overlap(direct, bypass) {
+                conflicts.push(format_domain_conflict(direct, bypass));
+            }
+        }
+    }
+
     conflicts.sort_unstable();
     conflicts.dedup();
     conflicts
+}
+
+fn domain_match_candidates(domain: &str) -> Vec<String> {
+    let mut candidates = vec![domain.to_owned()];
+    for (idx, _) in domain.match_indices('.') {
+        let suffix = &domain[idx + 1..];
+        if suffix.contains('.') {
+            candidates.push(suffix.to_owned());
+        }
+    }
+    candidates
+}
+
+fn format_domain_conflict(direct: &str, bypass: &str) -> String {
+    if direct == bypass {
+        direct.to_owned()
+    } else {
+        format!("{direct} <-> {bypass}")
+    }
 }
 
 fn domain_rules_overlap(left: &str, right: &str) -> bool {
