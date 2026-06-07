@@ -145,6 +145,7 @@ tokio = { version = "1.38", features = [
     "net",
     "parking_lot",
     "rt",
+    "signal",
     "sync",
     "time",
 ] }

@@ -22,7 +22,7 @@ use tokio::{net::TcpListener, time};
 
 use crate::{
     config::WebAdminConfig,
-    local::routing::{ManualDomainRule, ManualIpRule, RoutingState, RuleLists},
+    local::routing::{RoutingState, RuleLists},
 };
 
 type ResponseBody = Full<Bytes>;
@@ -176,12 +176,6 @@ impl WebAdminHandler {
                 if let Some(value) = route_sources.geoip_sources {
                     sources.geoip_sources = value;
                 }
-                if let Some(value) = route_sources.geosite_sources {
-                    sources.geosite_sources = value;
-                }
-                if let Some(value) = route_sources.direct_domain_sources {
-                    sources.direct_domain_sources = value;
-                }
                 if let Some(value) = route_sources.bypass_domain_sources {
                     sources.bypass_domain_sources = value;
                 }
@@ -290,32 +284,6 @@ impl WebAdminHandler {
             (Method::PUT, "/api/temp-rules") => {
                 let rules: RuleLists = read_json(req).await?;
                 self.routing_state.set_temporary_rules(rules).await?;
-                Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
-            }
-            (Method::GET, "/api/manual-ip") => Ok(json_response(
-                StatusCode::OK,
-                &self.routing_state.manual_ip_rules().await,
-            )),
-            (Method::PUT, "/api/manual-ip") => {
-                let rule: ManualIpRule = read_json(req).await?;
-                if rule.region.trim().is_empty() {
-                    self.routing_state.remove_manual_ip_rule(&rule.cidr).await?;
-                } else {
-                    self.routing_state.set_manual_ip_rule(rule).await?;
-                }
-                Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
-            }
-            (Method::GET, "/api/manual-domain") => Ok(json_response(
-                StatusCode::OK,
-                &self.routing_state.manual_domain_rules().await,
-            )),
-            (Method::PUT, "/api/manual-domain") => {
-                let rule: ManualDomainRule = read_json(req).await?;
-                if rule.region.trim().is_empty() {
-                    self.routing_state.remove_manual_domain_rule(&rule.domain).await?;
-                } else {
-                    self.routing_state.set_manual_domain_rule(rule).await?;
-                }
                 Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
             }
             (Method::GET, "/api/conflicts/ip") => {
@@ -480,8 +448,6 @@ struct DnsPayload {
 #[derive(serde::Deserialize)]
 struct RouteSourcesPayload {
     geoip_sources: Option<Vec<String>>,
-    geosite_sources: Option<Vec<String>>,
-    direct_domain_sources: Option<Vec<String>>,
     bypass_domain_sources: Option<Vec<String>>,
 }
 
@@ -1058,7 +1024,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <button onclick="saveRules()">Save</button>
       <button onclick="downloadRules()">Download</button>
       <button onclick="generateRules()">Generate</button>
-      <p class="hint">Manual selections and manual_domain.txt/manual_ip.txt changes take effect after Generate.</p>
+      <p class="hint">Source downloads refresh weekly. Generate rebuilds direct_ip.txt from geoip.dat and bypass_domain.txt from gfw.txt.</p>
     </div>
   </section>
 
@@ -1083,7 +1049,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
   <script>
     let currentConfigPath='', currentRawConfig={}, rulesSnapshot={}, servicePlatform=null;
-    const routeSourceKeys=['geoip_sources','geosite_sources','direct_domain_sources','bypass_domain_sources'];
+    const routeSourceKeys=['geoip_sources','bypass_domain_sources'];
     const dnsKeys=['dns_cache_capacity','dns_cache_ttl_seconds','dns_cache_refresh_enabled','dns_cache_refresh_batch_size','dns_intercept_mode','dns_ipv4_only'];
     const sourceKeys=[...routeSourceKeys,...dnsKeys];
     function token(){return new URLSearchParams(location.search).get('token')||''}
@@ -1169,6 +1135,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       delete routeRules.foreign_dns;
       delete routeRules.dns_listen_address;
       delete routeRules.dns_listen_port;
+      delete routeRules.geosite_sources;
+      delete routeRules.direct_domain_sources;
       routeRules.dns_cache_capacity=num(dnsCacheCapacity.value,10000);
       routeRules.dns_cache_ttl_seconds=num(dnsCacheTtl.value,604800);
       routeRules.dns_cache_refresh_enabled=dnsCacheRefreshEnabled.checked;

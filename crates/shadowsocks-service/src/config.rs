@@ -634,10 +634,6 @@ struct SSRouteRulesConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     geoip_sources: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    geosite_sources: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    direct_domain_sources: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     bypass_domain_sources: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dns_cache_capacity: Option<usize>,
@@ -1548,20 +1544,11 @@ pub struct OnlineConfig {
 pub const DEFAULT_GEOIP_SOURCE: &str =
     "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat";
 #[cfg(feature = "local-web-admin")]
-pub const DEFAULT_GEOSITE_SOURCE: &str =
-    "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat";
-#[cfg(feature = "local-web-admin")]
 #[cfg(windows)]
 pub const DEFAULT_DEPLOY_DIR: &str = r"D:\software\shadowsocks";
 #[cfg(feature = "local-web-admin")]
 #[cfg(not(windows))]
 pub const DEFAULT_DEPLOY_DIR: &str = "/usr/local/shadowsocks";
-#[cfg(feature = "local-web-admin")]
-pub const DEFAULT_DIRECT_DOMAIN_SOURCES: &[&str] = &[
-    "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/china-list.txt",
-    "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/apple-cn.txt",
-    "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/google-cn.txt",
-];
 #[cfg(feature = "local-web-admin")]
 pub const DEFAULT_BYPASS_DOMAIN_SOURCES: &[&str] =
     &["https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt"];
@@ -1592,8 +1579,6 @@ impl Default for WebAdminConfig {
 pub struct RouteRulesConfig {
     pub rules_dir: PathBuf,
     pub geoip_sources: Vec<String>,
-    pub geosite_sources: Vec<String>,
-    pub direct_domain_sources: Vec<String>,
     pub bypass_domain_sources: Vec<String>,
     pub dns_cache_capacity: usize,
     pub dns_cache_ttl_seconds: u64,
@@ -1613,8 +1598,6 @@ impl Default for RouteRulesConfig {
         Self {
             rules_dir: PathBuf::from(DEFAULT_DEPLOY_DIR).join("data"),
             geoip_sources: vec![DEFAULT_GEOIP_SOURCE.to_owned()],
-            geosite_sources: vec![DEFAULT_GEOSITE_SOURCE.to_owned()],
-            direct_domain_sources: DEFAULT_DIRECT_DOMAIN_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
             bypass_domain_sources: DEFAULT_BYPASS_DOMAIN_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
             dns_cache_capacity: 100_000,
             dns_cache_ttl_seconds: 7 * 24 * 60 * 60,
@@ -2815,12 +2798,6 @@ impl Config {
                 if let Some(sources) = route_rules.geoip_sources {
                     parsed.geoip_sources = sources;
                 }
-                if let Some(sources) = route_rules.geosite_sources {
-                    parsed.geosite_sources = sources;
-                }
-                if let Some(sources) = route_rules.direct_domain_sources {
-                    parsed.direct_domain_sources = sources;
-                }
                 if let Some(sources) = route_rules.bypass_domain_sources {
                     parsed.bypass_domain_sources = sources;
                 }
@@ -3630,8 +3607,6 @@ impl fmt::Display for Config {
             jconf.route_rules = Some(SSRouteRulesConfig {
                 rules_dir: Some(self.route_rules.rules_dir.clone()),
                 geoip_sources: Some(self.route_rules.geoip_sources.clone()),
-                geosite_sources: Some(self.route_rules.geosite_sources.clone()),
-                direct_domain_sources: Some(self.route_rules.direct_domain_sources.clone()),
                 bypass_domain_sources: Some(self.route_rules.bypass_domain_sources.clone()),
                 dns_cache_capacity: Some(self.route_rules.dns_cache_capacity),
                 dns_cache_ttl_seconds: Some(self.route_rules.dns_cache_ttl_seconds),
