@@ -21,7 +21,7 @@ use crate::{
     local::{
         context::ServiceContext,
         loadbalancing::PingBalancer,
-        net::{UdpAssociationManager, UdpInboundWrite},
+        net::{UdpAssociationKind, UdpAssociationManager, UdpInboundWrite},
         redir::redir_ext::{RedirSocketOpts, UdpSocketRedirExt},
     },
     net::utils::to_ipv4_mapped,
@@ -247,6 +247,7 @@ impl RedirUdpServer {
             self.time_to_live,
             self.capacity,
             self.balancer,
+            UdpAssociationKind::Redir,
         );
 
         let mut pkt_buf = [0u8; MAXIMUM_UDP_PAYLOAD_SIZE];

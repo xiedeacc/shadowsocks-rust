@@ -1,6 +1,10 @@
 //! Shadowsocks Local Utilities
 
-use std::{io, net::SocketAddr, time::Duration};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use log::{debug, trace};
 use shadowsocks::{
@@ -13,6 +17,36 @@ use tokio::{
 };
 
 use crate::local::net::AutoProxyIo;
+
+pub(crate) fn is_fixed_direct_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            octets[0] == 0
+                || octets[0] == 10
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || octets[0] == 127
+                || (octets[0] == 169 && octets[1] == 254)
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 168)
+                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+        }
+        IpAddr::V6(ip) => {
+            ip.is_unspecified()
+                || ip.is_loopback()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+                || (ip.segments()[0] & 0xff00) == 0xff00
+        }
+    }
+}
+
+pub(crate) fn address_is_fixed_direct(addr: &Address) -> bool {
+    match addr {
+        Address::SocketAddress(addr) => is_fixed_direct_ip(&addr.ip()),
+        Address::DomainNameAddress(..) => false,
+    }
+}
 
 pub(crate) async fn establish_tcp_tunnel<P, S>(
     svr_cfg: &ServerConfig,

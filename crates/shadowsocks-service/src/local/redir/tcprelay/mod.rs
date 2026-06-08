@@ -21,7 +21,7 @@ use crate::{
         loadbalancing::PingBalancer,
         net::AutoProxyClientStream,
         redir::redir_ext::{TcpListenerRedirExt, TcpStreamRedirExt},
-        utils::{establish_tcp_tunnel, establish_tcp_tunnel_bypassed},
+        utils::{address_is_fixed_direct, establish_tcp_tunnel, establish_tcp_tunnel_bypassed},
     },
     net::utils::to_ipv4_mapped,
 };
@@ -43,9 +43,12 @@ async fn establish_client_tcp_redir(
         let mut remote = AutoProxyClientStream::connect_bypassed(context.clone(), addr).await?;
         #[cfg(feature = "local-web-admin")]
         if let Some(routing_state) = context.routing_state() {
-            routing_state
-                .record_connection(peer_addr, addr, "tcp", crate::local::routing::ConnectionDecision::Redir)
-                .await;
+            let decision = if address_is_fixed_direct(addr) {
+                crate::local::routing::ConnectionDecision::Direct
+            } else {
+                crate::local::routing::ConnectionDecision::Redir
+            };
+            routing_state.record_connection(peer_addr, addr, "tcp", decision).await;
         }
         return establish_tcp_tunnel_bypassed(&mut stream, &mut remote, peer_addr, addr).await;
     }
@@ -58,9 +61,12 @@ async fn establish_client_tcp_redir(
 
     #[cfg(feature = "local-web-admin")]
     if let Some(routing_state) = context.routing_state() {
-        routing_state
-            .record_connection(peer_addr, addr, "tcp", crate::local::routing::ConnectionDecision::Redir)
-            .await;
+        let decision = if address_is_fixed_direct(addr) {
+            crate::local::routing::ConnectionDecision::Direct
+        } else {
+            crate::local::routing::ConnectionDecision::Redir
+        };
+        routing_state.record_connection(peer_addr, addr, "tcp", decision).await;
     }
 
     establish_tcp_tunnel(svr_cfg, &mut stream, &mut remote, peer_addr, addr).await

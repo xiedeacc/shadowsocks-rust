@@ -1,5 +1,7 @@
 //! Shadowsocks Local server serving on a Tun interface
 
+#[cfg(windows)]
+use std::net::ToSocketAddrs;
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 #[cfg(windows)]
@@ -138,14 +140,22 @@ impl TunBuilder {
         );
 
         #[cfg(windows)]
-        let bypass_route_ips = self
-            .balancer
-            .servers()
-            .filter_map(|server| match server.server_config().addr() {
-                ServerAddr::SocketAddr(addr) => Some(addr.ip()),
-                ServerAddr::DomainName(..) => None,
-            })
-            .collect();
+        let bypass_route_ips = {
+            let mut ips = Vec::new();
+            for server in self.balancer.servers() {
+                match server.server_config().addr() {
+                    ServerAddr::SocketAddr(addr) => ips.push(addr.ip()),
+                    ServerAddr::DomainName(host, port) => {
+                        if let Ok(ip) = host.parse::<IpAddr>() {
+                            ips.push(ip);
+                        } else if let Ok(addrs) = (host.as_str(), *port).to_socket_addrs() {
+                            ips.extend(addrs.map(|addr| addr.ip()));
+                        }
+                    }
+                }
+            }
+            ips
+        };
 
         let tcp = TcpTun::new(
             self.context.clone(),

@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(feature = "local-web-admin")]
 use crate::local::routing::RouteDecision;
 use crate::{
-    local::{context::ServiceContext, loadbalancing::ServerIdent},
+    local::{context::ServiceContext, loadbalancing::ServerIdent, utils::address_is_fixed_direct},
     net::{MonProxyStream, OutboundProxyStream, TcpDialer},
 };
 
@@ -190,6 +190,33 @@ impl AutoProxyClientStream {
                 trace!("Proxy target address {addr}");
                 Self::connect_proxied_with_opts_inner(context, server, addr, opts).await
             }
+        }
+    }
+
+    /// Connect through the selected Shadowsocks server unless the resolved
+    /// target is one of the fixed Direct exception ranges.
+    pub async fn connect_proxied_or_fixed_direct_with_opts<A>(
+        context: Arc<ServiceContext>,
+        server: &ServerIdent,
+        addr: A,
+        opts: &ConnectOpts,
+    ) -> io::Result<Self>
+    where
+        A: Into<Address>,
+    {
+        #[cfg_attr(not(feature = "local-fake-dns"), allow(unused_mut))]
+        let mut addr = addr.into();
+        #[cfg(feature = "local-fake-dns")]
+        if let Some(mapped_addr) = context.try_map_fake_address(&addr).await {
+            addr = mapped_addr;
+        }
+
+        if address_is_fixed_direct(&addr) {
+            trace!("Fixed-Direct target address {addr}");
+            Self::connect_bypassed_with_opts_inner(context, addr, opts).await
+        } else {
+            trace!("Proxy target address {addr}");
+            Self::connect_proxied_with_opts_inner(context, server, addr, opts).await
         }
     }
 

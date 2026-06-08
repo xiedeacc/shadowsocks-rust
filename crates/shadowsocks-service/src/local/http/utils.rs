@@ -136,8 +136,13 @@ pub async fn connect_host(
         Some(balancer) => {
             let server = balancer.best_tcp_server();
 
-            match AutoProxyClientStream::connect_with_opts(context, server.as_ref(), host, server.connect_opts_ref())
-                .await
+            match AutoProxyClientStream::connect_proxied_or_fixed_direct_with_opts(
+                context,
+                server.as_ref(),
+                host,
+                server.connect_opts_ref(),
+            )
+            .await
             {
                 Ok(s) => Ok((s, Some(server))),
                 Err(err) => {

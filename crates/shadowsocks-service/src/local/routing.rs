@@ -59,6 +59,7 @@ static ADD_DNS_RESULTS_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 const SLOW_HOT_PATH_MS: u128 = 100;
 
 use crate::config::RouteRulesConfig;
+use crate::local::utils::is_fixed_direct_ip;
 
 const DIRECT_IP_FILE: &str = "direct_ip.txt";
 const DIRECT_DOMAIN_FILE: &str = "direct_domain.txt";
@@ -221,14 +222,10 @@ pub struct ConnectionEvent {
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionDecision {
     Direct,
-    Proxy,
     HttpProxy,
     Socks5Proxy,
     Redir,
     Tun,
-    /// Flow observed in the kernel (conntrack / /proc/net/{tcp,udp}) but not
-    /// matched to an in-memory sslocal decision.
-    Observed,
 }
 
 /// Five-tuple identifying a kernel-visible flow, used as the key of
@@ -559,12 +556,6 @@ fn spawn_record_worker(
                     {
                         let mut inner = inner.write().await;
                         if !is_record_session_active(&control, event.session_id) {
-                            continue;
-                        }
-                        if event.destination_ip.is_some_and(|ip| is_private_connection_ip(&ip)) {
-                            continue;
-                        }
-                        if matches!(event.decision, ConnectionDecision::Proxy | ConnectionDecision::Observed) {
                             continue;
                         }
                         let domain = event.destination_domain.clone().or_else(|| {
@@ -1653,12 +1644,6 @@ impl RoutingState {
             Address::SocketAddress(saddr) => (Some(saddr.ip()), None, saddr.port()),
             Address::DomainNameAddress(domain, port) => (None, Some(domain.clone()), *port),
         };
-        if destination_ip.is_some_and(|ip| is_private_connection_ip(&ip)) {
-            return;
-        }
-        if matches!(decision, ConnectionDecision::Proxy | ConnectionDecision::Observed) {
-            return;
-        }
         if self
             .record_tx
             .try_send(RecordCommand::Connection(RecordConnectionEvent {
@@ -2620,23 +2605,8 @@ fn debug_ip_query_matches(query: &DebugIpQuery, net: &IpNet) -> bool {
     }
 }
 
-fn is_private_connection_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            ip.is_loopback()
-                || ip.octets()[0] == 10
-                || (ip.octets()[0] == 172 && (16..=31).contains(&ip.octets()[1]))
-                || (ip.octets()[0] == 192 && ip.octets()[1] == 168)
-        }
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip
-                    .to_ipv4_mapped()
-                    .is_some_and(|ip| is_private_connection_ip(&IpAddr::V4(ip)))
-                || (ip.segments()[0] & 0xfe00) == 0xfc00
-                || (ip.segments()[0] & 0xffc0) == 0xfe80
-        }
-    }
+fn is_filtered_system_connection_ip(ip: &IpAddr) -> bool {
+    is_fixed_direct_ip(ip)
 }
 
 fn connection_key(event: &ConnectionEvent) -> (IpAddr, u16, Option<IpAddr>, Option<String>, u16, String) {
@@ -2726,7 +2696,7 @@ fn parse_conntrack_line(line: &str, reverse_domains: &HashMap<IpAddr, String>) -
         }
     }
     let destination_ip = destination_ip?;
-    if is_private_connection_ip(&destination_ip) {
+    if is_filtered_system_connection_ip(&destination_ip) {
         return None;
     }
     Some(ConnectionEvent {
@@ -2777,7 +2747,10 @@ fn parse_proc_net_line(
     }
     let (source_ip, source_port) = parse_proc_net_addr(local, ipv6)?;
     let (destination_ip, destination_port) = parse_proc_net_addr(remote, ipv6)?;
-    if destination_port == 0 || is_unspecified_ip(&destination_ip) || is_private_connection_ip(&destination_ip) {
+    if destination_port == 0
+        || is_unspecified_ip(&destination_ip)
+        || is_filtered_system_connection_ip(&destination_ip)
+    {
         return None;
     }
     Some(ConnectionEvent {
@@ -3422,6 +3395,102 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ss-rust-routing-{name}-{}", now()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    async fn wait_for_recorded_connection(
+        state: &RoutingState,
+        source: SocketAddr,
+        destination: IpAddr,
+        port: u16,
+    ) -> ConnectionEvent {
+        for _ in 0..50 {
+            if let Some(row) = state.recent_connections(&HashSet::new()).await.into_iter().find(|row| {
+                row.source_ip == source.ip()
+                    && row.source_port == source.port()
+                    && row.destination_ip == Some(destination)
+                    && row.destination_port == port
+            }) {
+                return row;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("recorded connection was not observed");
+    }
+
+    #[test]
+    fn fixed_direct_ip_matches_documented_ranges() {
+        for ip in [
+            "0.1.2.3",
+            "10.1.2.3",
+            "100.64.0.1",
+            "100.127.255.255",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "::",
+            "::1",
+            "fc00::1",
+            "fdff::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            assert!(is_fixed_direct_ip(&ip.parse().unwrap()), "{ip}");
+        }
+
+        for ip in ["1.1.1.1", "100.128.0.1", "172.32.0.1", "198.20.0.1", "2001:db8::1"] {
+            assert!(!is_fixed_direct_ip(&ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_recording_keeps_fixed_direct_application_events() {
+        let dir = temp_rules_dir("record-fixed-direct");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+
+        assert!(state.recent_connections(&HashSet::new()).await.is_empty());
+        state.start_activity_recording().await.unwrap();
+
+        let source = "127.0.0.1:40000".parse::<SocketAddr>().unwrap();
+        let destination = "10.1.2.3".parse::<IpAddr>().unwrap();
+        let target = Address::SocketAddress(SocketAddr::new(destination, 443));
+        state
+            .record_connection(source, &target, "tcp", ConnectionDecision::Direct)
+            .await;
+
+        let row = wait_for_recorded_connection(&state, source, destination, 443).await;
+        assert_eq!(row.decision, ConnectionDecision::Direct);
+
+        state.stop_activity_recording().await.unwrap();
+        assert!(state.recent_connections(&HashSet::new()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn activity_recording_records_socks5_proxy_decision() {
+        let dir = temp_rules_dir("record-socks5-proxy");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+        state.start_activity_recording().await.unwrap();
+
+        let source = "127.0.0.1:40001".parse::<SocketAddr>().unwrap();
+        let destination = "203.0.113.10".parse::<IpAddr>().unwrap();
+        let target = Address::SocketAddress(SocketAddr::new(destination, 443));
+        state
+            .record_connection(source, &target, "tcp", ConnectionDecision::Socks5Proxy)
+            .await;
+
+        let row = wait_for_recorded_connection(&state, source, destination, 443).await;
+        assert_eq!(row.decision, ConnectionDecision::Socks5Proxy);
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     convert::Infallible,
     fs, io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::PathBuf,
     pin::Pin,
     process::{Command, Stdio},
@@ -635,8 +635,28 @@ fn server_filters_from_config_path(config_path: &PathBuf) -> HashSet<IpAddr> {
         .and_then(|servers| servers.as_array())
         .into_iter()
         .flatten()
-        .filter_map(|server| server.get("server")?.as_str()?.parse::<IpAddr>().ok())
+        .flat_map(|server| {
+            let Some(host) = server.get("server").and_then(|value| value.as_str()) else {
+                return Vec::new();
+            };
+            let port = server
+                .get("server_port")
+                .and_then(|value| value.as_u64())
+                .and_then(|port| u16::try_from(port).ok())
+                .unwrap_or(0);
+            server_filter_ips(host, port)
+        })
         .collect()
+}
+
+fn server_filter_ips(host: &str, port: u16) -> Vec<IpAddr> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return vec![ip];
+    }
+    (host, port)
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+        .unwrap_or_default()
 }
 
 fn run_debug_curl(url: &str) -> io::Result<DebugCurlResult> {

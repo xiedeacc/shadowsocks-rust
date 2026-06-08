@@ -59,8 +59,8 @@
 - `geoip_cn`：从 `data/source/geoip.dat` 解析出的 CN CIDR。
 - `*_modified`：规则文件和 `geoip.dat` 的 mtime，用于冲突 API 懒刷新。
 - `ip_conflicts` / `domain_conflicts`：当前冲突结果。
-- `connections` / `dns`：最近连接和最近 DNS 事件，最多 4096 条，默认保留 300 秒。
-- `flow_decisions`：5 元组到权威连接决策的映射，TTL 1 小时，用于重标记 conntrack 或 `/proc/net/*` 中看到的长连接。
+- `connections` / `dns`：当前 Record 会话内的最近连接和最近 DNS 事件，最多 4096 条；Record 开启时清空，关闭或过期时整体清空。
+- `flow_decisions`：当前 Record 会话内 5 元组到权威连接决策的映射，用于重标记 conntrack 或 `/proc/net/*` 中看到的连接；随 Record 会话整体清空。
 - `reverse_domains`：IP 到域名的反向映射，来自 DNS 结果。
 - `dns_cache` / `dns_cache_order`：路由 DNS 缓存和 FIFO 容量控制队列。
 - `proxy_ip_dirty` / `proxy_ip_persist_scheduled`：运行时学习到的 Proxy IP 是否需要延迟写入 `proxy_ip.txt`。
@@ -811,7 +811,7 @@ Debug IP 不检查临时规则，也不检查 Direct 规则。
 - `recent_connections()` 以 conntrack + `/proc/net/tcp`、`udp`、`tcp6`、`udp6` 为主数据源。
 - 读取所有出站连接后过滤：
   - 目标地址为 SS server IP 的连接
-  - private / unspecified / listen 行
+  - 固定 Direct 例外网段 / unspecified / listen 行
 - 每条系统连接默认标为 `direct`。
 - 用 `flow_decisions` 按 5 元组 O(1) 查表：
   - 命中 `socks5_proxy` / `http_proxy` / `redir` / `tun` 时覆盖显示
@@ -907,7 +907,6 @@ Debug IP 不检查临时规则，也不检查 Direct 规则。
   - `record_connection()` 位于转发热路径，只允许做固定小成本操作：
     - 读取 Record 开关、过期时间和当前 `record_session_id`。
     - 如果 Record 未开启或已过期，立即返回。
-    - 如果目标是 private / local / link-local 等不应展示的地址，立即返回。
     - 构造轻量 `RecordEvent::Connection { session_id, source, target, protocol, decision }`。
     - 使用非阻塞 `try_send` 投递到 Record 队列。
   - `record_connection()` 不直接写入 `connections`，不直接更新 `flow_decisions`，不直接追加 `record.txt`，也不等待 Record worker 完成。
@@ -915,7 +914,6 @@ Debug IP 不检查临时规则，也不检查 Direct 规则。
 3. Record worker 消费连接事件
   - Record worker 从队列中串行消费 `RecordEvent::Connection`。
   - 如果事件的 `session_id` 不是当前本轮 Record，说明它来自旧会话或过期投递，直接丢弃。
-  - 如果目标是 private / local / link-local 等不应展示的地址，直接跳过。
   - 如果目标包含 `destination_ip` 且协议是 TCP/UDP，就生成 5 元组写入 `flow_decisions`：
     - socks5 入口写 `socks5_proxy`
     - http 入口写 `http_proxy`
@@ -955,7 +953,7 @@ Debug IP 不检查临时规则，也不检查 Direct 规则。
     - `/proc/net/udp`
     - `/proc/net/tcp6`
     - `/proc/net/udp6`
-  - 每条系统连接先过滤 listen、unspecified、private、SS server IP。
+  - 每条系统连接先过滤 listen、unspecified、固定 Direct 例外网段、SS server IP。
   - 系统连接默认标记为 `direct`。
   - 如果系统连接 5 元组命中 `flow_decisions`，用权威决策覆盖默认值。
   - 如果 `dedupped_recent_connections` 中没有同一条连接，则追加到返回结果。
@@ -1013,7 +1011,7 @@ Debug IP 不检查临时规则，也不检查 Direct 规则。
   - 如需防御极端高 churn 环境，可保留简单最大数量上限，但不需要把逐项清理放到查询路径。
 - 热路径尽早返回：
   - `record_connection()` / `record_dns()` 在 Record 未开启或过期时立即返回，正常代理流量不承担 Recent 活动记录成本。
-  - private/local 目标在记录入口直接跳过，减少无意义事件和后续合并成本。
+  - 固定 Direct 例外目标由入口记录为 `direct`；系统快照仍过滤这些网段，避免把本地/LAN 噪声补入列表。
 - 系统快照采集保守串行：
   - 先串行读取 conntrack/proc，逻辑简单且避免额外任务调度。
   - 如果实测路由器或高连接数环境下慢，再把系统快照采集放到 `spawn_blocking` 或拆成并行读取；这属于后续性能验证后的优化，不影响当前方案正确性。
@@ -1036,8 +1034,8 @@ Debug IP 不检查临时规则，也不检查 Direct 规则。
   - SOCKS 目标命中固定 Direct 例外网段时走 Direct，并记录 `ConnectionDecision::Direct`。
   - 记录 `ConnectionDecision::Socks5Proxy`。
 - `crates/shadowsocks-service/src/local/net/udp/association.rs`
-  - 避免记录 `ConnectionDecision::Proxy`。
-  - 如需记录 UDP，应由调用入口传入 socks/redir/tun 类型；否则系统快照默认 direct。
+  - UDP 代理分支按调用入口记录 `socks5_proxy` / `redir` / `tun`。
+  - tunnel UDP 不补充 Recent Connections；否则系统快照默认 direct。
   - UDP 目标命中固定 Direct 例外网段时记录 `ConnectionDecision::Direct`。
 - redir/tun 相关入口
   - 目标命中固定 Direct 例外网段时走 Direct，并记录 `ConnectionDecision::Direct`。
@@ -1162,4 +1160,3 @@ flowchart TD
 - 临时规则优先生效，但不写入冲突 JSONL。
 - Debug IP 只验证持久化 `proxy_ip.txt` 和 nft Proxy set，不代表完整路由决策。
 - Debug URL 使用 `curl -4`，因此主要验证 IPv4 透明代理链路。
-

@@ -26,15 +26,15 @@ use shadowsocks::{
     },
 };
 
+#[cfg(feature = "local-web-admin")]
+use crate::local::routing::{ConnectionDecision, RouteDecision};
 use crate::{
-    local::{context::ServiceContext, loadbalancing::PingBalancer},
+    local::{context::ServiceContext, loadbalancing::PingBalancer, utils::address_is_fixed_direct},
     net::{
         MonProxySocket, OutboundProxyDatagram, TcpDialer, UDP_ASSOCIATION_KEEP_ALIVE_CHANNEL_SIZE,
         UDP_ASSOCIATION_SEND_CHANNEL_SIZE, packet_window::PacketWindowFilter,
     },
 };
-#[cfg(feature = "local-web-admin")]
-use crate::local::routing::RouteDecision;
 
 /// Build the Proxy socket appropriate for `svr_cfg`, transparently
 /// going through the configured outbound chain when one is present and
@@ -112,6 +112,26 @@ pub trait UdpInboundWrite {
     async fn send_to(&self, peer_addr: SocketAddr, remote_addr: &Address, data: &[u8]) -> io::Result<()>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UdpAssociationKind {
+    Socks5,
+    Redir,
+    Tun,
+    Tunnel,
+}
+
+impl UdpAssociationKind {
+    #[cfg(feature = "local-web-admin")]
+    fn proxied_connection_decision(self) -> Option<ConnectionDecision> {
+        match self {
+            Self::Socks5 => Some(ConnectionDecision::Socks5Proxy),
+            Self::Redir => Some(ConnectionDecision::Redir),
+            Self::Tun => Some(ConnectionDecision::Tun),
+            Self::Tunnel => None,
+        }
+    }
+}
+
 type AssociationMap<W> = LruCache<SocketAddr, UdpAssociation<W>>;
 
 /// UDP association manager
@@ -124,6 +144,7 @@ where
     assoc_map: AssociationMap<W>,
     keepalive_tx: mpsc::Sender<SocketAddr>,
     balancer: PingBalancer,
+    kind: UdpAssociationKind,
     server_session_expire_duration: Duration,
 }
 
@@ -140,6 +161,7 @@ where
         time_to_live: Option<Duration>,
         capacity: Option<usize>,
         balancer: PingBalancer,
+        kind: UdpAssociationKind,
     ) -> (Self, Duration, mpsc::Receiver<SocketAddr>) {
         let time_to_live = time_to_live.unwrap_or(crate::DEFAULT_UDP_EXPIRY_DURATION);
         let assoc_map = match capacity {
@@ -156,6 +178,7 @@ where
                 assoc_map,
                 keepalive_tx,
                 balancer,
+                kind,
                 server_session_expire_duration: time_to_live,
             },
             time_to_live,
@@ -182,6 +205,7 @@ where
             peer_addr,
             self.keepalive_tx.clone(),
             self.balancer.clone(),
+            self.kind,
             self.respond_writer.clone(),
             self.server_session_expire_duration,
         );
@@ -232,6 +256,7 @@ where
         peer_addr: SocketAddr,
         keepalive_tx: mpsc::Sender<SocketAddr>,
         balancer: PingBalancer,
+        kind: UdpAssociationKind,
         respond_writer: W,
         server_session_expire_duration: Duration,
     ) -> Self {
@@ -240,6 +265,7 @@ where
             peer_addr,
             keepalive_tx,
             balancer,
+            kind,
             respond_writer,
             server_session_expire_duration,
         );
@@ -289,6 +315,7 @@ where
     keepalive_tx: mpsc::Sender<SocketAddr>,
     keepalive_flag: bool,
     balancer: PingBalancer,
+    kind: UdpAssociationKind,
     respond_writer: W,
     client_session_id: u64,
     client_packet_id: u64,
@@ -329,6 +356,7 @@ where
         peer_addr: SocketAddr,
         keepalive_tx: mpsc::Sender<SocketAddr>,
         balancer: PingBalancer,
+        kind: UdpAssociationKind,
         respond_writer: W,
         server_session_expire_duration: Duration,
     ) -> (JoinHandle<()>, mpsc::Sender<(Address, Bytes)>) {
@@ -346,6 +374,7 @@ where
             keepalive_tx,
             keepalive_flag: false,
             balancer,
+            kind,
             respond_writer,
             // client_session_id must be random generated,
             // server use this ID to identify every independent clients.
@@ -498,18 +527,15 @@ where
     }
 
     async fn dispatch_received_packet(&mut self, target_addr: &Address, data: &[u8]) {
-        let direct = self.balancer.is_empty() || self.route_target_is_direct(target_addr).await;
+        let direct = self.target_should_dispatch_direct(target_addr).await;
 
         #[cfg(feature = "local-web-admin")]
         if let Some(routing_state) = self.context.routing_state() {
-            let decision = if direct {
-                crate::local::routing::ConnectionDecision::Direct
-            } else {
-                crate::local::routing::ConnectionDecision::Proxy
-            };
-            routing_state
-                .record_connection(self.peer_addr, target_addr, "udp", decision)
-                .await;
+            if let Some(decision) = self.connection_decision(target_addr, direct) {
+                routing_state
+                    .record_connection(self.peer_addr, target_addr, "udp", decision)
+                    .await;
+            }
         }
 
         trace!(
@@ -538,6 +564,38 @@ where
                 data.len(),
                 err
             );
+        }
+    }
+
+    async fn target_should_dispatch_direct(&self, target_addr: &Address) -> bool {
+        if self.balancer.is_empty() {
+            return true;
+        }
+
+        match self.kind {
+            UdpAssociationKind::Socks5 => address_is_fixed_direct(target_addr),
+            UdpAssociationKind::Redir | UdpAssociationKind::Tun | UdpAssociationKind::Tunnel => {
+                self.route_target_is_direct(target_addr).await
+            }
+        }
+    }
+
+    #[cfg(feature = "local-web-admin")]
+    fn connection_decision(&self, target_addr: &Address, direct: bool) -> Option<ConnectionDecision> {
+        match self.kind {
+            UdpAssociationKind::Socks5 => Some(if direct {
+                ConnectionDecision::Direct
+            } else {
+                ConnectionDecision::Socks5Proxy
+            }),
+            UdpAssociationKind::Redir | UdpAssociationKind::Tun => {
+                if address_is_fixed_direct(target_addr) {
+                    Some(ConnectionDecision::Direct)
+                } else {
+                    self.kind.proxied_connection_decision()
+                }
+            }
+            UdpAssociationKind::Tunnel => None,
         }
     }
 

@@ -74,7 +74,7 @@
 - `recent_connections()` 以 conntrack + `/proc/net/tcp`、`udp`、`tcp6`、`udp6` 为主数据源。
 - 读取所有出站连接后过滤：
   - 目标地址为 SS server IP 的连接
-  - private / unspecified / listen 行
+  - 固定 Direct 例外网段 / unspecified / listen 行
 - 每条系统连接默认标为 `direct`。
 - 用 `flow_decisions` 按 5 元组 O(1) 查表：
   - 命中 `socks5_proxy` / `http_proxy` / `redir` / `tun` 时覆盖显示
@@ -170,7 +170,6 @@
   - `record_connection()` 位于转发热路径，只允许做固定小成本操作：
     - 读取 Record 开关、过期时间和当前 `record_session_id`。
     - 如果 Record 未开启或已过期，立即返回。
-    - 如果目标是 private / local / link-local 等不应展示的地址，立即返回。
     - 构造轻量 `RecordEvent::Connection { session_id, source, target, protocol, decision }`。
     - 使用非阻塞 `try_send` 投递到 Record 队列。
   - `record_connection()` 不直接写入 `connections`，不直接更新 `flow_decisions`，不直接追加 `record.txt`，也不等待 Record worker 完成。
@@ -178,7 +177,6 @@
 3. Record worker 消费连接事件
   - Record worker 从队列中串行消费 `RecordEvent::Connection`。
   - 如果事件的 `session_id` 不是当前本轮 Record，说明它来自旧会话或过期投递，直接丢弃。
-  - 如果目标是 private / local / link-local 等不应展示的地址，直接跳过。
   - 如果目标包含 `destination_ip` 且协议是 TCP/UDP，就生成 5 元组写入 `flow_decisions`：
     - socks5 入口写 `socks5_proxy`
     - http 入口写 `http_proxy`
@@ -218,7 +216,7 @@
     - `/proc/net/udp`
     - `/proc/net/tcp6`
     - `/proc/net/udp6`
-  - 每条系统连接先过滤 listen、unspecified、private、SS server IP。
+  - 每条系统连接先过滤 listen、unspecified、固定 Direct 例外网段、SS server IP。
   - 系统连接默认标记为 `direct`。
   - 如果系统连接 5 元组命中 `flow_decisions`，用权威决策覆盖默认值。
   - 如果 `dedupped_recent_connections` 中没有同一条连接，则追加到返回结果。
@@ -276,7 +274,7 @@
   - 如需防御极端高 churn 环境，可保留简单最大数量上限，但不需要把逐项清理放到查询路径。
 - 热路径尽早返回：
   - `record_connection()` / `record_dns()` 在 Record 未开启或过期时立即返回，正常代理流量不承担 Recent 活动记录成本。
-  - private/local 目标在记录入口直接跳过，减少无意义事件和后续合并成本。
+  - 固定 Direct 例外目标由入口记录为 `direct`；系统快照仍过滤这些网段，避免把本地/LAN 噪声补入列表。
 - 系统快照采集保守串行：
   - 先串行读取 conntrack/proc，逻辑简单且避免额外任务调度。
   - 如果实测路由器或高连接数环境下慢，再把系统快照采集放到 `spawn_blocking` 或拆成并行读取；这属于后续性能验证后的优化，不影响当前方案正确性。
@@ -299,8 +297,8 @@
   - SOCKS 目标命中固定 Direct 例外网段时走 Direct，并记录 `ConnectionDecision::Direct`。
   - 记录 `ConnectionDecision::Socks5Proxy`。
 - `crates/shadowsocks-service/src/local/net/udp/association.rs`
-  - 避免记录 `ConnectionDecision::Proxy`。
-  - 如需记录 UDP，应由调用入口传入 socks/redir/tun 类型；否则系统快照默认 direct。
+  - UDP 代理分支按调用入口记录 `socks5_proxy` / `redir` / `tun`。
+  - tunnel UDP 不补充 Recent Connections；否则系统快照默认 direct。
   - UDP 目标命中固定 Direct 例外网段时记录 `ConnectionDecision::Direct`。
 - redir/tun 相关入口
   - 目标命中固定 Direct 例外网段时走 Direct，并记录 `ConnectionDecision::Direct`。
@@ -319,4 +317,3 @@
 - `cargo check --no-default-features --features 'local local-http-rustls' --bin sslocal`
 - `cargo test -p shadowsocks-service --features local-web-admin,local-dns,local-redir,local-tun local::routing`
 - 扫描确保管理页 Recent Connections 不会再输出 `proxy` / `observed`。
-

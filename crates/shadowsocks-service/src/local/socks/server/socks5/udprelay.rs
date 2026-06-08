@@ -23,7 +23,9 @@ use crate::{
     local::{
         context::ServiceContext,
         loadbalancing::PingBalancer,
-        net::{UdpAssociationManager, UdpInboundWrite, udp::listener::create_standard_udp_listener},
+        net::{
+            UdpAssociationKind, UdpAssociationManager, UdpInboundWrite, udp::listener::create_standard_udp_listener,
+        },
     },
     net::utils::to_ipv4_mapped,
 };
@@ -154,6 +156,7 @@ impl Socks5UdpServer {
             self.time_to_live,
             self.capacity,
             self.balancer,
+            UdpAssociationKind::Socks5,
         );
 
         let mut buffer = [0u8; MAXIMUM_UDP_PAYLOAD_SIZE];

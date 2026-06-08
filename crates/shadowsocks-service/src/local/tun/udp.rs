@@ -15,7 +15,7 @@ use crate::{
     local::{
         context::ServiceContext,
         loadbalancing::PingBalancer,
-        net::{UdpAssociationManager, UdpInboundWrite},
+        net::{UdpAssociationKind, UdpAssociationManager, UdpInboundWrite},
     },
     net::utils::to_ipv4_mapped,
 };
@@ -36,8 +36,14 @@ impl UdpTun {
     ) -> (Self, Duration, mpsc::Receiver<SocketAddr>) {
         let (tun_tx, tun_rx) = mpsc::channel(64);
         let writer = UdpTunInboundWriter::new(tun_tx);
-        let (manager, cleanup_interval, keepalive_rx) =
-            UdpAssociationManager::new(context.clone(), writer.clone(), time_to_live, capacity, balancer);
+        let (manager, cleanup_interval, keepalive_rx) = UdpAssociationManager::new(
+            context.clone(),
+            writer.clone(),
+            time_to_live,
+            capacity,
+            balancer,
+            UdpAssociationKind::Tun,
+        );
 
         (
             Self {

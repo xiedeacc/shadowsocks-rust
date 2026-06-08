@@ -1,7 +1,7 @@
 //! Shadowsocks Local Server
 
 #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::future;
@@ -1057,16 +1057,19 @@ fn collect_dns_intercept_exempt_ips(state: &DnsRuntimeState) -> Vec<IpAddr> {
 /// its own transport connection.
 #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
 fn collect_dns_intercept_tcp_exempt_endpoints(config: &Config) -> Vec<(IpAddr, u16)> {
-    let mut endpoints = config
-        .server
-        .iter()
-        .filter_map(|server| match server.config.addr() {
-            shadowsocks::config::ServerAddr::SocketAddr(addr) => Some((addr.ip(), addr.port())),
+    let mut endpoints = Vec::new();
+    for server in &config.server {
+        match server.config.addr() {
+            shadowsocks::config::ServerAddr::SocketAddr(addr) => endpoints.push((addr.ip(), addr.port())),
             shadowsocks::config::ServerAddr::DomainName(host, port) => {
-                host.parse::<IpAddr>().ok().map(|ip| (ip, *port))
+                if let Ok(ip) = host.parse::<IpAddr>() {
+                    endpoints.push((ip, *port));
+                } else if let Ok(addrs) = (host.as_str(), *port).to_socket_addrs() {
+                    endpoints.extend(addrs.map(|addr| (addr.ip(), *port)));
+                }
             }
-        })
-        .collect::<Vec<_>>();
+        }
+    }
     endpoints.sort_unstable();
     endpoints.dedup();
     endpoints

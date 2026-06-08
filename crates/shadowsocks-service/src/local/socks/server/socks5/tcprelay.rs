@@ -240,7 +240,7 @@ impl Socks5TcpHandler {
         } else {
             let server = self.balancer.best_tcp_server();
 
-            let r = AutoProxyClientStream::connect_with_opts(
+            let r = AutoProxyClientStream::connect_proxied_or_fixed_direct_with_opts(
                 context.clone(),
                 &server,
                 &target_addr,
