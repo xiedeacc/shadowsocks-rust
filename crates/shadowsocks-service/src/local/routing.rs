@@ -435,6 +435,7 @@ struct RoutingInner {
     persistent: CompiledRules,
     geoip_cn: Vec<IpNet>,
     geoip_modified: Option<SystemTime>,
+    temporary_fingerprint: Vec<Option<u64>>,
     direct_ip_modified: Option<SystemTime>,
     bypass_ip_modified: Option<SystemTime>,
     direct_domain_modified: Option<SystemTime>,
@@ -493,6 +494,7 @@ impl RoutingState {
         let direct_domain_modified = file_modified(&config.rules_dir.join(DIRECT_DOMAIN_FILE))?;
         let bypass_domain_modified = file_modified(&config.rules_dir.join(BYPASS_DOMAIN_FILE))?;
         let temporary_raw = with_private_direct_rules(read_temporary_rule_lists(&config.rules_dir)?);
+        let temporary_fingerprint = temporary_files_fingerprint(&config.rules_dir)?;
         let temporary = compile_rules(&temporary_raw);
         let mut inner = RoutingInner {
             sources: RoutingSources::from(&config),
@@ -503,6 +505,7 @@ impl RoutingState {
             persistent,
             geoip_cn,
             geoip_modified,
+            temporary_fingerprint,
             direct_ip_modified,
             bypass_ip_modified,
             direct_domain_modified,
@@ -527,6 +530,7 @@ impl RoutingState {
             dns_runtime: Arc::new(TokioRwLock::new(DnsRuntimeState::default())),
         };
         state.spawn_periodic_source_update();
+        state.spawn_periodic_temporary_reload();
         Ok(state)
     }
 
@@ -568,6 +572,7 @@ impl RoutingState {
         };
         let mut inner = self.inner.write().await;
         write_temporary_rule_lists(&inner.rules_dir, &rules)?;
+        inner.temporary_fingerprint = temporary_files_fingerprint(&inner.rules_dir)?;
         inner.temporary_raw = rules;
         inner.temporary = compile_rules(&inner.temporary_raw);
         rebuild_conflicts(&mut inner);
@@ -579,6 +584,39 @@ impl RoutingState {
             }
         }
         Ok(())
+    }
+
+    pub async fn save_temporary_rules_to_files(&self, rules: RuleLists) -> io::Result<()> {
+        let rules = with_private_direct_rules(normalize_rule_lists(rules));
+        validate_temporary_rules(&rules)?;
+        let rules_dir = self.inner.read().await.rules_dir.clone();
+        write_temporary_rule_lists(&rules_dir, &rules)
+    }
+
+    pub async fn reload_temporary_rules_from_files(&self) -> io::Result<RuleLists> {
+        let rules_dir = self.inner.read().await.rules_dir.clone();
+        let rules = with_private_direct_rules(read_temporary_rule_lists(&rules_dir)?);
+        validate_temporary_rules(&rules)?;
+        let temporary_fingerprint = temporary_files_fingerprint(&rules_dir)?;
+        #[cfg(all(target_os = "linux", feature = "local-dns"))]
+        let bypass_nets = {
+            let inner = self.inner.read().await;
+            temporary_nft_bypass_nets(&inner, &rules)
+        };
+        let mut inner = self.inner.write().await;
+        inner.temporary_fingerprint = temporary_fingerprint;
+        inner.temporary_raw = rules;
+        inner.temporary = compile_rules(&inner.temporary_raw);
+        rebuild_conflicts(&mut inner);
+        let temporary = inner.temporary_raw.clone();
+        drop(inner);
+        #[cfg(all(target_os = "linux", feature = "local-dns"))]
+        {
+            if let Err(err) = crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &[], &bypass_nets) {
+                warn!("failed to refresh nft bypass set after temporary rule reload: {}", err);
+            }
+        }
+        Ok(temporary)
     }
 
     pub async fn route_ip(&self, ip: &IpAddr) -> Option<RouteDecision> {
@@ -608,28 +646,19 @@ impl RoutingState {
         ADD_DNS_RESULTS_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
 
         let mut schedule_bypass_persist = false;
-        let additions = {
+        let nft_ips = {
             let mut inner = self.inner.write().await;
-            let mut additions = Vec::new();
+            let mut nft_ips = Vec::new();
             let mut lines = Vec::new();
+            let mut bypass_changed = false;
             for ip in results {
-                let target_exists = match decision {
-                    RouteDecision::Direct => {
-                        compiled_rules_match_ip(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip, ip)
-                    }
-                    RouteDecision::Proxy => {
-                        compiled_rules_match_ip(&inner.persistent.bypass_ip_exact, &inner.persistent.bypass_ip, ip)
-                    }
-                };
                 match decision {
                     RouteDecision::Direct => {
-                        if target_exists {
-                            continue;
-                        }
-                        additions.push(*ip);
-                        lines.push(ip.to_string());
+                        nft_ips.push(*ip);
                     }
                     RouteDecision::Proxy => {
+                        let target_exists =
+                            compiled_rules_match_ip(&inner.persistent.bypass_ip_exact, &inner.persistent.bypass_ip, ip);
                         let line = format_bypass_ip_domain_line(ip, domain);
                         match inner
                             .persistent_raw
@@ -640,6 +669,7 @@ impl RoutingState {
                             Some(idx) => {
                                 if bypass_ip_line_domain(&inner.persistent_raw.bypass_ip[idx]).is_none() {
                                     inner.persistent_raw.bypass_ip[idx] = line;
+                                    bypass_changed = true;
                                     inner.bypass_ip_dirty = true;
                                     if !inner.bypass_ip_persist_scheduled {
                                         inner.bypass_ip_persist_scheduled = true;
@@ -649,56 +679,32 @@ impl RoutingState {
                             }
                             None => {
                                 lines.push(line);
+                                bypass_changed = true;
                             }
                         }
                         if !target_exists {
-                            additions.push(*ip);
+                            inner.persistent.bypass_ip_exact.insert(*ip);
+                            inner.persistent.bypass_ip.push(IpNet::from(*ip));
+                            if !compiled_rules_match_ip(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip, ip)
+                                && !compiled_rules_match_ip(&inner.temporary.direct_ip_exact, &inner.temporary.direct_ip, ip)
+                            {
+                                nft_ips.push(*ip);
+                            }
                         }
                     }
                 }
             }
 
-            if lines.is_empty() && additions.is_empty() {
+            if !bypass_changed && nft_ips.is_empty() {
                 let elapsed = total_start.elapsed();
                 ADD_DNS_RESULTS_TOTAL_NS.fetch_add(elapsed.as_nanos() as u64, AtomicOrdering::Relaxed);
                 return Ok(());
             }
 
             match decision {
-                RouteDecision::Direct => {
-                    // append_lines is a *blocking* file write done while
-                    // holding the routing write lock. We time it
-                    // explicitly so we can answer "is the lock being held
-                    // for tens of ms because of disk?" from log alone.
-                    let started = Instant::now();
-                    let result = append_lines(&inner.rules_dir.join(DIRECT_IP_FILE), &lines);
-                    let elapsed = started.elapsed();
-                    APPEND_LINES_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
-                    APPEND_LINES_TOTAL_NS.fetch_add(elapsed.as_nanos() as u64, AtomicOrdering::Relaxed);
-                    if elapsed.as_millis() >= SLOW_HOT_PATH_MS {
-                        warn!(
-                            "append_lines slow: {}ms ({} lines, file={}, domain={})",
-                            elapsed.as_millis(),
-                            lines.len(),
-                            DIRECT_IP_FILE,
-                            domain
-                        );
-                    }
-                    result?;
-                    inner.persistent_raw.direct_ip.extend(lines);
-                    inner.persistent.direct_ip_exact.extend(additions.iter().copied());
-                    inner
-                        .persistent
-                        .direct_ip
-                        .extend(additions.iter().copied().map(IpNet::from));
-                }
+                RouteDecision::Direct => {}
                 RouteDecision::Proxy => {
                     inner.persistent_raw.bypass_ip.extend(lines);
-                    inner.persistent.bypass_ip_exact.extend(additions.iter().copied());
-                    inner
-                        .persistent
-                        .bypass_ip
-                        .extend(additions.iter().copied().map(IpNet::from));
                     inner.bypass_ip_dirty = true;
                     if !inner.bypass_ip_persist_scheduled {
                         inner.bypass_ip_persist_scheduled = true;
@@ -707,11 +713,11 @@ impl RoutingState {
                 }
             }
             rebuild_ip_conflicts(&mut inner);
-            additions
+            nft_ips
         };
         warn!(
-            "dns added {} {:?} IPs for {} to runtime rules",
-            additions.len(),
+            "dns processed {} {:?} nft candidate IPs for {}",
+            nft_ips.len(),
             decision,
             domain
         );
@@ -725,7 +731,7 @@ impl RoutingState {
             // per-IP invocations, so this is now one fork+exec total
             // for the whole resolution batch.
             let nft_start = Instant::now();
-            let additions_for_nft = additions.clone();
+            let additions_for_nft = nft_ips.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<(), io::Error> {
                 match decision {
                     RouteDecision::Direct => {
@@ -748,7 +754,7 @@ impl RoutingState {
                 warn!(
                     "nft sync slow: {}ms ({} IPs, decision={:?}, domain={})",
                     nft_elapsed.as_millis(),
-                    additions.len(),
+                    nft_ips.len(),
                     decision,
                     domain
                 );
@@ -776,7 +782,7 @@ impl RoutingState {
                 elapsed.as_millis(),
                 decision,
                 domain,
-                additions.len(),
+                nft_ips.len(),
             );
         }
         Ok(())
@@ -847,6 +853,30 @@ impl RoutingState {
         });
     }
 
+    fn spawn_periodic_temporary_reload(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(2));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let (rules_dir, known_fingerprint) = {
+                    let inner = state.inner.read().await;
+                    (inner.rules_dir.clone(), inner.temporary_fingerprint.clone())
+                };
+                match temporary_files_fingerprint(&rules_dir) {
+                    Ok(fingerprint) if fingerprint != known_fingerprint => {
+                        if let Err(err) = state.reload_temporary_rules_from_files().await {
+                            warn!("failed to reload temporary rules after temp file change: {}", err);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => warn!("failed to stat temporary rule files: {}", err),
+                }
+            }
+        });
+    }
+
     pub async fn update_from_sources(&self) -> io::Result<()> {
         let (sources, rules_dir) = {
             let inner = self.inner.read().await;
@@ -862,7 +892,7 @@ impl RoutingState {
             .into_iter()
             .filter(|rule| parse_ip_net(rule).is_some())
             .collect::<Vec<_>>();
-        let mut direct_ip = Vec::new();
+        let direct_ip = read_lines(rules_dir.join(DIRECT_IP_FILE))?;
         let mut bypass_domain_candidates = Vec::new();
         let mut geoip_cn = Vec::new();
         let mut completed_files = 0usize;
@@ -882,22 +912,26 @@ impl RoutingState {
             completed_files += 1;
             self.mark_source_completed(
                 &downloaded.display_name,
-                downloaded.from_cache,
+                downloaded.status,
                 &source_dir,
                 completed_files,
                 total_files,
             )
             .await;
-            self.mark_source_processing(&downloaded.display_name, completed_files, total_files, "parsing rules")
+            self.mark_source_processing(
+                &downloaded.display_name,
+                completed_files,
+                total_files,
+                "parsing geoip conflicts",
+            )
                 .await;
             match parse_geoip_cn_nets(&downloaded.bytes) {
                 Ok(nets) => {
-                    direct_ip.extend(nets.iter().map(ToString::to_string));
-                    geoip_cn = nets;
+                    geoip_cn.extend(nets);
                 }
                 Err(_) => {
                     let text = String::from_utf8_lossy(&downloaded.bytes);
-                    direct_ip.extend(parse_text_rules(&text));
+                    geoip_cn.extend(parse_text_rules(&text).into_iter().filter_map(|rule| parse_ip_net(&rule)));
                 }
             }
         }
@@ -917,7 +951,7 @@ impl RoutingState {
             completed_files += 1;
             self.mark_source_completed(
                 &downloaded.display_name,
-                downloaded.from_cache,
+                downloaded.status,
                 &source_dir,
                 completed_files,
                 total_files,
@@ -983,6 +1017,28 @@ impl RoutingState {
             .unwrap_or_default()
     }
 
+    pub fn mark_rule_job_failed_sync(&self, message: String) {
+        if let Ok(mut progress) = self.progress.write() {
+            let total_files = progress.total_files;
+            let completed_files = progress.completed_files;
+            let remaining_files = progress.remaining_files;
+            let percent = progress.percent;
+            let current_source = progress.current_source.clone();
+            let mut completed_messages = progress.completed_messages.clone();
+            completed_messages.push(message.clone());
+            *progress = RuleUpdateProgress {
+                status: RuleUpdateStatus::Failed,
+                current_source,
+                completed_files,
+                total_files,
+                remaining_files,
+                percent,
+                message: Some(message),
+                completed_messages,
+            };
+        }
+    }
+
     pub async fn download_sources(&self) -> io::Result<()> {
         let (sources, source_dir) = {
             let inner = self.inner.read().await;
@@ -1009,7 +1065,7 @@ impl RoutingState {
             completed_files += 1;
             self.mark_source_completed(
                 &downloaded.display_name,
-                downloaded.from_cache,
+                downloaded.status,
                 &source_dir,
                 completed_files,
                 total_files,
@@ -1112,16 +1168,18 @@ impl RoutingState {
     async fn mark_source_completed(
         &self,
         source: &str,
-        from_cache: bool,
+        status: DownloadedSourceStatus,
         cache_dir: &Path,
         completed_files: usize,
         total_files: usize,
     ) {
         let percent = progress_percent(completed_files, total_files);
-        let message = if from_cache {
-            format!("{source} already exists in {}, using cached file", cache_dir.display())
-        } else {
-            format!("{source} downloaded successfully")
+        let message = match status {
+            DownloadedSourceStatus::Downloaded => format!("{source} downloaded successfully"),
+            DownloadedSourceStatus::FallbackCache => {
+                format!("{source} download failed or was empty; kept existing file in {}", cache_dir.display())
+            }
+            DownloadedSourceStatus::LocalFile => format!("{source} loaded from local file"),
         };
         let mut completed_messages = self.completed_messages();
         completed_messages.push(message.clone());
@@ -2135,7 +2193,9 @@ fn join_wildcard_candidate(prefix: &str, suffix: &str) -> String {
 }
 
 fn domain_matches_rule(rule: &str, domain: &str) -> bool {
-    if rule.contains('*') {
+    if let Some(suffix_rule) = rule.strip_prefix("*.") {
+        domain_matches_rule(suffix_rule, domain)
+    } else if rule.contains('*') {
         wildcard_domain_matches(rule, domain)
     } else if !rule.contains('.') {
         domain == rule
@@ -2533,8 +2593,10 @@ fn validate_temporary_rules(lists: &RuleLists) -> io::Result<()> {
 
 #[cfg(all(target_os = "linux", feature = "local-dns"))]
 fn persistent_nft_bypass_nets(inner: &RoutingInner) -> Vec<IpNet> {
-    let direct = &inner.persistent.direct_ip;
+    let mut direct = inner.persistent.direct_ip.clone();
+    direct.extend(inner.temporary.direct_ip.iter().copied());
     let mut bypass = inner.persistent.bypass_ip.clone();
+    bypass.extend(inner.temporary.bypass_ip.iter().copied());
     bypass.retain(|net| !direct.iter().any(|direct| ip_nets_overlap(direct, net)));
     bypass
 }
@@ -2639,6 +2701,31 @@ fn write_temporary_rule_lists(dir: &Path, lists: &RuleLists) -> io::Result<()> {
     Ok(())
 }
 
+fn temporary_files_fingerprint(dir: &Path) -> io::Result<Vec<Option<u64>>> {
+    [
+        TEMP_DIRECT_IP_FILE,
+        TEMP_DIRECT_DOMAIN_FILE,
+        TEMP_BYPASS_IP_FILE,
+        TEMP_BYPASS_DOMAIN_FILE,
+    ]
+    .into_iter()
+    .map(|file_name| file_fingerprint(&temp_file_path(dir, file_name)))
+    .collect()
+}
+
+fn file_fingerprint(path: &Path) -> io::Result<Option<u64>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(Some(hash))
+}
+
 fn read_temp_lines(dir: &Path, file_name: &str) -> io::Result<Vec<String>> {
     let current = read_lines(temp_file_path(dir, file_name))?;
     if !current.is_empty() {
@@ -2717,7 +2804,14 @@ fn file_modified(path: &Path) -> io::Result<Option<SystemTime>> {
 struct DownloadedSource {
     bytes: Vec<u8>,
     display_name: String,
-    from_cache: bool,
+    status: DownloadedSourceStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DownloadedSourceStatus {
+    Downloaded,
+    FallbackCache,
+    LocalFile,
 }
 
 async fn download_source(source: &str, cache_dir: &Path) -> io::Result<DownloadedSource> {
@@ -2727,16 +2821,6 @@ async fn download_source(source: &str, cache_dir: &Path) -> io::Result<Downloade
         tokio::task::spawn_blocking(move || {
             let display_name = source_cache_name(&source);
             let cache_path = cached_source_path(&source, &cache_dir);
-            if !source_needs_refresh(&cache_path, SOURCE_REFRESH_INTERVAL)?
-                && let Some(bytes) = read_non_empty_file(&cache_path)?
-            {
-                return Ok(DownloadedSource {
-                    bytes,
-                    display_name,
-                    from_cache: true,
-                });
-            }
-
             fs::create_dir_all(&cache_dir)?;
             let temp_dir = cache_dir.join(SOURCE_TEMP_DIR);
             fs::create_dir_all(&temp_dir)?;
@@ -2751,15 +2835,22 @@ async fn download_source(source: &str, cache_dir: &Path) -> io::Result<Downloade
                         return Ok(DownloadedSource {
                             bytes: out.stdout,
                             display_name,
-                            from_cache: false,
+                            status: DownloadedSourceStatus::Downloaded,
                         });
                     }
                     _ => continue,
                 }
             }
+            if let Some(bytes) = read_non_empty_file(&cache_path)? {
+                return Ok(DownloadedSource {
+                    bytes,
+                    display_name,
+                    status: DownloadedSourceStatus::FallbackCache,
+                });
+            }
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "no working downloader found; install uclient-fetch, wget, or curl",
+                "download failed or returned empty output, and no existing source file is available",
             ))
         })
         .await
@@ -2768,7 +2859,7 @@ async fn download_source(source: &str, cache_dir: &Path) -> io::Result<Downloade
         Ok(DownloadedSource {
             bytes: fs::read(source)?,
             display_name: source_progress_name(source),
-            from_cache: true,
+            status: DownloadedSourceStatus::LocalFile,
         })
     }
 }
@@ -2831,17 +2922,6 @@ fn read_non_empty_file(path: &Path) -> io::Result<Option<Vec<u8>>> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
     }
-}
-
-fn source_needs_refresh(path: &Path, interval: Duration) -> io::Result<bool> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) if metadata.len() > 0 => metadata,
-        Ok(_) => return Ok(true),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Err(err) => return Err(err),
-    };
-    let modified = metadata.modified()?;
-    Ok(modified.elapsed().unwrap_or(interval) >= interval)
 }
 
 fn read_geoip_cn_nets(path: &Path) -> io::Result<Vec<IpNet>> {
@@ -3115,30 +3195,88 @@ mod tests {
     #[tokio::test]
     async fn source_update_writes_four_rule_files() {
         let dir = temp_rules_dir("sources");
+        let geoip_source = dir.join("geoip.txt");
         let bypass_source = dir.join("bypass.txt");
+        fs::write(dir.join(DIRECT_IP_FILE), "192.0.2.0/24\n").unwrap();
+        write_temporary_rule_lists(
+            &dir,
+            &RuleLists {
+                direct_ip: vec!["203.0.113.0/24".to_owned()],
+                direct_domain: vec!["temp-direct.example".to_owned()],
+                bypass_ip: vec!["203.0.113.10".to_owned()],
+                bypass_domain: vec!["temp-proxy.example".to_owned()],
+            },
+        )
+        .unwrap();
         fs::write(
             dir.join(DIRECT_DOMAIN_FILE),
             "direct.example\n# comment\nchina.example\n",
         )
         .unwrap();
+        fs::write(&geoip_source, "198.51.100.0/24\n").unwrap();
         fs::write(&bypass_source, "proxy.example\ngfw.example\n").unwrap();
 
         let mut config = RouteRulesConfig::default();
         config.rules_dir = dir.clone();
-        config.geoip_sources.clear();
+        config.geoip_sources = vec![geoip_source.display().to_string()];
         config.bypass_domain_sources = vec![bypass_source.display().to_string()];
 
         let state = RoutingState::load(config).await.unwrap();
         state.update_from_sources().await.unwrap();
 
         let direct_domain = read_lines(dir.join(DIRECT_DOMAIN_FILE)).unwrap();
+        let direct_ip = read_lines(dir.join(DIRECT_IP_FILE)).unwrap();
+        let bypass_ip = read_lines(dir.join(BYPASS_IP_FILE)).unwrap();
         let bypass_domain = read_lines(dir.join(BYPASS_DOMAIN_FILE)).unwrap();
+        assert!(direct_ip.contains(&"192.0.2.0/24".to_owned()));
+        assert!(!direct_ip.contains(&"203.0.113.0/24".to_owned()));
+        assert!(!direct_ip.contains(&"198.51.100.0/24".to_owned()));
         assert!(direct_domain.contains(&"direct.example".to_owned()));
         assert!(direct_domain.contains(&"china.example".to_owned()));
+        assert!(!direct_domain.contains(&"temp-direct.example".to_owned()));
+        assert!(!bypass_ip.contains(&"203.0.113.10".to_owned()));
         assert!(bypass_domain.contains(&"proxy.example".to_owned()));
         assert!(bypass_domain.contains(&"gfw.example".to_owned()));
+        assert!(!bypass_domain.contains(&"temp-proxy.example".to_owned()));
         assert!(dir.join(DIRECT_IP_FILE).exists());
         assert!(dir.join(BYPASS_IP_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn http_source_download_failure_keeps_existing_cache() {
+        let dir = temp_rules_dir("source-fallback");
+        let source = "http://127.0.0.1:9/gfw.txt";
+        let cache_dir = dir.join(SOURCE_DIR);
+        fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cached_source_path(source, &cache_dir);
+        fs::write(&cache_path, "cached.example\n").unwrap();
+
+        let downloaded = download_source(source, &cache_dir).await.unwrap();
+
+        assert_eq!(downloaded.bytes, b"cached.example\n");
+        assert_eq!(downloaded.status, DownloadedSourceStatus::FallbackCache);
+        assert_eq!(fs::read(&cache_path).unwrap(), b"cached.example\n");
+    }
+
+    #[tokio::test]
+    async fn source_update_and_download_jobs_are_mutually_exclusive() {
+        let dir = temp_rules_dir("source-job-lock");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+
+        let state = RoutingState::load(config).await.unwrap();
+
+        assert!(state.try_begin_update().await);
+        assert!(!state.try_begin_update().await);
+        assert!(!state.try_begin_download().await);
+
+        state.mark_rule_job_failed_sync("release update lock".to_owned());
+
+        assert!(state.try_begin_download().await);
+        assert!(!state.try_begin_update().await);
+        assert!(!state.try_begin_download().await);
     }
 
     #[tokio::test]
@@ -3156,6 +3294,7 @@ mod tests {
         let state = RoutingState::load(config).await.unwrap();
 
         assert_eq!(state.route_domain("www.example.com").await, Some(RouteDecision::Direct));
+        assert_eq!(state.route_domain("example.com").await, Some(RouteDecision::Direct));
         assert_eq!(state.route_domain("api.example.com").await, Some(RouteDecision::Direct));
         let conflicts = state.domain_conflicts().await;
         assert!(conflicts.iter().any(|conflict| {
@@ -3164,6 +3303,37 @@ mod tests {
                 "*.example.com <-> api.*" | "api.* <-> *.example.com"
             ) && conflict.sources == [DIRECT_DOMAIN_FILE.to_owned(), BYPASS_DOMAIN_FILE.to_owned()]
         }));
+    }
+
+    #[tokio::test]
+    async fn direct_domain_overrides_bypass_suffix_after_reload() {
+        let dir = temp_rules_dir("domain-priority-reload");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["a.baidu.com".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_DOMAIN_FILE), &["baidu.com".to_owned()]).unwrap();
+        write_temporary_rule_lists(
+            &dir,
+            &RuleLists {
+                direct_ip: Vec::new(),
+                direct_domain: vec!["b.baidu.com".to_owned()],
+                bypass_ip: Vec::new(),
+                bypass_domain: vec!["temp.baidu.com".to_owned()],
+            },
+        )
+        .unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+
+        assert_eq!(state.route_domain("baidu.com").await, Some(RouteDecision::Proxy));
+        assert_eq!(state.route_domain("c.baidu.com").await, Some(RouteDecision::Proxy));
+        assert_eq!(state.route_domain("a.baidu.com").await, Some(RouteDecision::Direct));
+        assert_eq!(state.route_domain("b.baidu.com").await, Some(RouteDecision::Direct));
+        assert_eq!(state.route_domain("temp.baidu.com").await, Some(RouteDecision::Proxy));
     }
 
     #[tokio::test]
@@ -3244,6 +3414,76 @@ mod tests {
                 && conflict.regions == ["direct".to_owned(), "bypass".to_owned()]
                 && conflict.sources == [DIRECT_IP_FILE.to_owned(), BYPASS_IP_FILE.to_owned()]
         }));
+    }
+
+    #[tokio::test]
+    async fn dns_learned_bypass_ip_keeps_temporary_direct_priority() {
+        let dir = temp_rules_dir("dns-learned-temp-direct-conflict");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
+        write_temporary_rule_lists(
+            &dir,
+            &RuleLists {
+                direct_ip: vec!["203.0.113.10".to_owned()],
+                direct_domain: Vec::new(),
+                bypass_ip: Vec::new(),
+                bypass_domain: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+
+        state
+            .add_dns_results(
+                RouteDecision::Proxy,
+                "www.example.com",
+                &["203.0.113.10".parse().unwrap()],
+            )
+            .await
+            .unwrap();
+
+        state.persist_bypass_ip_if_dirty().await;
+
+        assert!(
+            read_lines(dir.join(BYPASS_IP_FILE))
+                .unwrap()
+                .contains(&"203.0.113.10 www.example.com".to_owned())
+        );
+        assert_eq!(
+            state.route_ip(&"203.0.113.10".parse().unwrap()).await,
+            Some(RouteDecision::Direct)
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_dns_results_do_not_become_direct_ip_rules() {
+        let dir = temp_rules_dir("dns-direct-not-persistent");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["direct.example".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_DOMAIN_FILE), &[]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+        let ip = "203.0.113.20".parse().unwrap();
+
+        state
+            .add_dns_results(RouteDecision::Direct, "direct.example", &[ip])
+            .await
+            .unwrap();
+
+        assert!(read_lines(dir.join(DIRECT_IP_FILE)).unwrap().is_empty());
+        assert_eq!(state.route_ip(&ip).await, None);
     }
 
     #[tokio::test]
@@ -3360,6 +3600,56 @@ mod tests {
         assert_eq!(
             reloaded.route_domain("direct.temp.example").await,
             Some(RouteDecision::Direct)
+        );
+    }
+
+    #[tokio::test]
+    async fn temporary_rules_reload_from_temp_files() {
+        let dir = temp_rules_dir("temporary-reload");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+
+        let state = RoutingState::load(config).await.unwrap();
+        assert_eq!(state.route_domain("file.temp.example").await, None);
+
+        write_lines_atomic(
+            temp_file_path(&dir, TEMP_BYPASS_DOMAIN_FILE),
+            &["file.temp.example".to_owned()],
+        )
+        .unwrap();
+
+        let reloaded = state.reload_temporary_rules_from_files().await.unwrap();
+        assert!(reloaded.bypass_domain.contains(&"file.temp.example".to_owned()));
+        assert_eq!(
+            state.route_domain("file.temp.example").await,
+            Some(RouteDecision::Proxy)
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_temporary_rules_are_loaded_by_file_watcher() {
+        let dir = temp_rules_dir("temporary-watch");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+
+        let state = RoutingState::load(config).await.unwrap();
+        state
+            .save_temporary_rules_to_files(RuleLists {
+                bypass_domain: vec!["watched.temp.example".to_owned()],
+                ..RuleLists::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(state.route_domain("watched.temp.example").await, None);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            state.route_domain("watched.temp.example").await,
+            Some(RouteDecision::Proxy)
         );
     }
 

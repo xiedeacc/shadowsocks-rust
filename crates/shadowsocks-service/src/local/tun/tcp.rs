@@ -28,6 +28,7 @@ use smoltcp::{
 use spin::Mutex as SpinMutex;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
     sync::{mpsc, oneshot},
 };
 
@@ -667,7 +668,7 @@ async fn establish_client_tcp_redir(
 async fn handle_redir_client(
     context: Arc<ServiceContext>,
     balancer: PingBalancer,
-    s: TcpConnection,
+    mut s: TcpConnection,
     peer_addr: SocketAddr,
     mut daddr: SocketAddr,
 ) -> io::Result<()> {
@@ -678,6 +679,14 @@ async fn handle_redir_client(
         && let Some(v4) = to_ipv4_mapped(a.ip())
     {
         daddr = SocketAddr::new(IpAddr::from(v4), a.port());
+    }
+    if daddr.port() == 53
+        && let Some(routing_state) = context.routing_state()
+        && let Some(target) = routing_state.dns_tun_intercept_target().await
+    {
+        let mut local_dns = TcpStream::connect(target).await?;
+        let target_addr = Address::from(target);
+        return establish_tcp_tunnel_bypassed(&mut s, &mut local_dns, peer_addr, &target_addr).await;
     }
     let target_addr = Address::from(daddr);
     establish_client_tcp_redir(context, balancer, s, peer_addr, &target_addr).await

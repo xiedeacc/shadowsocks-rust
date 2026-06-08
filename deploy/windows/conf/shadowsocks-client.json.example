@@ -87,17 +87,20 @@
     // listener to intercept DNS, no firewall rules required (Windows
     // does not have nftables).
     //
-    // Upstream resolvers (`local_dns_address` / `remote_dns_address`)
-    // and the listen socket (`local_address` / `local_port`) are read
-    // directly from `locals[].dns` above — no `domestic_dns` /
-    // `foreign_dns` / `dns_listen_*` duplication here.
+    // Upstream resolvers and the listen socket are read directly from
+    // `locals[].dns` above.
     "dns_intercept_mode": "tun",
     // Strip AAAA from DNS responses. Set false ONLY if the host
     // has working public IPv6 -- otherwise browsers spend happy-
     // eyeballs time on v6 attempts that never connect before
     // falling back to v4.
     "dns_ipv4_only": true,
-    "rules_dir": "D:\\software\\shadowsocks\\data"
+    "geoip_sources": [
+      "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+    ],
+    "bypass_domain_sources": [
+      "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt"
+    ]
   },
   "servers": [
     {
@@ -121,7 +124,6 @@
     }
   ],
   "web_admin": {
-    "client_config_path": "D:\\software\\shadowsocks\\conf\\shadowsocks-client.json",
     "listen": "127.0.0.1:9090"
   }
 }

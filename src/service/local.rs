@@ -598,24 +598,6 @@ pub fn define_command_line_options(mut app: Command) -> Command {
                     .num_args(1)
                     .action(ArgAction::Set)
                     .help("Bearer token for embedded web admin"),
-            )
-            .arg(
-                Arg::new("ROUTE_RULES_DIR")
-                    .long("route-rules-dir")
-                    .num_args(1)
-                    .action(ArgAction::Set)
-                    .value_parser(clap::value_parser!(PathBuf))
-                    .value_hint(ValueHint::DirPath)
-                    .help("Directory for generated routing rule files"),
-            )
-            .arg(
-                Arg::new("WEB_ADMIN_CLIENT_CONFIG")
-                    .long("web-admin-client-config")
-                    .num_args(1)
-                    .action(ArgAction::Set)
-                    .value_parser(clap::value_parser!(PathBuf))
-                    .value_hint(ValueHint::FilePath)
-                    .help("Client config file edited by embedded web admin"),
             );
     }
 
@@ -993,7 +975,6 @@ pub fn create(matches: &ArgMatches) -> ShadowsocksResult<(Runtime, impl Future<O
         {
             if matches.get_one::<std::net::SocketAddr>("WEB_ADMIN_LISTEN").is_some()
                 || matches.get_one::<String>("WEB_ADMIN_TOKEN").is_some()
-                || matches.get_one::<PathBuf>("WEB_ADMIN_CLIENT_CONFIG").is_some()
             {
                 let mut web_admin = config.web_admin.unwrap_or_default();
                 if let Some(listen) = matches.get_one::<std::net::SocketAddr>("WEB_ADMIN_LISTEN") {
@@ -1002,17 +983,9 @@ pub fn create(matches: &ArgMatches) -> ShadowsocksResult<(Runtime, impl Future<O
                 if let Some(token) = matches.get_one::<String>("WEB_ADMIN_TOKEN") {
                     web_admin.token = Some(token.clone());
                 }
-                if let Some(path) = matches.get_one::<PathBuf>("WEB_ADMIN_CLIENT_CONFIG") {
-                    web_admin.client_config_path = path.clone();
-                }
                 config.web_admin = Some(web_admin);
             }
 
-            if let Some(rules_dir) = matches.get_one::<PathBuf>("ROUTE_RULES_DIR") {
-                let mut route_rules = config.route_rules.clone();
-                route_rules.rules_dir = rules_dir.clone();
-                config.route_rules = route_rules;
-            }
         }
 
         // DONE READING options

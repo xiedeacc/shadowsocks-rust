@@ -622,15 +622,11 @@ struct SSWebAdminConfig {
     listen: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    client_config_path: Option<PathBuf>,
 }
 
 #[cfg(feature = "local-web-admin")]
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 struct SSRouteRulesConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rules_dir: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     geoip_sources: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1558,7 +1554,6 @@ pub const DEFAULT_BYPASS_DOMAIN_SOURCES: &[&str] =
 pub struct WebAdminConfig {
     pub listen: SocketAddr,
     pub token: Option<String>,
-    pub client_config_path: PathBuf,
 }
 
 #[cfg(feature = "local-web-admin")]
@@ -1569,7 +1564,6 @@ impl Default for WebAdminConfig {
                 .parse()
                 .expect("valid default web admin listen address"),
             token: None,
-            client_config_path: PathBuf::from(DEFAULT_DEPLOY_DIR).join("conf/shadowsocks-client.json"),
         }
     }
 }
@@ -2784,17 +2778,11 @@ impl Config {
                     })?;
                 }
                 parsed.token = web_admin.token;
-                if let Some(client_config_path) = web_admin.client_config_path {
-                    parsed.client_config_path = client_config_path;
-                }
                 nconfig.web_admin = Some(parsed);
             }
 
             if let Some(route_rules) = config.route_rules {
                 let mut parsed = RouteRulesConfig::default();
-                if let Some(rules_dir) = route_rules.rules_dir {
-                    parsed.rules_dir = rules_dir;
-                }
                 if let Some(sources) = route_rules.geoip_sources {
                     parsed.geoip_sources = sources;
                 }
@@ -3600,12 +3588,10 @@ impl fmt::Display for Config {
                 jconf.web_admin = Some(SSWebAdminConfig {
                     listen: Some(web_admin.listen.to_string()),
                     token: web_admin.token.clone(),
-                    client_config_path: Some(web_admin.client_config_path.clone()),
                 });
             }
 
             jconf.route_rules = Some(SSRouteRulesConfig {
-                rules_dir: Some(self.route_rules.rules_dir.clone()),
                 geoip_sources: Some(self.route_rules.geoip_sources.clone()),
                 bypass_domain_sources: Some(self.route_rules.bypass_domain_sources.clone()),
                 dns_cache_capacity: Some(self.route_rules.dns_cache_capacity),

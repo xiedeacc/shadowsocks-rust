@@ -1020,17 +1020,38 @@ impl DnsClient {
                 return (response, matches!(decision, RouteDecision::Proxy));
             }
             let query_type = query.query_type().to_string();
-            if let Some((cached, decision)) = routing_state.dns_cache_lookup_any(&domain, &query_type).await {
+            let decision = RouteDecision::Direct;
+            if let Some(cached) = routing_state.dns_cache_lookup(&domain, &query_type, decision).await {
                 let mut cached = cached;
                 maybe_strip_proxy_ipv6_answers(&self.context, decision, &mut cached);
                 let ips = collect_answer_ips(&cached);
                 info!(
-                    "dns fallback cache hit {} {:?}: resolver={:?}, results={:?}",
+                    "dns route default local cache hit {} {:?}: resolver={:?}, results={:?}",
                     domain, query.query_type(), decision, ips
                 );
                 routing_state.record_dns(domain, query_type, ips, decision, true).await;
                 return (Ok(cached), matches!(decision, RouteDecision::Proxy));
             }
+            info!(
+                "dns route default local {} {:?}: resolver={:?}",
+                domain,
+                query.query_type(),
+                decision
+            );
+            let response = self.lookup_local(query, local_addr).await;
+            if let Ok(mut msg) = response {
+                maybe_strip_proxy_ipv6_answers(&self.context, decision, &mut msg);
+                let ips = collect_answer_ips(&msg);
+                routing_state
+                    .dns_cache_insert(&domain, &query_type, decision, msg.clone(), ips.clone())
+                    .await;
+                if !ips.is_empty() {
+                    let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
+                }
+                routing_state.record_dns(domain, query_type, ips, decision, false).await;
+                return (Ok(msg), false);
+            }
+            return (response, false);
         }
 
         match should_forward_by_query(&self.context, &self.balancer, query) {
