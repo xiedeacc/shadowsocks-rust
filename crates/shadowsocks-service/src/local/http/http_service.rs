@@ -130,7 +130,7 @@ impl HttpService {
                 "CONNECT relay connected {} <-> {} ({})",
                 self.peer_addr,
                 host,
-                if stream.is_bypassed() { "bypassed" } else { "proxied" }
+                if stream.is_bypassed() { "Direct" } else { "Proxy" }
             );
 
             #[cfg(feature = "local-web-admin")]

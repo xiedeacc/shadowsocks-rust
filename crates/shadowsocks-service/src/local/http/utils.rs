@@ -122,14 +122,14 @@ pub async fn connect_host(
         None => match AutoProxyClientStream::connect_bypassed(context, host).await {
             Ok(s) => Ok((s, None)),
             Err(err) => {
-                error!("failed to connect host {} bypassed, err: {}", host, err);
+                error!("failed to connect host {} Direct, err: {}", host, err);
                 Err(err)
             }
         },
         Some(balancer) if balancer.is_empty() => match AutoProxyClientStream::connect_bypassed(context, host).await {
             Ok(s) => Ok((s, None)),
             Err(err) => {
-                error!("failed to connect host {} bypassed, err: {}", host, err);
+                error!("failed to connect host {} Direct, err: {}", host, err);
                 Err(err)
             }
         },
@@ -142,7 +142,7 @@ pub async fn connect_host(
                 Ok(s) => Ok((s, Some(server))),
                 Err(err) => {
                     error!(
-                        "failed to connect host {} proxied, svr_cfg: {}, error: {}",
+                        "failed to connect host {} Proxy, svr_cfg: {}, error: {}",
                         host,
                         server.server_config().addr(),
                         err

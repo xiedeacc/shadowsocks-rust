@@ -630,7 +630,7 @@ struct SSRouteRulesConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     geoip_sources: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    bypass_domain_sources: Option<Vec<String>>,
+    proxy_domain_sources: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dns_cache_capacity: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1546,7 +1546,7 @@ pub const DEFAULT_DEPLOY_DIR: &str = r"D:\software\shadowsocks";
 #[cfg(not(windows))]
 pub const DEFAULT_DEPLOY_DIR: &str = "/usr/local/shadowsocks";
 #[cfg(feature = "local-web-admin")]
-pub const DEFAULT_BYPASS_DOMAIN_SOURCES: &[&str] =
+pub const DEFAULT_PROXY_DOMAIN_SOURCES: &[&str] =
     &["https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt"];
 
 #[cfg(feature = "local-web-admin")]
@@ -1573,7 +1573,7 @@ impl Default for WebAdminConfig {
 pub struct RouteRulesConfig {
     pub rules_dir: PathBuf,
     pub geoip_sources: Vec<String>,
-    pub bypass_domain_sources: Vec<String>,
+    pub proxy_domain_sources: Vec<String>,
     pub dns_cache_capacity: usize,
     pub dns_cache_ttl_seconds: u64,
     pub dns_cache_refresh_enabled: bool,
@@ -1592,7 +1592,7 @@ impl Default for RouteRulesConfig {
         Self {
             rules_dir: PathBuf::from(DEFAULT_DEPLOY_DIR).join("data"),
             geoip_sources: vec![DEFAULT_GEOIP_SOURCE.to_owned()],
-            bypass_domain_sources: DEFAULT_BYPASS_DOMAIN_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
+            proxy_domain_sources: DEFAULT_PROXY_DOMAIN_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
             dns_cache_capacity: 100_000,
             dns_cache_ttl_seconds: 7 * 24 * 60 * 60,
             dns_cache_refresh_enabled: true,
@@ -2786,8 +2786,8 @@ impl Config {
                 if let Some(sources) = route_rules.geoip_sources {
                     parsed.geoip_sources = sources;
                 }
-                if let Some(sources) = route_rules.bypass_domain_sources {
-                    parsed.bypass_domain_sources = sources;
+                if let Some(sources) = route_rules.proxy_domain_sources {
+                    parsed.proxy_domain_sources = sources;
                 }
                 if let Some(capacity) = route_rules.dns_cache_capacity {
                     parsed.dns_cache_capacity = capacity.max(1);
@@ -3593,7 +3593,7 @@ impl fmt::Display for Config {
 
             jconf.route_rules = Some(SSRouteRulesConfig {
                 geoip_sources: Some(self.route_rules.geoip_sources.clone()),
-                bypass_domain_sources: Some(self.route_rules.bypass_domain_sources.clone()),
+                proxy_domain_sources: Some(self.route_rules.proxy_domain_sources.clone()),
                 dns_cache_capacity: Some(self.route_rules.dns_cache_capacity),
                 dns_cache_ttl_seconds: Some(self.route_rules.dns_cache_ttl_seconds),
                 dns_cache_refresh_enabled: Some(self.route_rules.dns_cache_refresh_enabled),

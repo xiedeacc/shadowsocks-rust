@@ -50,7 +50,7 @@ pub use http_connect::{HttpConnectClient, HttpConnectTunnel};
 
 /// Trait used by [`OutboundProxyClient`] to dial the first hop of the
 /// chain. Each caller (server / local) injects its own implementation so
-/// that the existing `ConnectOpts` / bypass routing rules continue to
+/// that the existing `ConnectOpts` / Direct-Proxy route decisions continue to
 /// apply.
 #[trait_variant::make(Send)]
 pub trait TcpDialer {

@@ -59,7 +59,7 @@ where
                 let _ = shadow.write(&[]).await?;
 
                 trace!(
-                    "tcp tunnel {} -> {} (proxied) sent handshake without data",
+                    "tcp tunnel {} -> {} (Proxy) sent handshake without data",
                     peer_addr, target_addr
                 );
             }
@@ -69,13 +69,13 @@ where
     match copy_encrypted_bidirectional(svr_cfg.method(), shadow, plain).await {
         Ok((wn, rn)) => {
             trace!(
-                "tcp tunnel {} <-> {} (proxied) closed, L2R {} bytes, R2L {} bytes",
+                "tcp tunnel {} <-> {} (Proxy) closed, L2R {} bytes, R2L {} bytes",
                 peer_addr, target_addr, rn, wn
             );
         }
         Err(err) => {
             trace!(
-                "tcp tunnel {} <-> {} (proxied) closed with error: {}",
+                "tcp tunnel {} <-> {} (Proxy) closed with error: {}",
                 peer_addr, target_addr, err
             );
         }
@@ -94,18 +94,18 @@ where
     P: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    debug!("established tcp tunnel {} <-> {} bypassed", peer_addr, target_addr);
+    debug!("established tcp tunnel {} <-> {} Direct", peer_addr, target_addr);
 
     match copy_bidirectional(plain, shadow).await {
         Ok((rn, wn)) => {
             trace!(
-                "tcp tunnel {} <-> {} (bypassed) closed, L2R {} bytes, R2L {} bytes",
+                "tcp tunnel {} <-> {} (Direct) closed, L2R {} bytes, R2L {} bytes",
                 peer_addr, target_addr, rn, wn
             );
         }
         Err(err) => {
             trace!(
-                "tcp tunnel {} <-> {} (bypassed) closed with error: {}",
+                "tcp tunnel {} <-> {} (Direct) closed with error: {}",
                 peer_addr, target_addr, err
             );
         }

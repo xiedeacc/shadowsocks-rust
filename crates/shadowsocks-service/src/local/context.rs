@@ -169,15 +169,24 @@ impl ServiceContext {
         self.context.dns_resolver()
     }
 
-    /// Check if target should be bypassed
-    pub async fn check_target_bypassed(&self, addr: &Address) -> bool {
+    /// Decide whether the target should be connected directly or through the proxy.
+    #[cfg(feature = "local-web-admin")]
+    pub async fn route_target(&self, addr: &Address) -> RouteDecision {
         #[cfg(feature = "local-web-admin")]
         if let Some(routing_state) = self.routing_state.as_ref()
             && let Some(decision) = routing_state.route_address(addr).await
         {
-            return decision.is_bypassed();
+            return decision;
         }
 
+        if self.target_is_direct_by_acl(addr).await {
+            RouteDecision::Direct
+        } else {
+            RouteDecision::Proxy
+        }
+    }
+
+    pub async fn target_is_direct_by_acl(&self, addr: &Address) -> bool {
         match self.acl {
             None => false,
             Some(ref acl) => {

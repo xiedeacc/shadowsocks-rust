@@ -20,7 +20,7 @@ impl OutboundProxyClient {
     /// Establish a TCP tunnel to `target` through the configured proxy
     /// chain. The first hop is dialled through `dialer`, allowing each
     /// caller to inject its own connect-options policy (`ConnectOpts`,
-    /// bypass routing, ...).
+    /// Direct/Proxy route decisions, ...).
     pub async fn connect_tcp<D>(
         &self,
         dialer: &D,

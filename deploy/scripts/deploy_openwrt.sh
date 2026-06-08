@@ -257,6 +257,7 @@ ssh_cmd "mkdir -p '$REMOTE_TMP' '$REMOTE_DIR/bin' '$REMOTE_DIR/conf' '$REMOTE_DI
 scp_cmd "$OPENWRT_DIR/bin/sslocal" "$HOST:$REMOTE_TMP/sslocal"
 scp_cmd "$OPENWRT_DIR/conf/shadowsocks-client.json" "$HOST:$REMOTE_TMP/shadowsocks-client.json"
 scp_cmd "$OPENWRT_DIR/conf/shadowsocks-rust.init" "$HOST:$REMOTE_TMP/$SERVICE_NAME.init"
+scp_cmd "$ROOT_DIR/deploy/scripts/migrate_proxy_rules.sh" "$HOST:$REMOTE_TMP/migrate_proxy_rules.sh"
 # sslocal-watch — independent /etc/init.d service that samples runtime
 # health every 30s. Decoupled from sslocal so a wedged proxy still leaves
 # us a forensic trail (see conf/sslocal-watch.sh for sampling logic).
@@ -293,6 +294,7 @@ cp -f \"\$REMOTE_TMP/sslocal\" \"\$REMOTE_DIR/bin/sslocal\"
 chmod 755 \"\$REMOTE_DIR/bin/sslocal\"
 cp -f \"\$REMOTE_TMP/shadowsocks-client.json\" \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
 chmod 644 \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
+sh \"\$REMOTE_TMP/migrate_proxy_rules.sh\" \"\$REMOTE_DIR\"
 find \"\$REMOTE_TMP\" -maxdepth 1 -type f \\
 	! -name sslocal \\
 	! -name shadowsocks-client.json \\
@@ -304,16 +306,16 @@ find \"\$REMOTE_TMP\" -maxdepth 1 -type f \\
 	! -name sslocal-probe.init \\
 	! -name direct_ip.txt \\
 	! -name direct_domain.txt \\
-	! -name bypass_ip.txt \\
-	! -name bypass_domain.txt \\
+	! -name proxy_ip.txt \\
+	! -name proxy_domain.txt \\
 	! -name direct_ip.temp \\
 	! -name direct_domain.temp \\
-	! -name bypass_ip.temp \\
-	! -name bypass_domain.temp \\
+	! -name proxy_ip.temp \\
+	! -name proxy_domain.temp \\
 	! -name record.txt \\
 	-exec cp -f {} \"\$REMOTE_DIR/data/\" \\;
-for rule_file in direct_ip.txt direct_domain.txt bypass_ip.txt bypass_domain.txt \\
-	direct_ip.temp direct_domain.temp bypass_ip.temp bypass_domain.temp record.txt; do
+for rule_file in direct_ip.txt direct_domain.txt proxy_ip.txt proxy_domain.txt \\
+	direct_ip.temp direct_domain.temp proxy_ip.temp proxy_domain.temp record.txt; do
 	if [ ! -e \"\$REMOTE_DIR/data/\$rule_file\" ] && [ -e \"\$REMOTE_TMP/\$rule_file\" ]; then
 		cp -f \"\$REMOTE_TMP/\$rule_file\" \"\$REMOTE_DIR/data/\$rule_file\"
 	fi

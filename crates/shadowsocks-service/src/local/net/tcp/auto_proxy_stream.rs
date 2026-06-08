@@ -16,12 +16,20 @@ use shadowsocks::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+#[cfg(feature = "local-web-admin")]
+use crate::local::routing::RouteDecision;
 use crate::{
     local::{context::ServiceContext, loadbalancing::ServerIdent},
     net::{MonProxyStream, OutboundProxyStream, TcpDialer},
 };
 
 use super::auto_proxy_io::AutoProxyIo;
+
+#[cfg(not(feature = "local-web-admin"))]
+enum RouteDecisionCompat {
+    Direct,
+    Proxy,
+}
 
 /// Outbound transport used by [`AutoProxyClientStream`]: either a direct
 /// TCP connection or a tunnel through the configured outbound proxy chain.
@@ -116,14 +124,14 @@ impl<'a> TcpDialer for DirectTcpDialer<'a> {
     }
 }
 
-/// Unified stream for bypassed and proxied connections
+/// Unified stream for Direct and Proxy connections
 #[allow(clippy::large_enum_variant)]
 #[pin_project(project = AutoProxyClientStreamProj)]
 pub enum AutoProxyClientStream {
     /// Tunnel through the shadowsocks server (optionally over the outbound
     /// proxy chain).
     Proxied(#[pin] ProxyClientStream<MonProxyStream<OutboundTransport>>),
-    /// Direct TCP, bypassing the shadowsocks server.
+    /// Direct TCP, skipping the shadowsocks server.
     Bypassed(#[pin] TcpStream),
 }
 
@@ -152,12 +160,36 @@ impl AutoProxyClientStream {
         if let Some(mapped_addr) = context.try_map_fake_address(&addr).await {
             addr = mapped_addr;
         }
-        if context.check_target_bypassed(&addr).await {
-            trace!("Bypassing target address {addr}");
-            Self::connect_bypassed_with_opts_inner(context, addr, opts).await
+        #[cfg(feature = "local-web-admin")]
+        let decision = context.route_target(&addr).await;
+        #[cfg(not(feature = "local-web-admin"))]
+        let decision = if context.target_is_direct_by_acl(&addr).await {
+            RouteDecisionCompat::Direct
         } else {
-            trace!("Proxying target address {addr}");
-            Self::connect_proxied_with_opts_inner(context, server, addr, opts).await
+            RouteDecisionCompat::Proxy
+        };
+
+        match decision {
+            #[cfg(feature = "local-web-admin")]
+            RouteDecision::Direct => {
+                trace!("Direct target address {addr}");
+                Self::connect_bypassed_with_opts_inner(context, addr, opts).await
+            }
+            #[cfg(feature = "local-web-admin")]
+            RouteDecision::Proxy => {
+                trace!("Proxy target address {addr}");
+                Self::connect_proxied_with_opts_inner(context, server, addr, opts).await
+            }
+            #[cfg(not(feature = "local-web-admin"))]
+            RouteDecisionCompat::Direct => {
+                trace!("Direct target address {addr}");
+                Self::connect_bypassed_with_opts_inner(context, addr, opts).await
+            }
+            #[cfg(not(feature = "local-web-admin"))]
+            RouteDecisionCompat::Proxy => {
+                trace!("Proxy target address {addr}");
+                Self::connect_proxied_with_opts_inner(context, server, addr, opts).await
+            }
         }
     }
 

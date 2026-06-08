@@ -41,8 +41,8 @@ enum OutboundProxyStreamInner {
     /// Plain TCP. Either no proxy chain is configured (used internally by
     /// the chain builder) or the SOCKS5 hop has just completed its
     /// handshake on top of a TCP connection — SOCKS5 negotiation does not
-    /// transform the wire layer, so the variant stays `Bypassed`.
-    Bypassed(#[pin] TcpStream),
+    /// transform the wire layer, so the variant stays plain TCP.
+    PlainTcp(#[pin] TcpStream),
 
     /// TLS layered on top of an inner [`OutboundProxyStream`]. Used by
     /// HTTPS proxy hops.
@@ -60,7 +60,7 @@ impl OutboundProxyStream {
         let local_addr = stream.local_addr()?;
         Ok(Self {
             local_addr,
-            inner: OutboundProxyStreamInner::Bypassed(stream),
+            inner: OutboundProxyStreamInner::PlainTcp(stream),
         })
     }
 
@@ -69,7 +69,7 @@ impl OutboundProxyStream {
     pub fn from_tcp_with_local_addr(stream: TcpStream, local_addr: SocketAddr) -> Self {
         Self {
             local_addr,
-            inner: OutboundProxyStreamInner::Bypassed(stream),
+            inner: OutboundProxyStreamInner::PlainTcp(stream),
         }
     }
 
@@ -89,8 +89,14 @@ impl OutboundProxyStream {
     /// `hyper::upgrade::Upgraded` which is not).
     #[allow(clippy::result_large_err)]
     pub fn try_into_tcp(self) -> Result<TcpStream, Self> {
+        #[cfg(not(any(feature = "local-http", feature = "local-http-native-tls", feature = "local-http-rustls")))]
+        {
+            let OutboundProxyStreamInner::PlainTcp(s) = self.inner;
+            Ok(s)
+        }
+        #[cfg(any(feature = "local-http", feature = "local-http-native-tls", feature = "local-http-rustls"))]
         match self.inner {
-            OutboundProxyStreamInner::Bypassed(s) => Ok(s),
+            OutboundProxyStreamInner::PlainTcp(s) => Ok(s),
             other => Err(Self {
                 local_addr: self.local_addr,
                 inner: other,
@@ -141,7 +147,7 @@ impl Unpin for OutboundProxyStream {}
 impl AsyncRead for OutboundProxyStream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         match self.project_inner() {
-            OutboundProxyStreamInnerProj::Bypassed(s) => s.poll_read(cx, buf),
+            OutboundProxyStreamInnerProj::PlainTcp(s) => s.poll_read(cx, buf),
             #[cfg(any(feature = "local-http-native-tls", feature = "local-http-rustls"))]
             OutboundProxyStreamInnerProj::Https(s) => s.poll_read(cx, buf),
             #[cfg(feature = "local-http")]
@@ -153,7 +159,7 @@ impl AsyncRead for OutboundProxyStream {
 impl AsyncWrite for OutboundProxyStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         match self.project_inner() {
-            OutboundProxyStreamInnerProj::Bypassed(s) => s.poll_write(cx, buf),
+            OutboundProxyStreamInnerProj::PlainTcp(s) => s.poll_write(cx, buf),
             #[cfg(any(feature = "local-http-native-tls", feature = "local-http-rustls"))]
             OutboundProxyStreamInnerProj::Https(s) => s.poll_write(cx, buf),
             #[cfg(feature = "local-http")]
@@ -163,7 +169,7 @@ impl AsyncWrite for OutboundProxyStream {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
         match self.project_inner() {
-            OutboundProxyStreamInnerProj::Bypassed(s) => s.poll_flush(cx),
+            OutboundProxyStreamInnerProj::PlainTcp(s) => s.poll_flush(cx),
             #[cfg(any(feature = "local-http-native-tls", feature = "local-http-rustls"))]
             OutboundProxyStreamInnerProj::Https(s) => s.poll_flush(cx),
             #[cfg(feature = "local-http")]
@@ -173,7 +179,7 @@ impl AsyncWrite for OutboundProxyStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
         match self.project_inner() {
-            OutboundProxyStreamInnerProj::Bypassed(s) => s.poll_shutdown(cx),
+            OutboundProxyStreamInnerProj::PlainTcp(s) => s.poll_shutdown(cx),
             #[cfg(any(feature = "local-http-native-tls", feature = "local-http-rustls"))]
             OutboundProxyStreamInnerProj::Https(s) => s.poll_shutdown(cx),
             #[cfg(feature = "local-http")]
@@ -187,7 +193,7 @@ impl AsyncWrite for OutboundProxyStream {
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         match self.project_inner() {
-            OutboundProxyStreamInnerProj::Bypassed(s) => s.poll_write_vectored(cx, bufs),
+            OutboundProxyStreamInnerProj::PlainTcp(s) => s.poll_write_vectored(cx, bufs),
             #[cfg(any(feature = "local-http-native-tls", feature = "local-http-rustls"))]
             OutboundProxyStreamInnerProj::Https(s) => s.poll_write_vectored(cx, bufs),
             #[cfg(feature = "local-http")]
@@ -197,7 +203,7 @@ impl AsyncWrite for OutboundProxyStream {
 
     fn is_write_vectored(&self) -> bool {
         match &self.inner {
-            OutboundProxyStreamInner::Bypassed(s) => s.is_write_vectored(),
+            OutboundProxyStreamInner::PlainTcp(s) => s.is_write_vectored(),
             // TLS / hyper upgraded streams don't expose vectored writes meaningfully.
             #[cfg(any(feature = "local-http-native-tls", feature = "local-http-rustls"))]
             OutboundProxyStreamInner::Https(_) => false,

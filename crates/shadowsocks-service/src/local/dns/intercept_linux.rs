@@ -21,8 +21,8 @@ use crate::local::routing::RouteDecision;
 const NFT_TABLE: &str = "ssrust_dns";
 const DIRECT4_SET: &str = "direct4";
 const DIRECT6_SET: &str = "direct6";
-const BYPASS4_SET: &str = "bypass4";
-const BYPASS6_SET: &str = "bypass6";
+const PROXY4_SET: &str = "proxy4";
+const PROXY6_SET: &str = "proxy6";
 
 pub struct DnsInterceptGuard {
     backend: Backend,
@@ -137,11 +137,11 @@ pub fn add_route_ips(decision: RouteDecision, ips: &[IpAddr]) -> io::Result<()> 
 fn nft_set_buckets(decision: RouteDecision, ips: &[IpAddr]) -> Vec<(&'static str, Vec<IpAddr>)> {
     let v4_set = match decision {
         RouteDecision::Direct => DIRECT4_SET,
-        RouteDecision::Proxy => BYPASS4_SET,
+        RouteDecision::Proxy => PROXY4_SET,
     };
     let v6_set = match decision {
         RouteDecision::Direct => DIRECT6_SET,
-        RouteDecision::Proxy => BYPASS6_SET,
+        RouteDecision::Proxy => PROXY6_SET,
     };
     let v4: Vec<IpAddr> = ips.iter().copied().filter(|ip| matches!(ip, IpAddr::V4(_))).collect();
     let v6: Vec<IpAddr> = ips.iter().copied().filter(|ip| matches!(ip, IpAddr::V6(_))).collect();
@@ -164,8 +164,8 @@ pub fn add_route_nets(decision: RouteDecision, nets: &[IpNet]) -> io::Result<()>
         let set_name = match (decision, net) {
             (RouteDecision::Direct, IpNet::V4(..)) => DIRECT4_SET,
             (RouteDecision::Direct, IpNet::V6(..)) => DIRECT6_SET,
-            (RouteDecision::Proxy, IpNet::V4(..)) => BYPASS4_SET,
-            (RouteDecision::Proxy, IpNet::V6(..)) => BYPASS6_SET,
+            (RouteDecision::Proxy, IpNet::V4(..)) => PROXY4_SET,
+            (RouteDecision::Proxy, IpNet::V6(..)) => PROXY6_SET,
         };
         let _ = command(
             "nft",
@@ -238,27 +238,27 @@ fn nft_apply_script(script: &str) -> io::Result<()> {
     }
 }
 
-pub fn replace_route_nets(work_dir: &Path, direct: &[IpNet], bypass: &[IpNet]) -> io::Result<()> {
+pub fn replace_route_nets(work_dir: &Path, direct: &[IpNet], proxy: &[IpNet]) -> io::Result<()> {
     ensure_nft_sets()?;
     let script_path = work_dir.join(format!("ssrust-nft-sync-{}.nft", std::process::id()));
     {
         let mut script = File::create(&script_path)?;
-        for set_name in [DIRECT4_SET, DIRECT6_SET, BYPASS4_SET, BYPASS6_SET] {
+        for set_name in [DIRECT4_SET, DIRECT6_SET, PROXY4_SET, PROXY6_SET] {
             writeln!(script, "flush set inet {NFT_TABLE} {set_name}")?;
         }
         write_add_elements(&mut script, RouteDecision::Direct, direct)?;
-        write_add_elements(&mut script, RouteDecision::Proxy, bypass)?;
+        write_add_elements(&mut script, RouteDecision::Proxy, proxy)?;
     }
     let result = command("nft", &["-f", &script_path.to_string_lossy()]);
     let _ = fs::remove_file(script_path);
     result
 }
 
-pub fn bypass_set_matches(input: &str) -> io::Result<Vec<String>> {
+pub fn proxy_set_matches(input: &str) -> io::Result<Vec<String>> {
     let query = parse_debug_ip_query(input)?;
     let set_name = match query.family() {
-        IpFamily::V4 => BYPASS4_SET,
-        IpFamily::V6 => BYPASS6_SET,
+        IpFamily::V4 => PROXY4_SET,
+        IpFamily::V6 => PROXY6_SET,
     };
     let output = Command::new("nft")
         .args(["list", "set", "inet", NFT_TABLE, set_name])
@@ -329,7 +329,10 @@ fn parse_nft_ip_nets(output: &str) -> Vec<IpNet> {
             if token.is_empty() || token.contains('-') {
                 return None;
             }
-            token.parse::<IpNet>().ok().or_else(|| token.parse::<IpAddr>().ok().map(IpNet::from))
+            token
+                .parse::<IpNet>()
+                .ok()
+                .or_else(|| token.parse::<IpAddr>().ok().map(IpNet::from))
         })
         .collect()
 }
@@ -347,16 +350,20 @@ fn write_add_elements(file: &mut File, decision: RouteDecision, nets: &[IpNet]) 
         (
             match decision {
                 RouteDecision::Direct => DIRECT4_SET,
-                RouteDecision::Proxy => BYPASS4_SET,
+                RouteDecision::Proxy => PROXY4_SET,
             },
-            nets.iter().filter(|net| matches!(net, IpNet::V4(..))).collect::<Vec<_>>(),
+            nets.iter()
+                .filter(|net| matches!(net, IpNet::V4(..)))
+                .collect::<Vec<_>>(),
         ),
         (
             match decision {
                 RouteDecision::Direct => DIRECT6_SET,
-                RouteDecision::Proxy => BYPASS6_SET,
+                RouteDecision::Proxy => PROXY6_SET,
             },
-            nets.iter().filter(|net| matches!(net, IpNet::V6(..))).collect::<Vec<_>>(),
+            nets.iter()
+                .filter(|net| matches!(net, IpNet::V6(..)))
+                .collect::<Vec<_>>(),
         ),
     ] {
         for chunk in family_nets.chunks(512) {
@@ -441,7 +448,7 @@ fn setup_nft(
                     "prerouting",
                     "ip",
                     "daddr",
-                    "@bypass4",
+                    "@proxy4",
                     "tcp",
                     "dport",
                     "!=",
@@ -461,7 +468,7 @@ fn setup_nft(
                     "prerouting",
                     "ip6",
                     "daddr",
-                    "@bypass6",
+                    "@proxy6",
                     "tcp",
                     "dport",
                     "!=",
@@ -553,7 +560,7 @@ fn setup_nft(
                     "output",
                     "ip",
                     "daddr",
-                    "@bypass4",
+                    "@proxy4",
                     "tcp",
                     "dport",
                     "!=",
@@ -573,7 +580,7 @@ fn setup_nft(
                     "output",
                     "ip6",
                     "daddr",
-                    "@bypass6",
+                    "@proxy6",
                     "tcp",
                     "dport",
                     "!=",
@@ -599,25 +606,13 @@ fn add_nft_sets() -> io::Result<()> {
     for (name, kind) in [
         (DIRECT4_SET, "ipv4_addr"),
         (DIRECT6_SET, "ipv6_addr"),
-        (BYPASS4_SET, "ipv4_addr"),
-        (BYPASS6_SET, "ipv6_addr"),
+        (PROXY4_SET, "ipv4_addr"),
+        (PROXY6_SET, "ipv6_addr"),
     ] {
         let _ = command(
             "nft",
             &[
-                "add",
-                "set",
-                "inet",
-                NFT_TABLE,
-                name,
-                "{",
-                "type",
-                kind,
-                ";",
-                "flags",
-                "interval",
-                ";",
-                "}",
+                "add", "set", "inet", NFT_TABLE, name, "{", "type", kind, ";", "flags", "interval", ";", "}",
             ],
         );
     }

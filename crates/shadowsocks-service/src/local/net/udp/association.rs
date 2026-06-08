@@ -33,15 +33,17 @@ use crate::{
         UDP_ASSOCIATION_SEND_CHANNEL_SIZE, packet_window::PacketWindowFilter,
     },
 };
+#[cfg(feature = "local-web-admin")]
+use crate::local::routing::RouteDecision;
 
-/// Build the proxied socket appropriate for `svr_cfg`, transparently
+/// Build the Proxy socket appropriate for `svr_cfg`, transparently
 /// going through the configured outbound chain when one is present and
-/// fully SOCKS5 (otherwise the chain is bypassed for UDP).
-async fn create_proxied_socket(
+/// fully SOCKS5. Otherwise UDP uses the Direct path.
+async fn create_proxy_socket(
     context: &ServiceContext,
     svr_cfg: &ServerConfig,
     connect_opts: &ConnectOpts,
-) -> io::Result<ProxiedSocket> {
+) -> io::Result<ProxyRelaySocket> {
     let use_chain = context.outbound_client().map(|c| c.supports_udp()).unwrap_or(false);
 
     if use_chain {
@@ -59,11 +61,11 @@ async fn create_proxied_socket(
             .await?;
         let proxy_socket = ProxySocket::from_socket(UdpSocketType::Client, context.context(), svr_cfg, datagram);
         let mon = MonProxySocket::from_socket(proxy_socket, context.flow_stat());
-        Ok(ProxiedSocket::Chained(mon))
+        Ok(ProxyRelaySocket::Chained(mon))
     } else {
         let socket = ProxySocket::connect_with_opts(context.context(), svr_cfg, connect_opts).await?;
         let mon = MonProxySocket::from_socket(socket, context.flow_stat());
-        Ok(ProxiedSocket::Direct(mon))
+        Ok(ProxyRelaySocket::Direct(mon))
     }
 }
 
@@ -79,15 +81,15 @@ impl TcpDialer for LocalTcpDialer {
     }
 }
 
-/// Proxied UDP socket, either direct (single hop to ss-server) or routed
+/// Proxy UDP socket, either Direct (single hop to ss-server) or routed
 /// through a SOCKS5-only outbound proxy chain.
 #[allow(clippy::large_enum_variant)]
-enum ProxiedSocket {
+enum ProxyRelaySocket {
     Direct(MonProxySocket<ShadowUdpSocket>),
     Chained(MonProxySocket<OutboundProxyDatagram>),
 }
 
-impl ProxiedSocket {
+impl ProxyRelaySocket {
     async fn send_with_ctrl(&self, addr: &Address, control: &UdpSocketControlData, data: &[u8]) -> io::Result<()> {
         match self {
             Self::Direct(s) => s.send_with_ctrl(addr, control, data).await,
@@ -281,9 +283,9 @@ where
 {
     context: Arc<ServiceContext>,
     peer_addr: SocketAddr,
-    bypassed_ipv4_socket: Option<ShadowUdpSocket>,
-    bypassed_ipv6_socket: Option<ShadowUdpSocket>,
-    proxied_socket: Option<ProxiedSocket>,
+    direct_ipv4_socket: Option<ShadowUdpSocket>,
+    direct_ipv6_socket: Option<ShadowUdpSocket>,
+    proxy_socket: Option<ProxyRelaySocket>,
     keepalive_tx: mpsc::Sender<SocketAddr>,
     keepalive_flag: bool,
     balancer: PingBalancer,
@@ -338,9 +340,9 @@ where
         let mut assoc = Self {
             context,
             peer_addr,
-            bypassed_ipv4_socket: None,
-            bypassed_ipv6_socket: None,
-            proxied_socket: None,
+            direct_ipv4_socket: None,
+            direct_ipv6_socket: None,
+            proxy_socket: None,
             keepalive_tx,
             keepalive_flag: false,
             balancer,
@@ -358,9 +360,9 @@ where
     }
 
     async fn dispatch_packet(&mut self, mut receiver: mpsc::Receiver<(Address, Bytes)>) {
-        let mut bypassed_ipv4_buffer = Vec::new();
-        let mut bypassed_ipv6_buffer = Vec::new();
-        let mut proxied_buffer = Vec::new();
+        let mut direct_ipv4_buffer = Vec::new();
+        let mut direct_ipv6_buffer = Vec::new();
+        let mut proxy_buffer = Vec::new();
         let mut keepalive_interval = time::interval(Duration::from_secs(1));
 
         loop {
@@ -377,43 +379,43 @@ where
                     self.dispatch_received_packet(&target_addr, &data).await;
                 }
 
-                received_opt = receive_from_bypassed_opt(&self.bypassed_ipv4_socket, &mut bypassed_ipv4_buffer), if self.bypassed_ipv4_socket.is_some() => {
+                received_opt = receive_from_direct_opt(&self.direct_ipv4_socket, &mut direct_ipv4_buffer), if self.direct_ipv4_socket.is_some() => {
                     let (n, addr) = match received_opt {
                         Ok(r) => r,
                         Err(err) => {
-                            error!("udp relay {} <- ... (bypassed) failed, error: {}", self.peer_addr, err);
+                            error!("udp relay {} <- ... (Direct) failed, error: {}", self.peer_addr, err);
                             // Socket failure. Reset for recreation.
-                            self.bypassed_ipv4_socket = None;
+                            self.direct_ipv4_socket = None;
                             continue;
                         }
                     };
 
                     let addr = Address::from(addr);
-                    self.send_received_respond_packet(&addr, &bypassed_ipv4_buffer[..n], true).await;
+                    self.send_received_respond_packet(&addr, &direct_ipv4_buffer[..n], true).await;
                 }
 
-                received_opt = receive_from_bypassed_opt(&self.bypassed_ipv6_socket, &mut bypassed_ipv6_buffer), if self.bypassed_ipv6_socket.is_some() => {
+                received_opt = receive_from_direct_opt(&self.direct_ipv6_socket, &mut direct_ipv6_buffer), if self.direct_ipv6_socket.is_some() => {
                     let (n, addr) = match received_opt {
                         Ok(r) => r,
                         Err(err) => {
-                            error!("udp relay {} <- ... (bypassed) failed, error: {}", self.peer_addr, err);
+                            error!("udp relay {} <- ... (Direct) failed, error: {}", self.peer_addr, err);
                             // Socket failure. Reset for recreation.
-                            self.bypassed_ipv6_socket = None;
+                            self.direct_ipv6_socket = None;
                             continue;
                         }
                     };
 
                     let addr = Address::from(addr);
-                    self.send_received_respond_packet(&addr, &bypassed_ipv6_buffer[..n], true).await;
+                    self.send_received_respond_packet(&addr, &direct_ipv6_buffer[..n], true).await;
                 }
 
-                received_opt = receive_from_proxied_opt(&self.proxied_socket, &mut proxied_buffer), if self.proxied_socket.is_some() => {
+                received_opt = receive_from_proxy_opt(&self.proxy_socket, &mut proxy_buffer), if self.proxy_socket.is_some() => {
                     let (n, addr, control_opt) = match received_opt {
                         Ok(r) => r,
                         Err(err) => {
-                            error!("udp relay {} <- ... (proxied) failed, error: {}", self.peer_addr, err);
+                            error!("udp relay {} <- ... (Proxy) failed, error: {}", self.peer_addr, err);
                             // Socket failure. Reset for recreation.
-                            self.proxied_socket = None;
+                            self.proxy_socket = None;
                             continue;
                         }
                     };
@@ -447,7 +449,7 @@ where
                         }
                     }
 
-                    self.send_received_respond_packet(&addr, &proxied_buffer[..n], false).await;
+                    self.send_received_respond_packet(&addr, &proxy_buffer[..n], false).await;
                 }
 
                 _ = keepalive_interval.tick() => {
@@ -463,7 +465,7 @@ where
         }
 
         #[inline]
-        async fn receive_from_bypassed_opt(
+        async fn receive_from_direct_opt(
             socket: &Option<ShadowUdpSocket>,
             buf: &mut Vec<u8>,
         ) -> io::Result<(usize, SocketAddr)> {
@@ -479,8 +481,8 @@ where
         }
 
         #[inline]
-        async fn receive_from_proxied_opt(
-            socket: &Option<ProxiedSocket>,
+        async fn receive_from_proxy_opt(
+            socket: &Option<ProxyRelaySocket>,
             buf: &mut Vec<u8>,
         ) -> io::Result<(usize, Address, Option<UdpSocketControlData>)> {
             match *socket {
@@ -496,12 +498,11 @@ where
     }
 
     async fn dispatch_received_packet(&mut self, target_addr: &Address, data: &[u8]) {
-        // Check if target should be bypassed. If so, send packets directly.
-        let bypassed = self.balancer.is_empty() || self.context.check_target_bypassed(target_addr).await;
+        let direct = self.balancer.is_empty() || self.route_target_is_direct(target_addr).await;
 
         #[cfg(feature = "local-web-admin")]
         if let Some(routing_state) = self.context.routing_state() {
-            let decision = if bypassed {
+            let decision = if direct {
                 crate::local::routing::ConnectionDecision::Direct
             } else {
                 crate::local::routing::ConnectionDecision::Proxy
@@ -515,23 +516,23 @@ where
             "udp relay {} -> {} ({}) with {} bytes",
             self.peer_addr,
             target_addr,
-            if bypassed { "bypassed" } else { "proxied" },
+            if direct { "Direct" } else { "Proxy" },
             data.len()
         );
 
-        if bypassed {
-            if let Err(err) = self.dispatch_received_bypassed_packet(target_addr, data).await {
+        if direct {
+            if let Err(err) = self.dispatch_received_direct_packet(target_addr, data).await {
                 error!(
-                    "udp relay {} -> {} (bypassed) with {} bytes, error: {}",
+                    "udp relay {} -> {} (Direct) with {} bytes, error: {}",
                     self.peer_addr,
                     target_addr,
                     data.len(),
                     err
                 );
             }
-        } else if let Err(err) = self.dispatch_received_proxied_packet(target_addr, data).await {
+        } else if let Err(err) = self.dispatch_received_proxy_packet(target_addr, data).await {
             error!(
-                "udp relay {} -> {} (proxied) with {} bytes, error: {}",
+                "udp relay {} -> {} (Proxy) with {} bytes, error: {}",
                 self.peer_addr,
                 target_addr,
                 data.len(),
@@ -540,19 +541,30 @@ where
         }
     }
 
-    async fn dispatch_received_bypassed_packet(&mut self, target_addr: &Address, data: &[u8]) -> io::Result<()> {
+    async fn route_target_is_direct(&self, target_addr: &Address) -> bool {
+        #[cfg(feature = "local-web-admin")]
+        {
+            matches!(self.context.route_target(target_addr).await, RouteDecision::Direct)
+        }
+        #[cfg(not(feature = "local-web-admin"))]
+        {
+            self.context.target_is_direct_by_acl(target_addr).await
+        }
+    }
+
+    async fn dispatch_received_direct_packet(&mut self, target_addr: &Address, data: &[u8]) -> io::Result<()> {
         match *target_addr {
-            Address::SocketAddress(sa) => self.send_received_bypassed_packet(sa, data).await,
+            Address::SocketAddress(sa) => self.send_received_direct_packet(sa, data).await,
             Address::DomainNameAddress(ref dname, port) => {
                 lookup_then!(self.context.context_ref(), dname, port, |sa| {
-                    self.send_received_bypassed_packet(sa, data).await
+                    self.send_received_direct_packet(sa, data).await
                 })
                 .map(|_| ())
             }
         }
     }
 
-    async fn send_received_bypassed_packet(&mut self, mut target_addr: SocketAddr, data: &[u8]) -> io::Result<()> {
+    async fn send_received_direct_packet(&mut self, mut target_addr: SocketAddr, data: &[u8]) -> io::Result<()> {
         const UDP_SOCKET_SUPPORT_DUAL_STACK: bool = cfg!(any(
             target_os = "linux",
             target_os = "android",
@@ -565,33 +577,33 @@ where
         ));
 
         let socket = if UDP_SOCKET_SUPPORT_DUAL_STACK {
-            match self.bypassed_ipv6_socket {
+            match self.direct_ipv6_socket {
                 Some(ref mut socket) => socket,
                 None => {
                     let socket =
                         ShadowUdpSocket::connect_any_with_opts(AddrFamily::Ipv6, self.context.connect_opts_ref())
                             .await?;
-                    self.bypassed_ipv6_socket.insert(socket)
+                    self.direct_ipv6_socket.insert(socket)
                 }
             }
         } else {
             match target_addr {
-                SocketAddr::V4(..) => match self.bypassed_ipv4_socket {
+                SocketAddr::V4(..) => match self.direct_ipv4_socket {
                     Some(ref mut socket) => socket,
                     None => {
                         let socket =
                             ShadowUdpSocket::connect_any_with_opts(&target_addr, self.context.connect_opts_ref())
                                 .await?;
-                        self.bypassed_ipv4_socket.insert(socket)
+                        self.direct_ipv4_socket.insert(socket)
                     }
                 },
-                SocketAddr::V6(..) => match self.bypassed_ipv6_socket {
+                SocketAddr::V6(..) => match self.direct_ipv6_socket {
                     Some(ref mut socket) => socket,
                     None => {
                         let socket =
                             ShadowUdpSocket::connect_any_with_opts(&target_addr, self.context.connect_opts_ref())
                                 .await?;
-                        self.bypassed_ipv6_socket.insert(socket)
+                        self.direct_ipv6_socket.insert(socket)
                     }
                 },
             }
@@ -616,7 +628,7 @@ where
         Ok(())
     }
 
-    async fn dispatch_received_proxied_packet(&mut self, target_addr: &Address, data: &[u8]) -> io::Result<()> {
+    async fn dispatch_received_proxy_packet(&mut self, target_addr: &Address, data: &[u8]) -> io::Result<()> {
         // Increase Packet ID before send
         self.client_packet_id = match self.client_packet_id.checked_add(1) {
             Some(i) => i,
@@ -631,11 +643,11 @@ where
                 let new_session_id = generate_client_session_id();
 
                 warn!(
-                    "{} -> {} (proxied) packet id overflowed. socket reset and session renewed ({} -> {})",
+                    "{} -> {} (Proxy) packet id overflowed. socket reset and session renewed ({} -> {})",
                     self.peer_addr, target_addr, self.client_session_id, new_session_id
                 );
 
-                self.proxied_socket.take();
+                self.proxy_socket.take();
                 self.client_packet_id = 1;
                 self.client_session_id = new_session_id;
 
@@ -643,16 +655,16 @@ where
             }
         };
 
-        let socket = match self.proxied_socket {
+        let socket = match self.proxy_socket {
             Some(ref mut socket) => socket,
             None => {
                 // Create a new connection to proxy server
                 let server = self.balancer.best_udp_server();
                 let svr_cfg = server.server_config();
 
-                let proxied = create_proxied_socket(self.context.as_ref(), svr_cfg, server.connect_opts_ref()).await?;
+                let proxy = create_proxy_socket(self.context.as_ref(), svr_cfg, server.connect_opts_ref()).await?;
 
-                self.proxied_socket.insert(proxied)
+                self.proxy_socket.insert(proxy)
             }
         };
 
@@ -664,7 +676,7 @@ where
             Ok(..) => return Ok(()),
             Err(err) => {
                 debug!(
-                    "{} -> {} (proxied) sending {} bytes failed, error: {}",
+                    "{} -> {} (Proxy) sending {} bytes failed, error: {}",
                     self.peer_addr,
                     target_addr,
                     data.len(),
@@ -672,19 +684,19 @@ where
                 );
 
                 // Drop the socket and reconnect to another server.
-                self.proxied_socket = None;
+                self.proxy_socket = None;
             }
         }
 
         Ok(())
     }
 
-    async fn send_received_respond_packet(&mut self, addr: &Address, data: &[u8], bypassed: bool) {
+    async fn send_received_respond_packet(&mut self, addr: &Address, data: &[u8], direct: bool) {
         trace!(
             "udp relay {} <- {} ({}) received {} bytes",
             self.peer_addr,
             addr,
-            if bypassed { "bypassed" } else { "proxied" },
+            if direct { "Direct" } else { "Proxy" },
             data.len(),
         );
 
@@ -699,7 +711,7 @@ where
                     data.len(),
                     self.peer_addr,
                     addr,
-                    if bypassed { "bypassed" } else { "proxied" },
+                    if direct { "Direct" } else { "Proxy" },
                     err
                 );
             }
@@ -708,7 +720,7 @@ where
                     "udp relay {} <- {} ({}) with {} bytes",
                     self.peer_addr,
                     addr,
-                    if bypassed { "bypassed" } else { "proxied" },
+                    if direct { "Direct" } else { "Proxy" },
                     data.len()
                 );
             }

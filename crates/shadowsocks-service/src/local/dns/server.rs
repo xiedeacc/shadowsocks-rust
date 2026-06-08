@@ -651,15 +651,15 @@ fn strip_ipv6_dns_answers(message: &mut Message) {
 #[cfg(feature = "local-web-admin")]
 fn maybe_strip_proxy_ipv6_answers(context: &ServiceContext, decision: RouteDecision, message: &mut Message) {
     if let Some(routing_state) = context.routing_state() {
-        // Global v4-only switch: strip AAAA from EVERY answer (direct or
-        // proxy, any platform). This kills the happy-eyeballs delay when
+        // Global v4-only switch: strip AAAA from EVERY answer (Direct or
+        // Proxy, any platform). This kills the happy-eyeballs delay when
         // the host has no working public IPv6 -- which on Windows is the
         // common case once a TUN catch-all owns v4 only.
         if routing_state.dns_ipv4_only_sync() {
             strip_ipv6_dns_answers(message);
             return;
         }
-        // Even when v6 is allowed in general, proxied targets on Windows
+        // Even when v6 is allowed in general, Proxy targets on Windows
         // still go through an IPv4-only TUN catch-all, so keep the old
         // proxy-side strip for that platform.
         #[cfg(windows)]
@@ -699,7 +699,7 @@ fn should_forward_by_query(context: &ServiceContext, balancer: &PingBalancer, qu
             if let Ok(mut name) = Name::from_str(dn) {
                 // cmp will handle FQDN in case insensitive way
                 if let Ordering::Equal = query.name().cmp(&name) {
-                    // It seems that query is for this server, just bypass it to local resolver
+                    // It seems that query is for this server, send it to the Direct resolver
                     trace!("DNS querying name {} of server {:?}", query.name(), svr_cfg);
                     return Some(false);
                 }

@@ -308,8 +308,8 @@ impl Server {
                         log::info!(
                             "routing diagnostics: dns_cache={}/{} order={} ttl={}s \
                              dns_events={} conns={} flow_dec={} reverse={} \
-                             persist_direct_ip={} persist_bypass_ip={} \
-                             tmp_direct_ip={} tmp_bypass_ip={}",
+                             persist_direct_ip={} persist_proxy_ip={} \
+                             tmp_direct_ip={} tmp_proxy_ip={}",
                             d.dns_cache_size,
                             d.dns_cache_capacity,
                             d.dns_cache_order_len,
@@ -319,9 +319,9 @@ impl Server {
                             d.flow_decisions,
                             d.reverse_domains,
                             d.persistent_direct_ip,
-                            d.persistent_bypass_ip,
+                            d.persistent_proxy_ip,
                             d.temporary_direct_ip,
-                            d.temporary_bypass_ip,
+                            d.temporary_proxy_ip,
                         );
                         log::info!(
                             "routing hot-paths (last {}ms): \
@@ -431,8 +431,8 @@ impl Server {
                                 "SIGUSR1 dump (lock waited {}ms): \
                                  dns_cache={}/{} order={} \
                                  dns_events={} conns={} flow_dec={} reverse={} \
-                                 persist_direct_ip={} persist_bypass_ip={} \
-                                 tmp_direct_ip={} tmp_bypass_ip={} | \
+                                 persist_direct_ip={} persist_proxy_ip={} \
+                                 tmp_direct_ip={} tmp_proxy_ip={} | \
                                  cumulative: prune calls={} time_ns={} | \
                                  nft invocations={} time_ns={} | \
                                  append calls={} time_ns={} | \
@@ -446,9 +446,9 @@ impl Server {
                                 d.flow_decisions,
                                 d.reverse_domains,
                                 d.persistent_direct_ip,
-                                d.persistent_bypass_ip,
+                                d.persistent_proxy_ip,
                                 d.temporary_direct_ip,
-                                d.temporary_bypass_ip,
+                                d.temporary_proxy_ip,
                                 d.prune_dns_cache_calls,
                                 d.prune_dns_cache_total_ns,
                                 d.nft_invocations,
@@ -478,7 +478,7 @@ impl Server {
                 let preview = crate::net::OutboundProxyClient::from_config(&config.outbound_proxy);
                 if !preview.supports_udp() {
                     log::warn!(
-                        "outbound proxy chain contains non-SOCKS5 hop(s); UDP traffic will bypass the chain. \
+                        "outbound proxy chain contains non-SOCKS5 hop(s); UDP traffic will use the Direct path. \
                          Configure a SOCKS5-only chain to enable UDP relay."
                     );
                 }

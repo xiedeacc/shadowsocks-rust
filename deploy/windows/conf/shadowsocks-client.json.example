@@ -70,7 +70,7 @@
       // Windows TUN device. Every outbound packet ends up here via the
       // catch-all 0.0.0.0/1 + 128.0.0.0/1 routes the deploy script
       // installs; sslocal then makes per-connection direct/proxy
-      // decisions based on the runtime bypass_ip / direct_ip sets.
+      // decisions based on the runtime proxy_ip / direct_ip sets.
       "protocol": "tun",
       "mode": "tcp_and_udp",
       "tun_interface_name": "shadowsocks-tun",
@@ -98,7 +98,7 @@
     "geoip_sources": [
       "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
     ],
-    "bypass_domain_sources": [
+    "proxy_domain_sources": [
       "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt"
     ]
   },
