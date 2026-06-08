@@ -252,6 +252,7 @@ pub struct DnsEvent {
     pub results: Vec<IpAddr>,
     pub resolver: RouteDecision,
     pub cache_hit: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -1428,6 +1429,31 @@ impl RoutingState {
                 results,
                 resolver,
                 cache_hit,
+                error: None,
+            },
+        );
+        trim_old(&mut inner.dns, DEFAULT_WINDOW);
+    }
+
+    pub async fn record_dns_error(
+        &self,
+        domain: String,
+        query_type: String,
+        resolver: RouteDecision,
+        cache_hit: bool,
+        error: String,
+    ) {
+        let mut inner = self.inner.write().await;
+        push_event(
+            &mut inner.dns,
+            DnsEvent {
+                timestamp: now(),
+                domain: normalize_dns_domain(&domain),
+                query_type,
+                results: Vec::new(),
+                resolver,
+                cache_hit,
+                error: Some(error),
             },
         );
         trim_old(&mut inner.dns, DEFAULT_WINDOW);

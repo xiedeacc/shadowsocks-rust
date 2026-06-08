@@ -918,6 +918,15 @@ impl DnsClient {
                 && let Some(routing_state) = self.context.routing_state()
                 && routing_state.dns_ipv4_only_sync()
             {
+                routing_state
+                    .record_dns_error(
+                        request.queries[0].name().to_ascii(),
+                        request.queries[0].query_type().to_string(),
+                        RouteDecision::Direct,
+                        false,
+                        "AAAA query suppressed because dns_ipv4_only is enabled".to_owned(),
+                    )
+                    .await;
                 message.queries = request.queries.clone();
                 return Ok(message);
             }
@@ -968,6 +977,29 @@ impl DnsClient {
     ) -> (io::Result<Message>, bool) {
         // Start querying name servers
         debug!("DNS lookup {:?} {}", query.query_type(), query.name());
+
+        #[cfg(feature = "local-web-admin")]
+        if let Some(routing_state) = self.context.routing_state()
+            && (query.query_class() != DNSClass::IN || query.query_type() == RecordType::PTR)
+        {
+            let reason = if query.query_class() != DNSClass::IN {
+                format!(
+                    "DNS routing skipped because query class {:?} is not IN",
+                    query.query_class()
+                )
+            } else {
+                "DNS routing skipped because PTR queries are not routed".to_owned()
+            };
+            routing_state
+                .record_dns_error(
+                    query.name().to_ascii(),
+                    query.query_type().to_string(),
+                    RouteDecision::Direct,
+                    false,
+                    reason,
+                )
+                .await;
+        }
 
         #[cfg(feature = "local-web-admin")]
         if let Some(routing_state) = self.context.routing_state()
