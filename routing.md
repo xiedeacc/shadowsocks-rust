@@ -325,12 +325,13 @@ IP 规则：
 
 匹配规则：
 
-- `*` 通配符规则使用简单 wildcard 匹配。
+- wildcard 只支持 `*.domain.tld` 这一种形式。
 - `*.baidu.com` 等同于 `baidu.com`，会同时匹配 `baidu.com` 和 `a.baidu.com`。
+- `api.*`、`*foo*`、`*.com` 这类复杂或过宽 wildcard 会在加载/保存规则时报错。
 - 单标签规则只精确匹配，例如 `cn` 只匹配 `cn`。
 - 多标签规则匹配自身和子域名，例如 `pki.goog` 匹配 `pki.goog` 和 `c.pki.goog`。
 - direct 与 bypass 同时匹配时 direct 胜出。
-
+- 域名规则会预编译为 exact 和 suffix 索引。普通域名和 `*.domain.tld` 后缀规则都走 HashSet 候选查找，不遍历全量规则。
 - 根据域名规则选择 local resolver 或 remote resolver。
 - 把 DNS 结果反向反馈给路由系统，形成运行时 IP 规则和 nft bypass set。
 
@@ -404,10 +405,31 @@ flowchart TD
     M -- 连接路径未命中 routing rule --> AI
 ```
 
+
+
 注：`HTTPS` 和 `SVCB` 查询也属于 `DNSClass::IN` 的非 `PTR` 查询，因此会进入上面的域名路由流程：命中 direct 域名规则时走 `local_dns_address`，命中 bypass 域名规则时走 `remote_dns_address`，未命中时默认走 `local_dns_address`。查询会被原样转发给对应上游 DNS，上游返回的 `HTTPS` / `SVCB` 响应也会原样返回给客户端。DNS 缓存 key 会保留原始查询类型，所以同一域名的 `A`、`AAAA`、`HTTPS`、`SVCB` 分别缓存。运行时 IP 学习只从 DNS answer 中提取 `A` / `AAAA` 记录；`HTTPS` / `SVCB` 记录本身不会写入 `bypass_ip.txt` 或 nft bypass set。如果这类响应额外夹带 `A` / `AAAA` answer，才会按当前 resolver 决策调用 `add_dns_results` 学习这些 IP。
 
 注：不满足 `DNSClass::IN` 且非 `PTR` 的查询不会进入 routing DNS 流程，但仍会继续按原 DNS/ACL 逻辑处理。Recent DNS 会记录这类查询，并在 Results 列显示 `Error: DNS routing skipped because ...`，用于说明它没有按 direct/bypass 域名规则选择 resolver。
 
+
+
+ - 支持 [baidu.com](http://baidu.com) 匹配自身和所有子域：
+
+      - [baidu.com](http://baidu.com)
+
+      - [a.baidu.com](http://a.baidu.com)
+
+  - 支持 *.[baidu.com](http://baidu.com)，并且它等同于 [baidu.com](http://baidu.com)。
+
+  - 不再支持复杂 wildcard：
+
+      - api.*
+
+      - *foo*
+
+      - *.com
+
+  - 这些复杂/过宽 wildcard 会在加载或保存规则时报错：
 
 ### 连接路径如何使用路由
 
@@ -912,3 +934,4 @@ flowchart TD
 - 临时规则优先生效，但不写入冲突 JSONL。
 - Debug IP 只验证持久化 `bypass_ip.txt` 和 nft bypass set，不代表完整路由决策。
 - Debug URL 使用 `curl -4`，因此主要验证 IPv4 透明代理链路。
+

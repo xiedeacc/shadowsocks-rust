@@ -420,10 +420,18 @@ impl Default for RuleUpdateProgress {
 struct CompiledRules {
     direct_ip: Vec<IpNet>,
     direct_ip_exact: HashSet<IpAddr>,
-    direct_domain: HashSet<String>,
+    direct_domain: CompiledDomainRules,
     bypass_ip: Vec<IpNet>,
     bypass_ip_exact: HashSet<IpAddr>,
-    bypass_domain: HashSet<String>,
+    bypass_domain: CompiledDomainRules,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CompiledDomainRules {
+    raw: HashSet<String>,
+    exact: HashSet<String>,
+    suffix: HashSet<String>,
+    match_all: bool,
 }
 
 #[derive(Debug)]
@@ -486,7 +494,7 @@ impl RoutingState {
         ensure_file(temp_file_path(&config.rules_dir, TEMP_BYPASS_DOMAIN_FILE))?;
 
         let persistent_raw = read_rule_lists(&config.rules_dir)?;
-        let persistent = compile_rules(&persistent_raw);
+        let persistent = compile_rules(&persistent_raw)?;
         let geoip_path = config.rules_dir.join(SOURCE_DIR).join("geoip.dat");
         let geoip_cn = read_geoip_cn_nets(&geoip_path)?;
         let geoip_modified = file_modified(&geoip_path)?;
@@ -496,7 +504,7 @@ impl RoutingState {
         let bypass_domain_modified = file_modified(&config.rules_dir.join(BYPASS_DOMAIN_FILE))?;
         let temporary_raw = with_private_direct_rules(read_temporary_rule_lists(&config.rules_dir)?);
         let temporary_fingerprint = temporary_files_fingerprint(&config.rules_dir)?;
-        let temporary = compile_rules(&temporary_raw);
+        let temporary = compile_rules(&temporary_raw)?;
         let mut inner = RoutingInner {
             sources: RoutingSources::from(&config),
             rules_dir: config.rules_dir,
@@ -575,7 +583,7 @@ impl RoutingState {
         write_temporary_rule_lists(&inner.rules_dir, &rules)?;
         inner.temporary_fingerprint = temporary_files_fingerprint(&inner.rules_dir)?;
         inner.temporary_raw = rules;
-        inner.temporary = compile_rules(&inner.temporary_raw);
+        inner.temporary = compile_rules(&inner.temporary_raw)?;
         rebuild_conflicts(&mut inner);
         drop(inner);
         #[cfg(all(target_os = "linux", feature = "local-dns"))]
@@ -607,7 +615,7 @@ impl RoutingState {
         let mut inner = self.inner.write().await;
         inner.temporary_fingerprint = temporary_fingerprint;
         inner.temporary_raw = rules;
-        inner.temporary = compile_rules(&inner.temporary_raw);
+        inner.temporary = compile_rules(&inner.temporary_raw)?;
         rebuild_conflicts(&mut inner);
         let temporary = inner.temporary_raw.clone();
         drop(inner);
@@ -972,7 +980,7 @@ impl RoutingState {
             bypass_ip: learned_bypass_ip,
             bypass_domain,
         });
-        let persistent = compile_rules(&lists);
+        let persistent = compile_rules(&lists)?;
         completed_files = match self
             .write_rule_lists_with_progress(&rules_dir, &lists, completed_files, total_files)
             .await
@@ -1894,7 +1902,7 @@ fn refresh_rule_files_from_disk_inner(inner: &mut RoutingInner) -> io::Result<()
     }
 
     inner.persistent_raw = read_rule_lists(&inner.rules_dir)?;
-    inner.persistent = compile_rules(&inner.persistent_raw);
+    inner.persistent = compile_rules(&inner.persistent_raw)?;
     if geoip_modified != inner.geoip_modified {
         inner.geoip_cn = read_geoip_cn_nets(&geoip_path)?;
     }
@@ -1942,7 +1950,7 @@ fn rebuild_ip_conflicts(inner: &mut RoutingInner) {
 
 fn rebuild_domain_conflicts(inner: &mut RoutingInner) {
     inner.domain_conflicts.clear();
-    for rule in domain_rule_conflicts(&inner.persistent.direct_domain, &inner.persistent.bypass_domain) {
+    for rule in domain_rule_conflicts(&inner.persistent.direct_domain.raw, &inner.persistent.bypass_domain.raw) {
         push_event(
             &mut inner.domain_conflicts,
             new_conflict_event_with_metadata(
@@ -2108,8 +2116,16 @@ fn compiled_rules_match_ip(exact: &HashSet<IpAddr>, nets: &[IpNet], ip: &IpAddr)
     exact.contains(ip) || rules_match_ip(nets, ip)
 }
 
-fn rules_match_domain(rules: &HashSet<String>, domain: &str) -> bool {
-    rules.contains(domain) || rules.iter().any(|rule| domain_matches_rule(rule, domain))
+fn rules_match_domain(rules: &CompiledDomainRules, domain: &str) -> bool {
+    if rules.match_all || rules.exact.contains(domain) {
+        return true;
+    }
+    for candidate in domain_match_candidates(domain) {
+        if rules.suffix.contains(&candidate) {
+            return true;
+        }
+    }
+    false
 }
 
 fn domain_rule_conflicts(direct: &HashSet<String>, bypass: &HashSet<String>) -> Vec<String> {
@@ -2183,46 +2199,14 @@ fn format_domain_conflict(direct: &str, bypass: &str) -> String {
 }
 
 fn domain_rules_overlap(left: &str, right: &str) -> bool {
-    if domain_matches_rule(left, right) || domain_matches_rule(right, left) {
-        return true;
-    }
-    if !left.contains('*') && !right.contains('*') {
-        return false;
-    }
-    wildcard_overlap_candidates(left, right)
-        .into_iter()
-        .any(|candidate| domain_matches_rule(left, &candidate) && domain_matches_rule(right, &candidate))
-}
-
-fn wildcard_overlap_candidates(left: &str, right: &str) -> Vec<String> {
-    let left_prefix = left.split('*').next().unwrap_or_default();
-    let left_suffix = left.rsplit('*').next().unwrap_or_default();
-    let right_prefix = right.split('*').next().unwrap_or_default();
-    let right_suffix = right.rsplit('*').next().unwrap_or_default();
-    [
-        left.replace('*', "example"),
-        right.replace('*', "example"),
-        join_wildcard_candidate(right_prefix, left_suffix),
-        join_wildcard_candidate(left_prefix, right_suffix),
-    ]
-    .into_iter()
-    .map(|candidate| normalize_domain(&candidate))
-    .filter(|candidate| !candidate.is_empty())
-    .collect()
-}
-
-fn join_wildcard_candidate(prefix: &str, suffix: &str) -> String {
-    match (prefix.strip_suffix('.'), suffix.strip_prefix('.')) {
-        (Some(prefix), Some(suffix)) => format!("{prefix}.{suffix}"),
-        _ => format!("{prefix}{suffix}"),
-    }
+    domain_matches_rule(left, right) || domain_matches_rule(right, left)
 }
 
 fn domain_matches_rule(rule: &str, domain: &str) -> bool {
     if let Some(suffix_rule) = rule.strip_prefix("*.") {
         domain_matches_rule(suffix_rule, domain)
     } else if rule.contains('*') {
-        wildcard_domain_matches(rule, domain)
+        false
     } else if !rule.contains('.') {
         domain == rule
     } else {
@@ -2233,54 +2217,48 @@ fn domain_matches_rule(rule: &str, domain: &str) -> bool {
     }
 }
 
-fn wildcard_domain_matches(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    let mut remaining = value;
-    let mut parts = pattern.split('*').peekable();
-    let mut first = true;
-    while let Some(part) = parts.next() {
-        if part.is_empty() {
-            first = false;
-            continue;
-        }
-        if first && !pattern.starts_with('*') {
-            let Some(stripped) = remaining.strip_prefix(part) else {
-                return false;
-            };
-            remaining = stripped;
-        } else if parts.peek().is_none() && !pattern.ends_with('*') {
-            return remaining.ends_with(part);
-        } else if let Some(idx) = remaining.find(part) {
-            remaining = &remaining[idx + part.len()..];
-        } else {
-            return false;
-        }
-        first = false;
-    }
-    pattern.ends_with('*') || remaining.is_empty()
-}
-
-fn compile_rules(raw: &RuleLists) -> CompiledRules {
-    CompiledRules {
+fn compile_rules(raw: &RuleLists) -> io::Result<CompiledRules> {
+    Ok(CompiledRules {
         direct_ip: raw.direct_ip.iter().filter_map(|s| parse_ip_net(s)).collect(),
         direct_ip_exact: raw.direct_ip.iter().filter_map(|s| parse_ip_addr(s)).collect(),
-        direct_domain: raw
-            .direct_domain
-            .iter()
-            .map(|s| normalize_domain(s))
-            .filter(|s| !s.is_empty())
-            .collect(),
+        direct_domain: compile_domain_rules(&raw.direct_domain)?,
         bypass_ip: raw.bypass_ip.iter().filter_map(|s| parse_ip_net(s)).collect(),
         bypass_ip_exact: raw.bypass_ip.iter().filter_map(|s| parse_ip_addr(s)).collect(),
-        bypass_domain: raw
-            .bypass_domain
-            .iter()
-            .map(|s| normalize_domain(s))
-            .filter(|s| !s.is_empty())
-            .collect(),
+        bypass_domain: compile_domain_rules(&raw.bypass_domain)?,
+    })
+}
+
+fn compile_domain_rules(lines: &[String]) -> io::Result<CompiledDomainRules> {
+    let mut compiled = CompiledDomainRules::default();
+    for line in lines {
+        let rule = normalize_domain(line);
+        if rule.is_empty() {
+            continue;
+        }
+        compiled.raw.insert(rule.clone());
+        if rule == "*" {
+            compiled.match_all = true;
+        } else if let Some(suffix) = rule.strip_prefix("*.") {
+            if suffix.is_empty() || suffix.contains('*') || !suffix.contains('.') {
+                return Err(invalid_domain_wildcard(&rule));
+            }
+            compiled.suffix.insert(suffix.to_owned());
+        } else if rule.contains('*') {
+            return Err(invalid_domain_wildcard(&rule));
+        } else if rule.contains('.') {
+            compiled.suffix.insert(rule);
+        } else {
+            compiled.exact.insert(rule);
+        }
     }
+    Ok(compiled)
+}
+
+fn invalid_domain_wildcard(rule: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("unsupported domain wildcard rule '{rule}'; only '*.domain.tld' wildcard form is supported"),
+    )
 }
 
 fn parse_ip_net(value: &str) -> Option<IpNet> {
@@ -2613,8 +2591,7 @@ fn with_private_direct_rules(mut lists: RuleLists) -> RuleLists {
 }
 
 fn validate_temporary_rules(lists: &RuleLists) -> io::Result<()> {
-    let _ = lists;
-    Ok(())
+    compile_rules(lists).map(|_| ())
 }
 
 #[cfg(all(target_os = "linux", feature = "local-dns"))]
@@ -3306,12 +3283,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wildcard_domain_rules_route_and_conflict() {
+    async fn wildcard_suffix_domain_rules_route_and_conflict() {
         let dir = temp_rules_dir("wildcard-domain");
         write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
         write_lines_atomic(dir.join(BYPASS_IP_FILE), &[]).unwrap();
         write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["*.example.com".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(BYPASS_DOMAIN_FILE), &["api.*".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
 
         let mut config = RouteRulesConfig::default();
         config.rules_dir = dir;
@@ -3324,11 +3301,29 @@ mod tests {
         assert_eq!(state.route_domain("api.example.com").await, Some(RouteDecision::Direct));
         let conflicts = state.domain_conflicts().await;
         assert!(conflicts.iter().any(|conflict| {
-            matches!(
-                conflict.value.as_str(),
-                "*.example.com <-> api.*" | "api.* <-> *.example.com"
-            ) && conflict.sources == [DIRECT_DOMAIN_FILE.to_owned(), BYPASS_DOMAIN_FILE.to_owned()]
+            conflict.value == "*.example.com <-> example.com"
+                && conflict.sources == [DIRECT_DOMAIN_FILE.to_owned(), BYPASS_DOMAIN_FILE.to_owned()]
         }));
+    }
+
+    #[tokio::test]
+    async fn complex_domain_wildcards_are_rejected() {
+        let dir = temp_rules_dir("complex-wildcard-domain");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_DOMAIN_FILE), &["api.*".to_owned()]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+        let err = match RoutingState::load(config).await {
+            Ok(_) => panic!("complex wildcard should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("only '*.domain.tld' wildcard form is supported"));
     }
 
     #[tokio::test]
@@ -3360,6 +3355,26 @@ mod tests {
         assert_eq!(state.route_domain("a.baidu.com").await, Some(RouteDecision::Direct));
         assert_eq!(state.route_domain("b.baidu.com").await, Some(RouteDecision::Direct));
         assert_eq!(state.route_domain("temp.baidu.com").await, Some(RouteDecision::Proxy));
+    }
+
+    #[tokio::test]
+    async fn apex_and_wildcard_domain_rules_are_suffix_equivalent() {
+        let dir = temp_rules_dir("domain-suffix-equivalence");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["*.direct.baidu.com".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(BYPASS_DOMAIN_FILE), &["baidu.com".to_owned()]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.bypass_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+
+        assert_eq!(state.route_domain("baidu.com").await, Some(RouteDecision::Proxy));
+        assert_eq!(state.route_domain("a.baidu.com").await, Some(RouteDecision::Proxy));
+        assert_eq!(state.route_domain("direct.baidu.com").await, Some(RouteDecision::Direct));
+        assert_eq!(state.route_domain("a.direct.baidu.com").await, Some(RouteDecision::Direct));
     }
 
     #[tokio::test]
