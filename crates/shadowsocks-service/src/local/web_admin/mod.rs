@@ -8,10 +8,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     process::{Command, Stdio},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     task::{Context, Poll},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -26,7 +23,7 @@ use tokio::{net::TcpListener, time};
 
 use crate::{
     config::{DEFAULT_DEPLOY_DIR, WebAdminConfig},
-    local::routing::{ConnectionEvent, RoutingState, RuleLists},
+    local::routing::{RoutingState, RuleLists},
 };
 
 type ResponseBody = Full<Bytes>;
@@ -62,12 +59,12 @@ pub struct WebAdmin {
 impl WebAdmin {
     pub async fn run(self) -> io::Result<()> {
         info!("shadowsocks web admin listening on {}", self.listener.local_addr()?);
+        let server_filters = Arc::new(server_filters_from_config_path(&self.config_path));
         let handler = Arc::new(WebAdminHandler {
             token: self.token,
             config_path: self.config_path,
             routing_state: self.routing_state,
-            activity_recording: Arc::new(AtomicBool::new(false)),
-            activity_recorded: Arc::new(Mutex::new(HashSet::new())),
+            server_filters,
         });
 
         loop {
@@ -99,8 +96,7 @@ struct WebAdminHandler {
     token: Option<String>,
     config_path: PathBuf,
     routing_state: RoutingState,
-    activity_recording: Arc<AtomicBool>,
-    activity_recorded: Arc<Mutex<HashSet<String>>>,
+    server_filters: Arc<HashSet<IpAddr>>,
 }
 
 impl WebAdminHandler {
@@ -297,19 +293,18 @@ impl WebAdminHandler {
             )),
             (Method::GET, "/api/activity/connections") => Ok(json_response(
                 StatusCode::OK,
-                &self.recordable_recent_connections().await?,
+                &self.routing_state.recent_connections(&self.server_filters).await,
             )),
             (Method::POST, "/api/activity/record/start") => {
-                self.routing_state.truncate_record_file().await?;
-                if let Ok(mut recorded) = self.activity_recorded.lock() {
-                    recorded.clear();
-                }
-                self.activity_recording.store(true, Ordering::Relaxed);
-                Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
+                let status = self.routing_state.start_activity_recording().await?;
+                Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true, "status": status })))
             }
             (Method::POST, "/api/activity/record/stop") => {
-                self.activity_recording.store(false, Ordering::Relaxed);
-                Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
+                let status = self.routing_state.stop_activity_recording().await?;
+                Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true, "status": status })))
+            }
+            (Method::GET, "/api/activity/record/status") => {
+                Ok(json_response(StatusCode::OK, &self.routing_state.activity_record_status().await))
             }
             (Method::GET, "/api/activity/dns") => {
                 Ok(json_response(StatusCode::OK, &self.routing_state.recent_dns().await))
@@ -355,7 +350,7 @@ impl WebAdminHandler {
     }
 
     async fn sys_status(&self) -> serde_json::Value {
-        let (ip_conflicts, domain_conflicts) = self.routing_state.direct_bypass_file_conflicts().await;
+        let (ip_conflicts, domain_conflicts) = self.routing_state.direct_proxy_file_conflicts().await;
         let mut status = system_status();
         if let Some(object) = status.as_object_mut() {
             object.insert("ip_conflicts".to_owned(), serde_json::json!(ip_conflicts));
@@ -393,7 +388,7 @@ impl WebAdminHandler {
             .iter()
             .flat_map(|event| event.results.iter().copied())
             .collect::<Vec<_>>();
-        let connections = self.routing_state.recent_connections(&self.server_filters()).await;
+        let connections = self.routing_state.recent_connections(&self.server_filters).await;
         let transparent_connection = connections.iter().find(|event| {
             event.timestamp >= started_at
                 && matches!(
@@ -408,7 +403,7 @@ impl WebAdminHandler {
         Ok(serde_json::json!({
             "url": url,
             "host": host,
-            "bypass_domain": matches!(decision, Some(crate::local::routing::RouteDecision::Proxy)),
+            "proxy_domain": matches!(decision, Some(crate::local::routing::RouteDecision::Proxy)),
             "route_decision": decision,
             "dns_intercepted": !matching_dns.is_empty(),
             "dns_cache_hit": cached_before,
@@ -421,41 +416,6 @@ impl WebAdminHandler {
         }))
     }
 
-    async fn recordable_recent_connections(&self) -> io::Result<Vec<ConnectionEvent>> {
-        let rows = self.routing_state.recent_connections(&self.server_filters()).await;
-        if !self.activity_recording.load(Ordering::Relaxed) {
-            return Ok(rows);
-        }
-
-        let unseen = if let Ok(mut recorded) = self.activity_recorded.lock() {
-            rows.iter()
-                .filter(|row| recorded.insert(connection_record_key(row)))
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        if !unseen.is_empty() {
-            self.routing_state.append_record_connections(&unseen).await?;
-        }
-        Ok(rows)
-    }
-
-    fn server_filters(&self) -> Vec<IpAddr> {
-        let Ok(content) = fs::read_to_string(&self.config_path) else {
-            return Vec::new();
-        };
-        let Ok(config) = json5::from_str::<serde_json::Value>(&content) else {
-            return Vec::new();
-        };
-        config
-            .get("servers")
-            .and_then(|servers| servers.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|server| server.get("server")?.as_str()?.parse::<IpAddr>().ok())
-            .collect()
-    }
 }
 
 #[derive(serde::Deserialize)]
@@ -663,18 +623,20 @@ fn domain_matches_debug_host(domain: &str, host: &str) -> bool {
         .eq_ignore_ascii_case(host.trim_end_matches('.'))
 }
 
-fn connection_record_key(row: &ConnectionEvent) -> String {
-    format!(
-        "{}|{}|{}|{:?}|{:?}|{}|{}|{:?}",
-        row.timestamp,
-        row.source_ip,
-        row.source_port,
-        row.destination_ip,
-        row.destination_domain,
-        row.destination_port,
-        row.protocol,
-        row.decision
-    )
+fn server_filters_from_config_path(config_path: &PathBuf) -> HashSet<IpAddr> {
+    let Ok(content) = fs::read_to_string(config_path) else {
+        return HashSet::new();
+    };
+    let Ok(config) = json5::from_str::<serde_json::Value>(&content) else {
+        return HashSet::new();
+    };
+    config
+        .get("servers")
+        .and_then(|servers| servers.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|server| server.get("server")?.as_str()?.parse::<IpAddr>().ok())
+        .collect()
 }
 
 fn run_debug_curl(url: &str) -> io::Result<DebugCurlResult> {
@@ -1014,11 +976,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
               <label>Direct Domain<textarea id="tmp_direct_domain"></textarea></label>
             </fieldset>
             <fieldset>
-              <label>Bypass IP<textarea id="tmp_bypass_ip"></textarea></label>
-              <label>Bypass Domain<textarea id="tmp_bypass_domain"></textarea></label>
+              <label>Proxy IP<textarea id="tmp_proxy_ip"></textarea></label>
+              <label>Proxy Domain<textarea id="tmp_proxy_domain"></textarea></label>
             </fieldset>
           </div>
-          <p class="hint" style="padding:0 9px 9px">Temporary lists have priority over generated direct/bypass files. bypass_ip supports "IP_OR_CIDR domain"; old one-column rows still work.</p>
+          <p class="hint" style="padding:0 9px 9px">Temporary lists have priority over generated direct/proxy files. proxy_ip supports "IP_OR_CIDR domain"; old one-column rows still work.</p>
         </div>
       </div>
     </div>
@@ -1027,7 +989,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <button onclick="saveTempRules()">Save</button>
       <button onclick="downloadRules()">Download</button>
       <button onclick="generateRules()">Generate</button>
-      <p class="hint">Sources are configured in Basic and refreshed weekly. Generate preserves direct_ip.txt, direct_domain.txt, and learned bypass_ip.txt rows, rebuilds bypass_domain.txt from gfw.txt, and uses geoip.dat only for IP conflict checks. Temporary Lists are saved only under data/temp and restored into memory.</p>
+      <p class="hint">Sources are configured in Basic and refreshed weekly. Generate preserves direct_ip.txt, direct_domain.txt, and learned proxy_ip.txt rows, rebuilds proxy_domain.txt from gfw.txt, and uses geoip.dat only for IP conflict checks. Temporary Lists are saved only under data/temp and restored into memory.</p>
       <div id="ruleUpdateProgress" class="progress-box">
         <div><strong>Status:</strong> <span id="progressStatus">idle</span></div>
         <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
@@ -1061,7 +1023,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <script>
     let currentConfigPath='', currentRawConfig={}, servicePlatform=null;
     const defaultGeoipSources=['https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'];
-    const defaultBypassDomainSources=['https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt'];
+    const defaultProxyDomainSources=['https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt'];
     function token(){return new URLSearchParams(location.search).get('token')||''}
     async function api(path,opt={}){opt.headers=Object.assign({'x-admin-token':token()},opt.headers||{});let r=await fetch(path,opt);let j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}
     async function platform(){if(!servicePlatform)servicePlatform=await api('/api/sys/platform');return servicePlatform}
@@ -1139,7 +1101,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const windowsTun=redirEnable.checked&&isWindowsService();
       let routeRules=Object.assign({},currentRawConfig.route_rules||{});
       if(!Array.isArray(routeRules.geoip_sources)||!routeRules.geoip_sources.length)routeRules.geoip_sources=defaultGeoipSources.slice();
-      if(!Array.isArray(routeRules.bypass_domain_sources)||!routeRules.bypass_domain_sources.length)routeRules.bypass_domain_sources=defaultBypassDomainSources.slice();
+      if(!Array.isArray(routeRules.proxy_domain_sources)||!routeRules.proxy_domain_sources.length)routeRules.proxy_domain_sources=defaultProxyDomainSources.slice();
       routeRules.dns_cache_capacity=num(dnsCacheCapacity.value,10000);
       routeRules.dns_cache_ttl_seconds=num(dnsCacheTtl.value,604800);
       routeRules.dns_cache_refresh_enabled=dnsCacheRefreshEnabled.checked;
@@ -1192,10 +1154,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     async function loadRules(){
       let tmp=await api('/api/temp-rules');
-      setLines('tmp_direct_ip',tmp.direct_ip);setLines('tmp_direct_domain',tmp.direct_domain);setLines('tmp_bypass_ip',tmp.bypass_ip);setLines('tmp_bypass_domain',tmp.bypass_domain);
+      setLines('tmp_direct_ip',tmp.direct_ip);setLines('tmp_direct_domain',tmp.direct_domain);setLines('tmp_proxy_ip',tmp.proxy_ip);setLines('tmp_proxy_domain',tmp.proxy_domain);
     }
     async function reloadRouteTab(){await loadRules();await renderRouteConflicts()}
-    function tempRules(){return {direct_ip:lines(tmp_direct_ip.value),direct_domain:lines(tmp_direct_domain.value),bypass_ip:lines(tmp_bypass_ip.value),bypass_domain:lines(tmp_bypass_domain.value)}}
+    function tempRules(){return {direct_ip:lines(tmp_direct_ip.value),direct_domain:lines(tmp_direct_domain.value),proxy_ip:lines(tmp_proxy_ip.value),proxy_domain:lines(tmp_proxy_domain.value)}}
     async function saveTempRules(){
       await api('/api/temp-rules',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(tempRules())});
       progressMessage.textContent='temporary rules saved to data/temp; runtime reload will follow automatically';
@@ -1235,13 +1197,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       let cols=[['Value',r=>r.value],['Regions',r=>(r.regions||[]).join(', ')],['Sources',r=>(r.sources||[]).join(', ')]];
       document.getElementById(id).innerHTML=table(rows,cols,'conflict-table')
     }
-    async function toggleActivityRecord(checked){await api(checked?'/api/activity/record/start':'/api/activity/record/stop',{method:'POST'});if(checked)refresh('connections')}
+    async function syncActivityRecordStatus(){let s=await api('/api/activity/record/status');activityRecord.checked=!!s.recording;if(!s.recording){dnsOut.innerHTML='';connOut.innerHTML=''}return s}
+    async function toggleActivityRecord(checked){await api(checked?'/api/activity/record/start':'/api/activity/record/stop',{method:'POST'});let s=await syncActivityRecordStatus();if(s.recording)refresh('connections')}
     async function renderConnections(){let rows=await api('/api/activity/connections');connOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Source',r=>r.source_ip+':'+r.source_port],['Destination',r=>(r.destination_ip||r.destination_domain)+':'+r.destination_port],['Domain',r=>r.domain||'-'],['Protocol',r=>r.protocol],['Decision',r=>r.decision]])}
-    async function renderDns(){let el=document.getElementById('recentDnsRecord');if(el&&!el.checked)return;let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>r.error?('Error: '+r.error):(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']])}
+    async function renderDns(){let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>r.error?('Error: '+r.error):(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']])}
     async function renderRouteConflicts(){await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip')}
-    async function renderSys(){let s=await api('/api/sys/status');let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p><p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body+`<h3 class="card-title">direct_ip.txt / bypass_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / bypass_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
-    async function debugUrlCheck(){let url=debugUrl.value.trim();if(!url){debugUrlOut.innerHTML='<p class="hint">Enter a URL first</p>';return}debugUrlOut.innerHTML='<p class="hint">Running debug, timeout 6s...</p>';let r=await api('/api/sys/debug-url',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url})});debugUrlOut.innerHTML=table([r],[['URL',x=>x.url],['Bypass Domain',x=>x.bypass_domain?'yes':'no'],['DNS Intercepted',x=>x.dns_intercepted?'yes':'no'],['DNS Cache',x=>x.dns_cache_hit?'hit':'miss'],['Resolved IPs',x=>(x.resolved_ips||[]).join('<br>')||'-'],['Transparent Port',x=>x.transparent_port_received?'received':'not received'],['Response',x=>x.response_received?'received':'none'],['HTTP',x=>x.http_code||'-'],['Error',x=>x.curl_error||'-']])}
-    async function debugIpCheck(){let query=debugIp.value.trim();if(!query){debugIpOut.innerHTML='<p class="hint">Enter an IP or CIDR first</p>';return}let r=await api('/api/sys/debug-ip',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query})});debugIpOut.innerHTML=table([r],[['Query',x=>x.query],['Valid',x=>x.valid?'yes':'no'],['bypass_ip.txt',x=>x.bypass_file?'yes':'no'],['bypass Matches',x=>(x.bypass_file_matches||[]).join('<br>')||'-'],['NFT Checked',x=>x.nft_checked?'yes':'no'],['NFT bypass',x=>x.nft_bypass?'yes':'no'],['NFT Matches',x=>(x.nft_matches||[]).join('<br>')||'-'],['Error',x=>x.error||x.nft_error||'-']])}
+    async function renderSys(){let s=await api('/api/sys/status');let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p><p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body+`<h3 class="card-title">direct_ip.txt / proxy_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / proxy_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
+    async function debugUrlCheck(){let url=debugUrl.value.trim();if(!url){debugUrlOut.innerHTML='<p class="hint">Enter a URL first</p>';return}debugUrlOut.innerHTML='<p class="hint">Running debug, timeout 6s...</p>';let r=await api('/api/sys/debug-url',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url})});debugUrlOut.innerHTML=table([r],[['URL',x=>x.url],['Proxy Domain',x=>x.proxy_domain?'yes':'no'],['DNS Intercepted',x=>x.dns_intercepted?'yes':'no'],['DNS Cache',x=>x.dns_cache_hit?'hit':'miss'],['Resolved IPs',x=>(x.resolved_ips||[]).join('<br>')||'-'],['Transparent Port',x=>x.transparent_port_received?'received':'not received'],['Response',x=>x.response_received?'received':'none'],['HTTP',x=>x.http_code||'-'],['Error',x=>x.curl_error||'-']])}
+    async function debugIpCheck(){let query=debugIp.value.trim();if(!query){debugIpOut.innerHTML='<p class="hint">Enter an IP or CIDR first</p>';return}let r=await api('/api/sys/debug-ip',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query})});debugIpOut.innerHTML=table([r],[['Query',x=>x.query],['Valid',x=>x.valid?'yes':'no'],['proxy_ip.txt',x=>x.proxy_file?'yes':'no'],['proxy Matches',x=>(x.proxy_file_matches||[]).join('<br>')||'-'],['NFT Checked',x=>x.nft_checked?'yes':'no'],['NFT proxy',x=>x.nft_proxy?'yes':'no'],['NFT Matches',x=>(x.nft_matches||[]).join('<br>')||'-'],['Error',x=>x.error||x.nft_error||'-']])}
     function syncDnsRefreshToBasic(){dnsCacheRefreshEnabled.checked=dnsCacheRefreshEnabledDns.checked;dnsCacheRefreshBatch.value=dnsCacheRefreshBatchDns.value;updateClientJson()}
     async function saveDnsCacheSettings(){syncDnsRefreshToBasic();await saveClientConfig();dnsCacheMessage.textContent='Refresh settings saved, restarting service...'}
     async function renderDnsCacheStats(){let s=await api('/api/dns/cache/stats');dnsCacheSize.textContent=s.size;dnsCacheCapacityOut.textContent=s.capacity;dnsCacheTtlOut.textContent=s.ttl_seconds;dnsCacheRefreshEnabledDns.checked=s.refresh_enabled!==false;dnsCacheRefreshBatchDns.value=s.refresh_batch_size||500}
@@ -1249,7 +1212,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function queryDnsCacheIp(){await renderDnsCacheStats();let ip=dnsQueryIp.value.trim();if(!ip){dnsCacheOut.innerHTML='<p class="hint">Enter an IP</p>';return}let rows=await api('/api/dns/cache/query-ip?ip='+encodeURIComponent(ip));dnsCacheOut.innerHTML=table(rows,[['IP',r=>r.ip],['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Expires',r=>fmtTime(r.expires_at)]])}
     async function clearDnsDomain(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheMessage.textContent='Enter a domain first';return}let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({domain})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';await queryDnsCache()}
     async function clearDnsAll(){let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';dnsCacheOut.innerHTML='';await renderDnsCacheStats()}
-    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='dns')await renderDnsCacheStats();if(id==='routeConfig')await reloadRouteTab();if(id==='sys')await renderSys();if(id==='connections'){await renderDns();await renderConnections()}}catch(e){alert(e.message)}}
+    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='dns')await renderDnsCacheStats();if(id==='routeConfig')await reloadRouteTab();if(id==='sys')await renderSys();if(id==='connections'){let s=await syncActivityRecordStatus();if(s.recording){await renderDns();await renderConnections()}}}catch(e){alert(e.message)}}
     document.querySelector("nav button[data-tab=\"basic\"]").classList.add('active');
     window.addEventListener('resize',updateNavIndicator);
     requestAnimationFrame(updateNavIndicator);
