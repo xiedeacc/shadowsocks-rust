@@ -965,6 +965,8 @@ impl RoutingState {
                     RouteDecision::Proxy => {
                         let target_exists =
                             compiled_rules_match_ip(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip, ip);
+                        let direct_exists =
+                            dns_proxy_ip_blocked_from_nft_by_direct_rule(&inner, ip);
                         let line = format_proxy_ip_domain_line(ip, domain);
                         match inner
                             .persistent_raw
@@ -991,21 +993,15 @@ impl RoutingState {
                         if !target_exists {
                             inner.persistent.proxy_ip_exact.insert(*ip);
                             inner.persistent.proxy_ip.push(IpNet::from(*ip));
-                            if !compiled_rules_match_ip(
-                                &inner.persistent.direct_ip_exact,
-                                &inner.persistent.direct_ip,
-                                ip,
-                            ) && !compiled_rules_match_ip(
-                                &inner.temporary.direct_ip_exact,
-                                &inner.temporary.direct_ip,
-                                ip,
-                            ) {
-                                nft_ips.push(*ip);
-                            }
+                        }
+                        if !direct_exists {
+                            nft_ips.push(*ip);
                         }
                     }
                 }
             }
+            nft_ips.sort_unstable();
+            nft_ips.dedup();
 
             if !proxy_changed && nft_ips.is_empty() {
                 let elapsed = total_start.elapsed();
@@ -1016,24 +1012,29 @@ impl RoutingState {
             match decision {
                 RouteDecision::Direct => {}
                 RouteDecision::Proxy => {
-                    inner.persistent_raw.proxy_ip.extend(lines);
-                    inner.proxy_ip_dirty = true;
-                    if !inner.proxy_ip_persist_scheduled {
-                        inner.proxy_ip_persist_scheduled = true;
-                        schedule_proxy_persist = true;
+                    if proxy_changed {
+                        inner.persistent_raw.proxy_ip.extend(lines);
+                        inner.proxy_ip_dirty = true;
+                        if !inner.proxy_ip_persist_scheduled {
+                            inner.proxy_ip_persist_scheduled = true;
+                            schedule_proxy_persist = true;
+                        }
                     }
                 }
             }
             rebuild_ip_conflicts(&mut inner);
             nft_ips
         };
-        warn!(
-            "dns processed {} {:?} nft candidate IPs for {}",
-            nft_ips.len(),
-            decision,
-            domain
-        );
+        if !nft_ips.is_empty() {
+            warn!(
+                "dns processed {} {:?} nft candidate IPs for {}",
+                nft_ips.len(),
+                decision,
+                domain
+            );
+        }
         #[cfg(all(target_os = "linux", feature = "local-dns"))]
+        if !nft_ips.is_empty()
         {
             // Move the nft fork+exec onto a blocking-pool thread so the
             // tokio worker that's running the DNS handler isn't stalled
@@ -3027,6 +3028,11 @@ fn persistent_nft_proxy_nets(inner: &RoutingInner) -> Vec<IpNet> {
     proxy
 }
 
+fn dns_proxy_ip_blocked_from_nft_by_direct_rule(inner: &RoutingInner, ip: &IpAddr) -> bool {
+    compiled_rules_match_ip(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip, ip)
+        || compiled_rules_match_ip(&inner.temporary.direct_ip_exact, &inner.temporary.direct_ip, ip)
+}
+
 #[cfg(all(target_os = "linux", feature = "local-dns"))]
 fn temporary_nft_proxy_nets(inner: &RoutingInner, rules: &RuleLists) -> Vec<IpNet> {
     let temporary_direct = rules
@@ -4123,6 +4129,59 @@ mod tests {
         assert!(!lines.contains(&"203.0.113.10 b.example.com".to_owned()));
         assert_eq!(lines.iter().filter(|line| parse_ip_addr(line) == Some(ip)).count(), 1);
         assert_eq!(state.route_ip(&ip).await, Some(RouteDecision::Proxy));
+    }
+
+    #[tokio::test]
+    async fn known_proxy_dns_result_does_not_dirty_proxy_file() {
+        let dir = temp_rules_dir("dns-known-proxy-not-dirty");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_IP_FILE), &["203.0.113.10 a.example.com".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+        let ip = "203.0.113.10".parse().unwrap();
+
+        state
+            .add_dns_results(RouteDecision::Proxy, "b.example.com.", &[ip])
+            .await
+            .unwrap();
+
+        let inner = state.inner.read().await;
+        assert!(!inner.proxy_ip_dirty);
+        assert!(!inner.proxy_ip_persist_scheduled);
+        drop(inner);
+
+        let lines = read_lines(dir.join(PROXY_IP_FILE)).unwrap();
+        assert_eq!(lines, vec!["203.0.113.10 a.example.com".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn known_proxy_ip_remains_eligible_for_nft_dns_sync() {
+        let dir = temp_rules_dir("dns-known-proxy-nft-sync");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_IP_FILE), &["203.0.113.10 a.example.com".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+        let ip = "203.0.113.10".parse().unwrap();
+        let inner = state.inner.read().await;
+
+        assert!(compiled_rules_match_ip(
+            &inner.persistent.proxy_ip_exact,
+            &inner.persistent.proxy_ip,
+            &ip
+        ));
+        assert!(!dns_proxy_ip_blocked_from_nft_by_direct_rule(&inner, &ip));
     }
 
     #[tokio::test]

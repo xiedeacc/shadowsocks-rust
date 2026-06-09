@@ -447,24 +447,24 @@ flowchart TD
     D -- 否 --> H[为每个 IP 生成 IP domain 行]
     H --> I{proxy_ip 已有同 IP?}
     I -- 一列旧行 --> J[升级为 IP domain]
-    I -- 已有带域名行 --> K[复用旧行]
+    I -- 已有带域名行 --> K[复用旧行, 不标记 dirty]
     I -- 不存在 --> L[加入内存 Proxy 列表并标记 dirty]
     J --> M[标记 proxy_ip_dirty]
-    K --> M
+    K --> N
     L --> M
     M --> N[重建 IP 冲突]
     N --> O[释放 routing lock]
     O --> P{Linux local-dns 构建?}
-    P -- 是 --> Q[计算 nft 增量 delta]
+    P -- 是 --> Q[计算 nft 同步候选]
     P -- 否 --> R[跳过 nft]
-    Q --> Q1{delta 为空?}
+    Q --> Q1{候选为空?}
     Q1 -- 是 --> X
-    Q1 -- 否 --> Q2[spawn_blocking 批量同步 nft delta]
+    Q1 -- 否 --> Q2[spawn_blocking 批量同步 nft]
     Q2 --> S{decision 是 Proxy?}
     S -- 是 --> T{IP 是否命中 persistent/temporary direct_ip?}
-    T -- 否 --> U[仅把尚未在 nft proxy set 的 IP 加入 proxy4/proxy6]
+    T -- 否 --> U[加入 proxy4/proxy6, 已存在元素由 nft duplicate 容错]
     T -- 是 --> V[不加入 nft, 但保留 proxy_ip.txt 学习结果]
-    S -- 否 --> W[仅删除可能存在于 proxy4/proxy6 的 IP]
+    S -- 否 --> W[从 proxy4/proxy6 删除 DNS 结果 IP]
     R --> X{proxy_ip_dirty?}
     U --> X
     V --> X
@@ -480,16 +480,11 @@ flowchart TD
 - Direct 分支不写入 `direct_ip.txt`，不更新 persistent Direct 索引，只驱动 nft Proxy 删除。
 - Proxy 分支先更新内存并标记 dirty，随后延迟 30 秒批量写入 `proxy_ip.txt`。
 - Proxy 分支解析出的 IP 即使命中 `direct_ip.txt` 或 Temporary Lists Direct IP，也会写入 `proxy_ip.txt`；但这类 IP 不会加入 nft Proxy set。
-- nft 同步必须是增量写入：
-  - 维护一个内存 shadow/index，表示当前应当已经在 Linux `proxy4` / `proxy6` set 中的 IP。
-  - Proxy 分支构造 nft 写入批次前，先用该 index 过滤：已经在 nft proxy set 中的 IP 不再次写入。
-  - 只有新学到、未命中 Direct、且尚未在 nft proxy set 中的 IP 才进入 `add element` delta。
-  - Direct 分支只对可能存在于 nft proxy set 的 IP 生成 `delete element` delta；删除成功后同步更新 shadow/index。
-  - 配置重建、进程启动、`replace_route_nets` 或 nft table 重建后，必须同步刷新 shadow/index，避免内存状态和实际 nft set 脱节。
+- Proxy 分支会把文件去重和 nft 对账拆开：即使 IP 已经存在于 persistent Proxy 内存/`proxy_ip.txt`，只要未被 persistent/temporary Direct IP 覆盖，仍会进入 nft Proxy set 同步候选。这用于修复 `replace_route_nets`、nft table 重建或外部修改造成的 nft set 与内存脱节。
+- 命中 Proxy DNS cache 时也会调用 `add_dns_results(RouteDecision::Proxy, ...)`，因此持续访问并一直命中 cache 的域名仍能补回缺失的 nft Proxy 元素。
 - `proxy_ip.txt` 持久化使用原子写入，并会排序、去重、优先保留带域名行。
 - Linux nft 同步放到 `spawn_blocking`，避免阻塞 Tokio worker。
-- `nft -f -` 只提交 delta，按 IPv4/IPv6 和每 512 个元素分块。
-- duplicate nft element 错误只能作为兜底容错，不应成为正常路径；正常情况下已经在 nft set 中的元素不会再次写入。
+- `nft -f -` 按 IPv4/IPv6 和每 512 个元素分块批量提交。duplicate nft element 错误按幂等同步处理并被忽略。
 
 ### Generate 对 learned IP 的影响
 
@@ -1158,6 +1153,10 @@ flowchart TD
     G --> H[replace_route_nets 刷新 nft Proxy set]
     H --> I[新连接按临时规则优先决策]
 ```
+
+这里使用 `replace_route_nets` 全量刷新 Linux nft Proxy set 是设计行为。保存或重载 Temporary Rules 时，系统会用当前 persistent Proxy IP 加 temporary Proxy IP，再扣除 persistent/temporary Direct IP，重建 `proxy4` / `proxy6`。Direct 优先级因此能立即反映到透明代理路径。
+
+如果全量刷新时的内存 IP 与实际 nft set 已经脱节，后续 Proxy DNS 结果会重新对账 nft；即使命中 DNS cache，Proxy cache hit 也会再次调用 `add_dns_results` 补回缺失元素。
 
 
 
