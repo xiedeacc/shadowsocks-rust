@@ -788,10 +788,9 @@ Debug IP 不检查临时规则，也不检查 Direct 规则。
 - redir/tun 目标命中固定 Direct 例外网段时，也必须走 Direct。
 - Linux redir/firewall 模式下，固定 Direct 例外网段不应加入 nft Proxy set；如果已存在，应从 nft Proxy set 中过滤或删除。
 - TUN 模式下，固定 Direct 例外网段应走 Direct 路由，不应被 TUN/Proxy 路径再次捕获。
-- redir/tun 连接记录继续显示：
-  - redir -> `redir`
-  - tun -> `tun`
-- redir/tun 命中固定 Direct 例外网段时记录 `direct`。
+- redir/tun 连接记录按实际出站结果显示：
+  - 实际走透明代理路径时，redir -> `redir`，tun -> `tun`。
+  - 实际走 Direct 时记录 `direct`，包括固定 Direct 例外网段，以及 route_rules 判定为 Direct 的目标。
 - 不把 redir/tun 内部路由判断结果显示成 `proxy`。
 
 ### SS Server 出口保护
@@ -919,7 +918,7 @@ Debug IP 不检查临时规则，也不检查 Direct 规则。
     - http 入口写 `http_proxy`
     - redir 入口写 `redir`
     - tun 入口写 `tun`
-    - 固定 Direct 例外网段写 `direct`
+    - 实际 Direct 出站写 `direct`
   - 把 `ConnectionEvent` 追加到 `connections`，作为应用层 Recent 事件。
   - 如果该连接是本轮 Record 中首次出现的新连接，追加写入 `data/record.txt`。
 4. DNS 记录异步投递和消费
@@ -1034,11 +1033,11 @@ Debug IP 不检查临时规则，也不检查 Direct 规则。
   - SOCKS 目标命中固定 Direct 例外网段时走 Direct，并记录 `ConnectionDecision::Direct`。
   - 记录 `ConnectionDecision::Socks5Proxy`。
 - `crates/shadowsocks-service/src/local/net/udp/association.rs`
-  - UDP 代理分支按调用入口记录 `socks5_proxy` / `redir` / `tun`。
+  - UDP 代理分支按实际出站结果记录 `direct` / `socks5_proxy` / `redir` / `tun`。
   - tunnel UDP 不补充 Recent Connections；否则系统快照默认 direct。
-  - UDP 目标命中固定 Direct 例外网段时记录 `ConnectionDecision::Direct`。
+  - UDP 目标实际 Direct 出站时记录 `ConnectionDecision::Direct`。
 - redir/tun 相关入口
-  - 目标命中固定 Direct 例外网段时走 Direct，并记录 `ConnectionDecision::Direct`。
+  - 目标实际 Direct 出站时记录 `ConnectionDecision::Direct`，否则按入口记录 `ConnectionDecision::Redir` / `ConnectionDecision::Tun`。
   - Linux nft/TUN 同步逻辑需要确保固定 Direct 例外网段不会进入 Proxy 捕获路径。
 - `crates/shadowsocks-service/src/local/web_admin/mod.rs`
   - `POST /api/activity/record/start`：清空 `record.txt`，清空本轮内存活动状态，开启 5 分钟 Record。

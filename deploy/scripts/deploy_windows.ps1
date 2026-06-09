@@ -77,8 +77,6 @@ param(
     [string]$Features = "full local-tun local-web-admin local-http-rustls winservice",
     [string]$XrayPlugin = "",
     [switch]$SkipBuild,
-    [switch]$ForceConfig,
-    [switch]$NoConfigCopy,
     # Log verbosity passed to sslocal.exe in Run mode. The accepted values
     # mirror sslocal's own -v / -vv / -vvv flags:
     #   "off" - no -v flag (warn level)
@@ -689,24 +687,16 @@ function Install-RoutesAndDns {
 }
 
 # ------------------------------------------------------------------
-# Build + copy artefacts. Returns the path to the deployed config.
+# Build + copy binaries. Returns the path to the existing deployed config.
 # ------------------------------------------------------------------
 
 function Build-And-Stage {
     param(
         [string]$Root,
-        [string]$RepoRoot,
-        [bool]$ForceConfig,
-        [bool]$NoConfigCopy
+        [string]$RepoRoot
     )
 
     $ReleaseDir   = Join-Path $RepoRoot "target\release"
-    $WindowsDir   = Join-Path $RepoRoot "deploy\windows"
-    $ConfigSource = Join-Path $WindowsDir "conf\shadowsocks-client.json.example"
-    if (-not (Test-Path -LiteralPath $ConfigSource)) {
-        $alt = Join-Path $WindowsDir "conf\shadowsocks-client.json"
-        if (Test-Path -LiteralPath $alt) { $ConfigSource = $alt }
-    }
 
     if (-not $SkipBuild) {
         Write-Step "cargo build --release (features: $Features)"
@@ -717,7 +707,6 @@ function Build-And-Stage {
     New-Item -ItemType Directory -Force -Path @(
         (Join-Path $Root "bin"),
         (Join-Path $Root "conf"),
-        (Join-Path $Root "data"),
         (Join-Path $Root "logs"),
         (Get-StateDir -Root $Root)
     ) | Out-Null
@@ -731,19 +720,7 @@ function Build-And-Stage {
     }
 
     $ConfigDest = Join-Path $Root "conf\shadowsocks-client.json"
-    if (-not $NoConfigCopy) {
-        if ($ForceConfig -or -not (Test-Path -LiteralPath $ConfigDest)) {
-            if (Test-Path -LiteralPath $ConfigSource) {
-                Copy-Item -Force -LiteralPath $ConfigSource -Destination $ConfigDest
-                Write-Step "wrote default config to $ConfigDest"
-            }
-        }
-    }
-
-    $UbuntuData = Join-Path $RepoRoot "deploy\ubuntu\data"
-    if (Test-Path -LiteralPath $UbuntuData) {
-        Copy-Item -Force -Recurse -Path (Join-Path $UbuntuData "*") -Destination (Join-Path $Root "data")
-    }
+    Write-Step "using existing config at $ConfigDest"
 
     return $ConfigDest
 }
@@ -758,9 +735,9 @@ function Invoke-RunAction {
     # Always cleanup first so a previous broken install can be reset.
     Invoke-Cleanup -Root $Root -ServiceName $ServiceName -TunName $TunName
 
-    $ConfigDest = Build-And-Stage -Root $Root -RepoRoot $RepoRoot -ForceConfig:$ForceConfig -NoConfigCopy:$NoConfigCopy
+    $ConfigDest = Build-And-Stage -Root $Root -RepoRoot $RepoRoot
     if (-not (Test-Path -LiteralPath $ConfigDest)) {
-        throw "config not found at $ConfigDest; supply one and re-run, or pass -ForceConfig"
+        throw "config not found at $ConfigDest; create it before running this script"
     }
 
     $BinPath = Join-Path $Root "bin\sslocal.exe"
@@ -861,7 +838,7 @@ function Invoke-StartAction {
     # 127.0.0.1.
     Invoke-Cleanup -Root $Root -ServiceName $ServiceName -TunName $TunName
 
-    $ConfigDest = Build-And-Stage -Root $Root -RepoRoot $RepoRoot -ForceConfig:$ForceConfig -NoConfigCopy:$NoConfigCopy
+    $ConfigDest = Build-And-Stage -Root $Root -RepoRoot $RepoRoot
     if (-not (Test-Path -LiteralPath $ConfigDest)) {
         throw "config not found at $ConfigDest"
     }

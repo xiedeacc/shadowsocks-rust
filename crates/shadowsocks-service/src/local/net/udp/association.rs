@@ -581,22 +581,8 @@ where
     }
 
     #[cfg(feature = "local-web-admin")]
-    fn connection_decision(&self, target_addr: &Address, direct: bool) -> Option<ConnectionDecision> {
-        match self.kind {
-            UdpAssociationKind::Socks5 => Some(if direct {
-                ConnectionDecision::Direct
-            } else {
-                ConnectionDecision::Socks5Proxy
-            }),
-            UdpAssociationKind::Redir | UdpAssociationKind::Tun => {
-                if address_is_fixed_direct(target_addr) {
-                    Some(ConnectionDecision::Direct)
-                } else {
-                    self.kind.proxied_connection_decision()
-                }
-            }
-            UdpAssociationKind::Tunnel => None,
-        }
+    fn connection_decision(&self, _target_addr: &Address, direct: bool) -> Option<ConnectionDecision> {
+        udp_connection_decision(self.kind, direct)
     }
 
     async fn route_target_is_direct(&self, target_addr: &Address) -> bool {
@@ -783,5 +769,49 @@ where
                 );
             }
         }
+    }
+}
+
+#[cfg(feature = "local-web-admin")]
+fn udp_connection_decision(kind: UdpAssociationKind, direct: bool) -> Option<ConnectionDecision> {
+    match kind {
+        UdpAssociationKind::Socks5 => Some(if direct {
+            ConnectionDecision::Direct
+        } else {
+            ConnectionDecision::Socks5Proxy
+        }),
+        UdpAssociationKind::Redir | UdpAssociationKind::Tun => {
+            if direct {
+                Some(ConnectionDecision::Direct)
+            } else {
+                kind.proxied_connection_decision()
+            }
+        }
+        UdpAssociationKind::Tunnel => None,
+    }
+}
+
+#[cfg(all(test, feature = "local-web-admin"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_redir_and_tun_decisions_follow_actual_dispatch() {
+        assert_eq!(
+            udp_connection_decision(UdpAssociationKind::Redir, true),
+            Some(ConnectionDecision::Direct)
+        );
+        assert_eq!(
+            udp_connection_decision(UdpAssociationKind::Redir, false),
+            Some(ConnectionDecision::Redir)
+        );
+        assert_eq!(
+            udp_connection_decision(UdpAssociationKind::Tun, true),
+            Some(ConnectionDecision::Direct)
+        );
+        assert_eq!(
+            udp_connection_decision(UdpAssociationKind::Tun, false),
+            Some(ConnectionDecision::Tun)
+        );
     }
 }
