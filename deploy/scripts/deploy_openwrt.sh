@@ -346,6 +346,10 @@ if [ -f \"\$REMOTE_TMP/sslocal-watch.init\" ]; then
 	cp -f \"\$REMOTE_TMP/sslocal-watch.init\" \"/etc/init.d/sslocal-watch\"
 	chmod 755 \"/etc/init.d/sslocal-watch\"
 	/etc/init.d/sslocal-watch enable || true
+elif [ -x /etc/init.d/sslocal-watch ]; then
+	/etc/init.d/sslocal-watch stop || true
+	/etc/init.d/sslocal-watch disable || true
+	rm -f /etc/init.d/sslocal-watch /etc/rc.d/*sslocal-watch*
 fi
 if [ -f \"\$REMOTE_TMP/sslocal-probe.sh\" ]; then
 	cp -f \"\$REMOTE_TMP/sslocal-probe.sh\" \"\$REMOTE_DIR/bin/sslocal-probe.sh\"
@@ -355,6 +359,10 @@ if [ -f \"\$REMOTE_TMP/sslocal-probe.init\" ]; then
 	cp -f \"\$REMOTE_TMP/sslocal-probe.init\" \"/etc/init.d/sslocal-probe\"
 	chmod 755 \"/etc/init.d/sslocal-probe\"
 	/etc/init.d/sslocal-probe enable || true
+elif [ -x /etc/init.d/sslocal-probe ]; then
+	/etc/init.d/sslocal-probe stop || true
+	/etc/init.d/sslocal-probe disable || true
+	rm -f /etc/init.d/sslocal-probe /etc/rc.d/*sslocal-probe*
 fi
 
 if [ \"\$DISABLE_LEGACY\" = 1 ] && [ -x /etc/init.d/shadowsocks ]; then
@@ -381,4 +389,8 @@ EOS
 sh '$REMOTE_TMP/install.sh'"
 
 printf 'Deployed %s to %s:%s with service %s\n' "$TARGET_TRIPLE" "$HOST" "$REMOTE_DIR" "$SERVICE_NAME"
-printf 'Legacy /etc/init.d/shadowsocks was not touched. Set DISABLE_LEGACY=1 to stop and disable it during deploy.\n'
+if [[ "$DISABLE_LEGACY" = 1 ]]; then
+	printf 'Legacy /etc/init.d/shadowsocks was stopped and disabled if present.\n'
+else
+	printf 'Legacy /etc/init.d/shadowsocks was not touched. Set DISABLE_LEGACY=1 to stop and disable it during deploy.\n'
+fi
