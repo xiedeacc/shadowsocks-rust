@@ -661,7 +661,7 @@ IP 冲突：
 
 - `GET /api/config/rules`：返回规则目录、source 配置和临时规则快照。
 - `GET /api/temp-rules`：从 `data/temp` 重新读取临时规则并刷新内存临时索引。
-- `PUT /api/temp-rules`：写入临时规则并刷新 nft Proxy set。
+- `PUT /api/temp-rules`：写入临时规则，立即刷新内存 temporary 索引，并刷新 nft Proxy set。
 - `POST /api/rules/download`：下载 source。
 - `POST /api/rules/update`：下载并生成规则。
 - `GET /api/rules/update-progress`：读取下载/生成进度。
@@ -1140,11 +1140,11 @@ flowchart TD
 
 
 
-### 临时 Proxy IP 生效
+### 临时规则生效
 
 ```mermaid
 flowchart TD
-    A[用户保存 temporary proxy_ip.temp] --> B[PUT /api/temp-rules]
+    A[用户保存 Temporary Lists] --> B[PUT /api/temp-rules]
     B --> C[规范化并写入 data/temp]
     C --> D[更新 temporary_raw 和 temporary 索引]
     D --> E[重建冲突缓存]

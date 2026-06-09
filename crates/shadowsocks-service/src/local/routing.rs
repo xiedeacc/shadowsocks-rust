@@ -3759,6 +3759,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn temporary_proxy_domain_matches_aws_console_subdomain_immediately() {
+        let dir = temp_rules_dir("temporary-aws-domain");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+
+        state
+            .set_temporary_rules(RuleLists {
+                proxy_domain: vec!["aws.amazon.com".to_owned()],
+                ..RuleLists::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(state.route_domain("aws.amazon.com").await, Some(RouteDecision::Proxy));
+        assert_eq!(
+            state.route_domain("ap-southeast-1.console.aws.amazon.com")
+                .await,
+            Some(RouteDecision::Proxy)
+        );
+    }
+
+    #[tokio::test]
     async fn source_update_writes_four_rule_files() {
         let dir = temp_rules_dir("sources");
         let geoip_source = dir.join("geoip.txt");

@@ -288,7 +288,7 @@ impl WebAdminHandler {
             }
             (Method::PUT, "/api/temp-rules") => {
                 let rules: RuleLists = read_json(req).await?;
-                self.routing_state.save_temporary_rules_to_files(rules).await?;
+                self.routing_state.set_temporary_rules(rules).await?;
                 Ok(json_response(StatusCode::OK, &serde_json::json!({ "ok": true })))
             }
             (Method::GET, "/api/conflicts/ip") => {
@@ -1668,7 +1668,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function tempRules(){return {direct_ip:lines(tmp_direct_ip.value),direct_domain:lines(tmp_direct_domain.value),proxy_ip:lines(tmp_proxy_ip.value),proxy_domain:lines(tmp_proxy_domain.value)}}
     async function saveTempRules(){
       await api('/api/temp-rules',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(tempRules())});
-      progressMessage.textContent='temporary rules saved to data/temp; runtime reload will follow automatically';
+      progressMessage.textContent='temporary rules saved to data/temp and applied to runtime';
     }
     let progressTimer=null;
     function renderProgress(p){
