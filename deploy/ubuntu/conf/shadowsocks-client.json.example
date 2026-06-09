@@ -1,0 +1,63 @@
+{
+  "no_delay": true,
+  "locals": [
+    {
+      "local_address": "0.0.0.0",
+      "local_port": 1080,
+      "protocol": "socks"
+    },
+    {
+      "local_address": "0.0.0.0",
+      "local_port": 1081,
+      "protocol": "http"
+    },
+    {
+      "local_address": "0.0.0.0",
+      "local_port": 12345,
+      "protocol": "redir",
+      "mode": "tcp_and_udp",
+      "tcp_redir": "redirect",
+      "udp_redir": "tproxy"
+    },
+    {
+      "local_address": "0.0.0.0",
+      "local_port": 1053,
+      "protocol": "dns",
+      "mode": "tcp_and_udp",
+      "local_dns_address": "223.5.5.5",
+      "local_dns_port": 53,
+      "remote_dns_address": "8.8.8.8",
+      "remote_dns_port": 53,
+      "client_cache_size": 64
+    }
+  ],
+  "web_admin": {
+    "listen": "127.0.0.1:9090"
+  },
+  "route_rules": {
+    "geoip_sources": [
+      "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+    ],
+    "proxy_domain_sources": [
+      "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt"
+    ],
+    "dns_cache_capacity": 100000,
+    "dns_cache_ttl_seconds": 604800,
+    "dns_cache_refresh_enabled": true,
+    "dns_cache_refresh_batch_size": 500,
+    "dns_intercept_mode": "both",
+    "dns_ipv4_only": true
+  },
+  "servers": [
+    {
+      "server": "x.x.x.x",
+      "server_port": 443,
+      "password": "xxxx",
+      "timeout": 300,
+      "method": "aes-256-gcm",
+      "mode": "tcp_and_udp",
+      "plugin": "/usr/local/shadowsocks/bin/xray-plugin",
+      "plugin_opts": "tls;host=forsimple.xxx.net;path=/sspath;mux=8"
+    }
+  ]
+}
