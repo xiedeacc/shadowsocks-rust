@@ -23,21 +23,28 @@ const DIRECT4_SET: &str = "direct4";
 const DIRECT6_SET: &str = "direct6";
 const PROXY4_SET: &str = "proxy4";
 const PROXY6_SET: &str = "proxy6";
+const TPROXY_PREROUTING_CHAIN: &str = "prerouting_tproxy";
+const TPROXY_OUTPUT_CHAIN: &str = "output_tproxy";
+const TPROXY_MARK: &str = "0x5355";
+const TPROXY_TABLE: &str = "5355";
 
 pub struct DnsInterceptGuard {
     backend: Backend,
 }
 
 enum Backend {
-    Nft,
+    Nft { udp_tproxy: bool },
     Iptables { port: u16, exempt_ips: Vec<IpAddr> },
 }
 
 impl Drop for DnsInterceptGuard {
     fn drop(&mut self) {
         match self.backend {
-            Backend::Nft => {
+            Backend::Nft { udp_tproxy } => {
                 let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
+                if udp_tproxy {
+                    cleanup_tproxy_policy_routing();
+                }
             }
             Backend::Iptables { port, ref exempt_ips } => {
                 cleanup_iptables(port, exempt_ips);
@@ -70,21 +77,30 @@ pub fn cleanup_stale_nft_table() {
         }
         _ => {}
     }
+    cleanup_tproxy_policy_routing();
 }
 
 pub fn setup_firewall_redirect(
     port: u16,
     redir_port: Option<u16>,
     dns_exempt_ips: &[IpAddr],
-    tcp_exempt_endpoints: &[(IpAddr, u16)],
+    proxy_exempt_endpoints: &[(IpAddr, u16)],
 ) -> io::Result<DnsInterceptGuard> {
-    match setup_nft(port, redir_port, dns_exempt_ips, tcp_exempt_endpoints) {
-        Ok(()) => {
+    match setup_nft(port, redir_port, dns_exempt_ips, proxy_exempt_endpoints) {
+        Ok(udp_tproxy) => {
             info!("installed nftables DNS interception rules on local port {}", port);
-            Ok(DnsInterceptGuard { backend: Backend::Nft })
+            if udp_tproxy && let Some(redir_port) = redir_port {
+                info!("installed nftables UDP tproxy rules on local redir port {}", redir_port);
+            }
+            Ok(DnsInterceptGuard {
+                backend: Backend::Nft { udp_tproxy },
+            })
         }
         Err(nft_err) => {
             warn!("failed to install nftables DNS interception rules: {}", nft_err);
+            cleanup_nft_tproxy_chains();
+            cleanup_tproxy_policy_routing();
+            let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
             setup_iptables(port, dns_exempt_ips)?;
             info!("installed iptables DNS interception rules on local port {}", port);
             Ok(DnsInterceptGuard {
@@ -433,8 +449,8 @@ fn setup_nft(
     port: u16,
     redir_port: Option<u16>,
     dns_exempt_ips: &[IpAddr],
-    tcp_exempt_endpoints: &[(IpAddr, u16)],
-) -> io::Result<()> {
+    proxy_exempt_endpoints: &[(IpAddr, u16)],
+) -> io::Result<bool> {
     let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
     command("nft", &["add", "table", "inet", NFT_TABLE])?;
     add_nft_sets()?;
@@ -567,7 +583,7 @@ fn setup_nft(
         if proto == "tcp"
             && let Some(redir_port) = redir_port
         {
-            for (ip, exempt_port) in tcp_exempt_endpoints {
+            for (ip, exempt_port) in proxy_exempt_endpoints {
                 let family_expr = match ip {
                     IpAddr::V4(..) => "ip",
                     IpAddr::V6(..) => "ip6",
@@ -638,7 +654,220 @@ fn setup_nft(
             )?;
         }
     }
+    let udp_tproxy = if let Some(redir_port) = redir_port {
+        match setup_nft_udp_tproxy(redir_port, proxy_exempt_endpoints) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(
+                    "failed to install nftables UDP tproxy rules on local redir port {}: {}",
+                    redir_port, err
+                );
+                cleanup_nft_tproxy_chains();
+                cleanup_tproxy_policy_routing();
+                false
+            }
+        }
+    } else {
+        false
+    };
+    Ok(udp_tproxy)
+}
+
+fn setup_nft_udp_tproxy(redir_port: u16, proxy_exempt_endpoints: &[(IpAddr, u16)]) -> io::Result<()> {
+    setup_tproxy_policy_routing()?;
+    command(
+        "nft",
+        &[
+            "add",
+            "chain",
+            "inet",
+            NFT_TABLE,
+            TPROXY_PREROUTING_CHAIN,
+            "{",
+            "type",
+            "filter",
+            "hook",
+            "prerouting",
+            "priority",
+            "mangle",
+            ";",
+            "}",
+        ],
+    )?;
+    command(
+        "nft",
+        &[
+            "add",
+            "chain",
+            "inet",
+            NFT_TABLE,
+            TPROXY_OUTPUT_CHAIN,
+            "{",
+            "type",
+            "route",
+            "hook",
+            "output",
+            "priority",
+            "mangle",
+            ";",
+            "}",
+        ],
+    )?;
+    add_nft_udp_tproxy_prerouting_rule("ip", "@proxy4", "ip", redir_port)?;
+    add_nft_udp_tproxy_prerouting_rule("ip6", "@proxy6", "ip6", redir_port)?;
+    command(
+        "nft",
+        &[
+            "add",
+            "rule",
+            "inet",
+            NFT_TABLE,
+            TPROXY_OUTPUT_CHAIN,
+            "meta",
+            "mark",
+            TPROXY_MARK,
+            "return",
+        ],
+    )?;
+    for (ip, exempt_port) in proxy_exempt_endpoints {
+        let family_expr = match ip {
+            IpAddr::V4(..) => "ip",
+            IpAddr::V6(..) => "ip6",
+        };
+        command(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                NFT_TABLE,
+                TPROXY_OUTPUT_CHAIN,
+                family_expr,
+                "daddr",
+                &ip.to_string(),
+                "udp",
+                "dport",
+                &exempt_port.to_string(),
+                "return",
+            ],
+        )?;
+    }
+    add_nft_udp_tproxy_output_rule("ip", "@proxy4")?;
+    add_nft_udp_tproxy_output_rule("ip6", "@proxy6")?;
     Ok(())
+}
+
+fn add_nft_udp_tproxy_prerouting_rule(
+    family_expr: &'static str,
+    set_name: &'static str,
+    tproxy_family: &'static str,
+    redir_port: u16,
+) -> io::Result<()> {
+    command(
+        "nft",
+        &[
+            "add",
+            "rule",
+            "inet",
+            NFT_TABLE,
+            TPROXY_PREROUTING_CHAIN,
+            family_expr,
+            "daddr",
+            set_name,
+            "udp",
+            "dport",
+            "!=",
+            "53",
+            "tproxy",
+            tproxy_family,
+            "to",
+            &format!(":{redir_port}"),
+            "meta",
+            "mark",
+            "set",
+            TPROXY_MARK,
+            "accept",
+        ],
+    )
+}
+
+fn add_nft_udp_tproxy_output_rule(family_expr: &'static str, set_name: &'static str) -> io::Result<()> {
+    command(
+        "nft",
+        &[
+            "add",
+            "rule",
+            "inet",
+            NFT_TABLE,
+            TPROXY_OUTPUT_CHAIN,
+            family_expr,
+            "daddr",
+            set_name,
+            "udp",
+            "dport",
+            "!=",
+            "53",
+            "meta",
+            "mark",
+            "set",
+            TPROXY_MARK,
+        ],
+    )
+}
+
+fn setup_tproxy_policy_routing() -> io::Result<()> {
+    cleanup_tproxy_policy_routing();
+    command("ip", &["rule", "add", "fwmark", TPROXY_MARK, "table", TPROXY_TABLE])?;
+    command(
+        "ip",
+        &["route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", TPROXY_TABLE],
+    )?;
+    if let Err(err) = command(
+        "ip",
+        &[
+            "-6",
+            "route",
+            "add",
+            "local",
+            "::/0",
+            "dev",
+            "lo",
+            "table",
+            TPROXY_TABLE,
+        ],
+    ) {
+        warn!("failed to install IPv6 UDP tproxy policy route: {}", err);
+    }
+    Ok(())
+}
+
+fn cleanup_tproxy_policy_routing() {
+    while command("ip", &["rule", "del", "fwmark", TPROXY_MARK, "table", TPROXY_TABLE]).is_ok() {}
+    let _ = command(
+        "ip",
+        &["route", "del", "local", "0.0.0.0/0", "dev", "lo", "table", TPROXY_TABLE],
+    );
+    let _ = command(
+        "ip",
+        &[
+            "-6",
+            "route",
+            "del",
+            "local",
+            "::/0",
+            "dev",
+            "lo",
+            "table",
+            TPROXY_TABLE,
+        ],
+    );
+}
+
+fn cleanup_nft_tproxy_chains() {
+    for chain in [TPROXY_PREROUTING_CHAIN, TPROXY_OUTPUT_CHAIN] {
+        let _ = command("nft", &["flush", "chain", "inet", NFT_TABLE, chain]);
+        let _ = command("nft", &["delete", "chain", "inet", NFT_TABLE, chain]);
+    }
 }
 
 fn ensure_nft_sets() -> io::Result<()> {

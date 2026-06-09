@@ -212,7 +212,7 @@ impl Server {
         context.set_accept_opts(accept_opts);
 
         #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
-        let dns_intercept_tcp_exempt_endpoints = collect_dns_intercept_tcp_exempt_endpoints(&config);
+        let dns_intercept_proxy_exempt_endpoints = collect_dns_intercept_proxy_exempt_endpoints(&config);
 
         if let Some(resolver) = build_dns_resolver(
             config.dns,
@@ -768,7 +768,7 @@ impl Server {
                             client_addr.port(),
                             dns_intercept_redir_port,
                             &dns_intercept_exempt_ips,
-                            &dns_intercept_tcp_exempt_endpoints,
+                            &dns_intercept_proxy_exempt_endpoints,
                         ) {
                             Ok(guard) => {
                                 if let Err(err) = routing_state.sync_persistent_ip_rules_to_firewall().await {
@@ -1051,12 +1051,12 @@ fn collect_dns_intercept_exempt_ips(state: &DnsRuntimeState) -> Vec<IpAddr> {
     ips
 }
 
-/// Build exact TCP endpoints that must not be captured by local transparent
+/// Build exact endpoints that must not be captured by local transparent
 /// proxy OUTPUT rules. These are the upstream Shadowsocks servers themselves:
 /// if they are redirected into the redir listener, sslocal recursively proxies
 /// its own transport connection.
 #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
-fn collect_dns_intercept_tcp_exempt_endpoints(config: &Config) -> Vec<(IpAddr, u16)> {
+fn collect_dns_intercept_proxy_exempt_endpoints(config: &Config) -> Vec<(IpAddr, u16)> {
     let mut endpoints = Vec::new();
     for server in &config.server {
         match server.config.addr() {
