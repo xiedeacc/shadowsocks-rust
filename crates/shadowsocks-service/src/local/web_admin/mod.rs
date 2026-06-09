@@ -1291,6 +1291,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .inline-check{display:inline-flex;align-items:center;gap:4px;margin:0 0 0 10px;font-size:12px;font-weight:600;color:var(--muted)}
     .inline-check input{width:auto;margin:0}
     .record-countdown{min-width:38px;color:var(--brand2)}
+    .dns-cache-clean-title{font-size:12px;font-weight:600;margin-top:8px;color:var(--muted)}
     .progress-box{margin:8px auto 0;max-width:760px;max-height:120px;overflow:auto;text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;box-shadow:0 1px 2px #10203312}
     .progress-bar{height:10px;background:var(--soft);border-radius:999px;overflow:hidden;margin:8px 0}
     .progress-fill{height:100%;width:0;background:var(--brand)}
@@ -1404,6 +1405,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <label>Record Type<select id="dnsQueryType"><option>A</option><option>AAAA</option></select></label>
           <button onclick="queryDnsCache()">Query Cache</button>
           <button onclick="clearDnsDomain()">Clear Domain Dns Cache</button>
+          <div class="dns-cache-clean-title">Dns Cache Clean</div>
           <button onclick="clearDnsAll()">Clear All Dns Cache</button>
           <label>IP<input id="dnsQueryIp" placeholder="142.251.151.119"></label>
           <button onclick="queryDnsCacheIp()">Query Domain By IP</button>
