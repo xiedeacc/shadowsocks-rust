@@ -832,6 +832,7 @@ Debug IP 不检查临时规则，也不检查 Direct 规则。
 - Record 默认不开启；进程启动后不采集 `Recent DNS` / `Recent Connections`，也不维护本轮活动记录。
 - 只有管理页面勾选 `Record` 时，才开启 `Recent DNS` 和 `Recent Connections` 功能。
 - `Record` 开启时：
+  - 记录当前 conntrack 和 `/proc/net/*` 中已经存在的系统连接 baseline。
   - 清空本轮内存活动状态，包括 `connections`、`dns`、`flow_decisions`、`reverse_domains`、页面去重用的 hash set 等。
   - 清空 `data/record.txt`，作为新一轮记录文件。
   - 开始采集 Recent DNS 和 Recent Connections。
@@ -863,6 +864,15 @@ Debug IP 不检查临时规则，也不检查 Direct 规则。
   - 作用：conntrack 和 `/proc/net/*` 只能看到系统连接，无法知道这条连接最初来自 SOCKS5、HTTP、redir 还是 TUN；`flow_decisions` 用同一个 5 元组把系统连接映射回应用层决策。
   - 只记录有 IP 的连接。域名目标如果还没有解析成 IP，无法和内核 5 元组匹配，所以不进入 `flow_decisions`。
   - 生命周期：只在本轮 Record 的 5 分钟窗口内存在。Record 开启时清空，Record 关闭或到期时整体清空，因此查询路径不再做逐项过期检查或复杂淘汰。
+- `system_connection_baseline`
+  - 含义：Record 开启瞬间已经存在的 conntrack / `/proc/net/*` 连接 5 元组集合。
+  - 用途：避免 Record 开启前就已经建立的长连接被轮询时重新打上当前时间，并作为新的默认 `direct` 系统快照行进入 Recent Connections。
+  - key：同 `flow_decisions` 的 `FlowKey`，不包含展示用域名；后续 DNS 反查补上域名后仍能命中 baseline。
+  - 生命周期：只在本轮 Record 窗口内存在。Record 开启时重建，Record 关闭或到期时清空。
+- `system_connection_first_seen`
+  - 含义：非 baseline 系统连接在本轮 Record 中第一次被观察到的时间。
+  - 用途：conntrack 和 `/proc/net/*` 不提供连接创建时间；页面每秒轮询时不能把同一条系统快照连接反复更新时间为当前时间，否则默认 `direct` 的系统行会一直浮在真实应用层 `redir` 记录上方。
+  - 生命周期：只在本轮 Record 窗口内存在。Record 开启时清空，Record 关闭或到期时清空。
 - `connections`
   - 含义：Recent Connections 的应用层事件队列，保存 `record_connection()` 主动记录的连接事件。
   - 数据结构：`VecDeque<ConnectionEvent>`，只保存本轮 Record 内的事件。
@@ -939,6 +949,8 @@ Debug IP 不检查临时规则，也不检查 Direct 规则。
   - 读取本轮 Record 的内存快照：
     - `connections`
     - `flow_decisions`
+    - `system_connection_baseline`
+    - `system_connection_first_seen`
     - `reverse_domains`
   - 这里不需要 routing write lock，也不需要在查询路径做逐项清理：
     - Record 只有 5 分钟窗口，数据生命周期由 Record start/stop/expire 统一控制。
@@ -953,6 +965,8 @@ Debug IP 不检查临时规则，也不检查 Direct 规则。
     - `/proc/net/tcp6`
     - `/proc/net/udp6`
   - 每条系统连接先过滤 listen、unspecified、固定 Direct 例外网段、SS server IP。
+  - 如果系统连接命中 `system_connection_baseline`，说明它在 Record 开启前已经存在，不作为本轮 Recent 新连接展示。
+  - 如果系统连接未命中 baseline，使用 `system_connection_first_seen` 中的稳定时间；第一次观察到时才写入当前时间，后续轮询不刷新。
   - 系统连接默认标记为 `direct`。
   - 如果系统连接 5 元组命中 `flow_decisions`，用权威决策覆盖默认值。
   - 如果 `dedupped_recent_connections` 中没有同一条连接，则追加到返回结果。

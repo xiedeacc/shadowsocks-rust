@@ -498,6 +498,14 @@ struct RoutingInner {
     /// Flow-keyed authoritative decision map for the current Record session.
     /// Cleared on Record start/stop/expire, so it does not need per-entry TTL.
     flow_decisions: HashMap<FlowKey, ConnectionDecision>,
+    /// Kernel-visible flows that were already open when the current Record
+    /// session started. These are not "recent" activity for this session and
+    /// should not be reintroduced as default-Direct scraper rows.
+    system_connection_baseline: HashSet<FlowKey>,
+    /// First time a non-baseline kernel-visible flow was observed during the
+    /// current Record session. Kernel snapshots do not carry creation time, so
+    /// keep this stable instead of refreshing rows to "now" every poll.
+    system_connection_first_seen: HashMap<FlowKey, u64>,
     dns: VecDeque<DnsEvent>,
     reverse_domains: HashMap<IpAddr, String>,
     dns_cache: HashMap<DnsCacheKey, DnsCacheEntry>,
@@ -532,9 +540,11 @@ fn spawn_record_worker(
         while let Some(command) = rx.recv().await {
             match command {
                 RecordCommand::Start { ack } => {
+                    let system_connection_baseline = collect_system_connection_keys();
                     let path = {
                         let mut inner = inner.write().await;
                         clear_activity_state(&mut inner);
+                        inner.system_connection_baseline = system_connection_baseline;
                         inner.rules_dir.join(RECORD_FILE)
                     };
                     recorded_connections.clear();
@@ -642,6 +652,8 @@ fn clear_activity_state(inner: &mut RoutingInner) {
     inner.connections.clear();
     inner.dns.clear();
     inner.flow_decisions.clear();
+    inner.system_connection_baseline.clear();
+    inner.system_connection_first_seen.clear();
     inner.reverse_domains.clear();
 }
 
@@ -702,6 +714,8 @@ impl RoutingState {
             domain_conflicts: VecDeque::new(),
             connections: VecDeque::new(),
             flow_decisions: HashMap::new(),
+            system_connection_baseline: HashSet::new(),
+            system_connection_first_seen: HashMap::new(),
             dns: VecDeque::new(),
             reverse_domains: HashMap::new(),
             dns_cache: HashMap::new(),
@@ -1983,6 +1997,7 @@ impl RoutingState {
         let inner = self.inner.read().await;
         let reverse_domains = build_reverse_domain_map(&inner);
         let flow_decisions = inner.flow_decisions.clone();
+        let system_connection_baseline = inner.system_connection_baseline.clone();
         let mut rows = inner
             .connections
             .iter()
@@ -1996,23 +2011,45 @@ impl RoutingState {
             .collect::<Vec<_>>();
         drop(inner);
         let mut dedupped_recent_connections = rows.iter().map(connection_key).collect::<HashSet<_>>();
-        for mut event in collect_system_connections(&reverse_domains) {
+        let mut system_connections = collect_system_connections(&reverse_domains);
+        let observed_at = now();
+        let system_connection_first_seen = {
+            let mut inner = self.inner.write().await;
+            let mut first_seen = HashMap::new();
+            for event in &system_connections {
+                if is_excluded_remote(event, excluded_remotes) {
+                    continue;
+                }
+                let Some(key) = flow_key_for_event(event) else {
+                    continue;
+                };
+                if system_connection_baseline.contains(&key) {
+                    continue;
+                }
+                let timestamp = remember_system_connection_first_seen(
+                    &mut inner.system_connection_first_seen,
+                    key,
+                    observed_at,
+                );
+                first_seen.insert(key, timestamp);
+            }
+            first_seen
+        };
+        for mut event in system_connections.drain(..) {
             if is_excluded_remote(&event, excluded_remotes) {
                 continue;
             }
             // Re-label scraper rows from the authoritative in-memory
             // decision map when the 5-tuple matches.
-            if let Some(dst_ip) = event.destination_ip {
-                let proto_static = match event.protocol.as_str() {
-                    "tcp" => Some("tcp"),
-                    "udp" => Some("udp"),
-                    _ => None,
-                };
-                if let Some(p) = proto_static {
-                    let key: FlowKey = (event.source_ip, event.source_port, dst_ip, event.destination_port, p);
-                    if let Some(decision) = flow_decisions.get(&key) {
-                        event.decision = *decision;
-                    }
+            if let Some(key) = flow_key_for_event(&event) {
+                if system_connection_baseline.contains(&key) {
+                    continue;
+                }
+                if let Some(timestamp) = system_connection_first_seen.get(&key) {
+                    event.timestamp = *timestamp;
+                }
+                if let Some(decision) = flow_decisions.get(&key) {
+                    event.decision = *decision;
                 }
             }
             if dedupped_recent_connections.insert(connection_key(&event)) {
@@ -2651,6 +2688,20 @@ fn connection_key(event: &ConnectionEvent) -> (IpAddr, u16, Option<IpAddr>, Opti
     )
 }
 
+fn flow_key_for_event(event: &ConnectionEvent) -> Option<FlowKey> {
+    Some((
+        event.source_ip,
+        event.source_port,
+        event.destination_ip?,
+        event.destination_port,
+        protocol_static(event.protocol.as_str())?,
+    ))
+}
+
+fn remember_system_connection_first_seen(first_seen: &mut HashMap<FlowKey, u64>, key: FlowKey, observed_at: u64) -> u64 {
+    *first_seen.entry(key).or_insert(observed_at)
+}
+
 fn connection_record_key(row: &ConnectionEvent) -> String {
     format!(
         "{}|{}|{:?}|{:?}|{}|{}|{:?}",
@@ -2749,6 +2800,13 @@ fn collect_system_connections(reverse_domains: &HashMap<IpAddr, String>) -> Vec<
         }
     }
     rows
+}
+
+fn collect_system_connection_keys() -> HashSet<FlowKey> {
+    collect_system_connections(&HashMap::new())
+        .iter()
+        .filter_map(flow_key_for_event)
+        .collect()
 }
 
 fn collect_conntrack_connections(reverse_domains: &HashMap<IpAddr, String>) -> Vec<ConnectionEvent> {
@@ -3512,6 +3570,42 @@ mod tests {
             time::sleep(Duration::from_millis(10)).await;
         }
         panic!("recorded connection was not observed");
+    }
+
+    #[test]
+    fn flow_key_for_system_rows_ignores_display_domain() {
+        let mut event = ConnectionEvent {
+            timestamp: now(),
+            source_ip: "192.168.2.246".parse().unwrap(),
+            source_port: 54000,
+            destination_ip: Some("172.64.155.209".parse().unwrap()),
+            destination_domain: None,
+            domain: None,
+            destination_port: 443,
+            protocol: "tcp".to_owned(),
+            decision: ConnectionDecision::Direct,
+        };
+        let baseline_key = flow_key_for_event(&event).unwrap();
+
+        event.domain = Some("chatgpt.com".to_owned());
+        event.decision = ConnectionDecision::Redir;
+
+        assert_eq!(flow_key_for_event(&event), Some(baseline_key));
+    }
+
+    #[test]
+    fn system_connection_first_seen_timestamp_is_stable() {
+        let key: FlowKey = (
+            "192.168.2.246".parse().unwrap(),
+            54000,
+            "172.64.155.209".parse().unwrap(),
+            443,
+            "tcp",
+        );
+        let mut first_seen = HashMap::new();
+
+        assert_eq!(remember_system_connection_first_seen(&mut first_seen, key, 100), 100);
+        assert_eq!(remember_system_connection_first_seen(&mut first_seen, key, 200), 100);
     }
 
     #[test]
