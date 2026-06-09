@@ -701,6 +701,7 @@ fn system_status() -> serde_json::Value {
                 "nft_installed": true,
                 "nft_version": version,
                 "dns_table_installed": table_ok,
+                "nft_set_counts": nft_set_counts_status(),
                 "install_command": install_command,
             })
         }
@@ -708,6 +709,7 @@ fn system_status() -> serde_json::Value {
             "nft_installed": false,
             "nft_version": "",
             "dns_table_installed": false,
+            "nft_set_counts": nft_set_counts_unavailable(),
             "install_command": install_command,
             "error": String::from_utf8_lossy(&output.stderr).trim(),
         }),
@@ -715,10 +717,42 @@ fn system_status() -> serde_json::Value {
             "nft_installed": false,
             "nft_version": "",
             "dns_table_installed": false,
+            "nft_set_counts": nft_set_counts_unavailable(),
             "install_command": install_command,
             "error": err.to_string(),
         }),
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "local-dns"))]
+fn nft_set_counts_status() -> serde_json::Value {
+    match crate::local::dns::intercept_linux::route_set_counts() {
+        Ok(counts) => serde_json::json!({
+            "checked": true,
+            "direct4": counts.direct4,
+            "direct6": counts.direct6,
+            "proxy4": counts.proxy4,
+            "proxy6": counts.proxy6,
+            "direct_total": counts.direct_total(),
+            "proxy_total": counts.proxy_total(),
+            "total": counts.total(),
+        }),
+        Err(err) => serde_json::json!({
+            "checked": true,
+            "error": err.to_string(),
+        }),
+    }
+}
+
+#[cfg(not(all(target_os = "linux", feature = "local-dns")))]
+fn nft_set_counts_status() -> serde_json::Value {
+    nft_set_counts_unavailable()
+}
+
+fn nft_set_counts_unavailable() -> serde_json::Value {
+    serde_json::json!({
+        "checked": false,
+    })
 }
 
 #[cfg(windows)]
@@ -1688,7 +1722,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function renderConnections(){let rows=await api('/api/activity/connections');connOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Source',r=>r.source_ip+':'+r.source_port],['Destination',r=>(r.destination_ip||r.destination_domain)+':'+r.destination_port],['Domain',r=>r.domain||'-'],['Protocol',r=>r.protocol],['Decision',r=>r.decision]],'copyable-table')}
     async function renderDns(){let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>r.error?('Error: '+r.error):(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']],'copyable-table')}
     async function renderRouteConflicts(){await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip')}
-    async function renderSys(){let s=await api('/api/sys/status');let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p><p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body+`<h3 class="card-title">direct_ip.txt / proxy_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / proxy_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
+    function nftCountsHtml(s){let c=s.nft_set_counts||{};if(!c.checked)return '';if(c.error)return `<p><strong>nft set entries:</strong> <span class="status-warn">unavailable</span> <span class="hint">${esc(c.error)}</span></p>`;let rows=[{set:'direct4',entries:c.direct4},{set:'direct6',entries:c.direct6},{set:'proxy4',entries:c.proxy4},{set:'proxy6',entries:c.proxy6}];return `<p><strong>nft set entries:</strong> ${c.total??0} total, ${c.proxy_total??0} proxy, ${c.direct_total??0} direct</p>`+table(rows,[['Set',r=>r.set],['Entries',r=>r.entries??0]])}
+    async function renderSys(){let s=await api('/api/sys/status');let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p>${nftCountsHtml(s)}<p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body+`<h3 class="card-title">direct_ip.txt / proxy_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / proxy_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
     async function debugUrlCheck(mode){let [input,out]=debugEls(mode);let url=input.value.trim();if(!url){out.innerHTML='<p class="hint">Enter a URL first</p>';return}out.innerHTML='<p class="hint">Running debug, timeout 6s...</p>';let r=await api('/api/sys/debug-url',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url,mode})});out.innerHTML=debugCommand(r)+table([r],debugUrlColumns(mode))}
     async function debugIpCheck(){let query=debugIp.value.trim();if(!query){debugIpOut.innerHTML='<p class="hint">Enter an IP or CIDR first</p>';return}let r=await api('/api/sys/debug-ip',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query})});debugIpOut.innerHTML=table([r],[['Query',x=>x.query],['Valid',x=>x.valid?'yes':'no'],['proxy_ip.txt',x=>x.proxy_file?'yes':'no'],['proxy Matches',x=>(x.proxy_file_matches||[]).join('<br>')||'-'],['NFT Checked',x=>x.nft_checked?'yes':'no'],['NFT proxy',x=>x.nft_proxy?'yes':'no'],['NFT Matches',x=>(x.nft_matches||[]).join('<br>')||'-'],['Error',x=>err(x.error||x.nft_error)]])}
     async function queryDnsCache(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheOut.innerHTML='<p class="hint">Enter a domain</p>';return}let rows=await api('/api/dns/cache/query?domain='+encodeURIComponent(domain));let type=dnsQueryType.value;rows=rows.filter(r=>!type||r.query_type===type);dnsCacheOut.innerHTML=table(rows,[['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Results',r=>(r.results||[]).join('<br>')],['Expires',r=>fmtTime(r.expires_at)]])}

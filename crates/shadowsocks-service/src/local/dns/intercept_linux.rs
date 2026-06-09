@@ -278,6 +278,52 @@ pub fn proxy_set_matches(input: &str) -> io::Result<Vec<String>> {
     Ok(matches)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RouteSetCounts {
+    pub direct4: usize,
+    pub direct6: usize,
+    pub proxy4: usize,
+    pub proxy6: usize,
+}
+
+impl RouteSetCounts {
+    pub fn direct_total(self) -> usize {
+        self.direct4 + self.direct6
+    }
+
+    pub fn proxy_total(self) -> usize {
+        self.proxy4 + self.proxy6
+    }
+
+    pub fn total(self) -> usize {
+        self.direct_total() + self.proxy_total()
+    }
+}
+
+pub fn route_set_counts() -> io::Result<RouteSetCounts> {
+    Ok(RouteSetCounts {
+        direct4: nft_set_entry_count(DIRECT4_SET)?,
+        direct6: nft_set_entry_count(DIRECT6_SET)?,
+        proxy4: nft_set_entry_count(PROXY4_SET)?,
+        proxy6: nft_set_entry_count(PROXY6_SET)?,
+    })
+}
+
+fn nft_set_entry_count(set_name: &str) -> io::Result<usize> {
+    let output = Command::new("nft")
+        .args(["list", "set", "inet", NFT_TABLE, set_name])
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "nft list set {set_name} exited with {}",
+            output.status
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_nft_ip_nets(&text).len())
+}
+
 #[derive(Clone, Copy, Debug)]
 enum IpFamily {
     V4,
