@@ -1232,6 +1232,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .scroll-panel table{margin-top:0}
     .scroll-panel table,.scroll-panel th,.scroll-panel td{user-select:text}
     .scroll-panel th{position:sticky;top:0;z-index:1}
+    .copyable-table td{cursor:copy}
+    .copyable-table td:hover{background:#f4f9fd}
+    .copyable-table td.copied{background:#dff3e8}
     .conflict-table{table-layout:fixed}
     .conflict-table th,.conflict-table td{overflow-wrap:anywhere;word-break:break-word}
     .conflict-table th:nth-child(1),.conflict-table td:nth-child(1){width:42%}
@@ -1239,11 +1242,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .conflict-table th:nth-child(3),.conflict-table td:nth-child(3){width:38%}
     pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto}
     .tab{display:none;height:calc(100vh - 88px);min-height:0;overflow:hidden}.tab.active{display:block}
-    #basic.tab.active,#connections.tab.active,#dns.tab.active,#routeConfig.tab.active,#sys.tab.active{display:flex;flex-direction:column}
+    #basic.tab.active,#connections.tab.active,#routeConfig.tab.active,#sys.tab.active{display:flex;flex-direction:column}
     .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
     .activity-toolbar{display:flex;align-items:center;margin:0 0 8px}
     .activity-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:16px;align-items:stretch;flex:1;min-height:0}
     .activity-card{min-width:0;min-height:0;display:flex;flex-direction:column}
+    .connections-layout{height:100%;min-height:0;flex:1;overflow:hidden;display:flex;flex-direction:column;gap:2px}
+    .connections-layout .activity-toolbar{margin:0;flex:0 0 auto}
+    .connections-layout .activity-grid{flex:0 0 clamp(360px,58vh,600px);grid-template-rows:minmax(0,1fr);min-height:360px}
     .basic-layout{display:grid;grid-template-columns:minmax(380px,540px) 1fr;gap:18px;align-items:stretch;height:calc(100% - 46px);min-height:0}
     .basic-form-panel{overflow:auto;min-height:0}
     .basic-json-panel{display:flex;flex-direction:column;min-height:0}
@@ -1263,6 +1269,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .temporary-panel label{display:flex;flex-direction:column;flex:1;min-height:0}
     .temporary-panel textarea{flex:1;min-height:0}
     .dns-layout{display:grid;grid-template-columns:minmax(320px,420px) 1fr;gap:18px;min-height:0;flex:1}
+    .connections-dns{flex:1 1 0;min-height:0;overflow:hidden}
+    .connections-dns .card-title{margin-top:0}
+    .connections-dns .dns-panel{height:100%;box-sizing:border-box}
+    .connections-dns .dns-panel:last-child{display:flex;flex-direction:column}
+    .connections-dns #dnsCacheOut{flex:1;min-height:0}
     .dns-panel{min-height:0;overflow:auto}
     .sys-layout{min-height:0;flex:1;overflow:auto}
     .status-ok{color:#18864b;font-weight:700}
@@ -1279,13 +1290,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .hint{color:var(--muted);font-size:12px}
     .inline-check{display:inline-flex;align-items:center;gap:4px;margin:0 0 0 10px;font-size:12px;font-weight:600;color:var(--muted)}
     .inline-check input{width:auto;margin:0}
+    .record-countdown{min-width:38px;color:var(--brand2)}
     .progress-box{margin:8px auto 0;max-width:760px;max-height:120px;overflow:auto;text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;box-shadow:0 1px 2px #10203312}
     .progress-bar{height:10px;background:var(--soft);border-radius:999px;overflow:hidden;margin:8px 0}
     .progress-fill{height:100%;width:0;background:var(--brand)}
     .progress-completed{white-space:pre-line;margin-top:8px}
     @media(max-width:1300px){.route-config-layout{grid-template-columns:1fr}.route-config-column{min-height:260px}}
     @media(max-width:1000px){.rules-workspace{grid-template-columns:1fr}}
-    @media(max-width:1100px){.activity-grid,.route-rules-layout{grid-template-columns:1fr}.activity-grid{grid-template-rows:repeat(4,minmax(0,1fr))}}
+    @media(max-width:1100px){.activity-grid,.route-rules-layout{grid-template-columns:1fr}.activity-grid{grid-template-rows:repeat(4,minmax(0,1fr))}.connections-layout .activity-grid{grid-template-rows:repeat(2,minmax(0,1fr))}}
     @media(max-width:900px){.basic-layout{grid-template-columns:1fr}#clientConfig{height:auto;max-height:none}}
   </style>
 </head>
@@ -1295,7 +1307,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <span class="nav-indicator" aria-hidden="true"></span>
       <button data-tab="basic" onclick="show('basic')">Basic</button>
       <button data-tab="connections" onclick="show('connections')">Connections</button>
-      <button data-tab="dns" onclick="show('dns')">DNS</button>
       <button data-tab="routeConfig" onclick="show('routeConfig')">Route</button>
       <button data-tab="sys" onclick="show('sys')">Sys</button>
     </div>
@@ -1371,43 +1382,37 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
   </section>
 
-  <section id="dns" class="tab">
-    <div class="dns-layout">
-      <div class="panel dns-panel">
-        <h3 class="card-title">Cache Management</h3>
-        <div><strong>Size:</strong> <span id="dnsCacheSize">0</span> / <span id="dnsCacheCapacityOut">0</span></div>
-        <div><strong>TTL:</strong> <span id="dnsCacheTtlOut">0</span> seconds</div>
-        <div class="form-line"><label>Async Refresh</label><input id="dnsCacheRefreshEnabledDns" type="checkbox"></div>
-        <div class="form-line"><label>Refresh Batch Size</label><input id="dnsCacheRefreshBatchDns" type="number" min="1"></div>
-        <button onclick="saveDnsCacheSettings()">Save Refresh Settings</button>
-        <label>Domain<input id="dnsQueryDomain" placeholder="example.com"></label>
-        <label>Record Type<select id="dnsQueryType"><option>A</option><option>AAAA</option></select></label>
-        <button onclick="queryDnsCache()">Query Cache</button>
-        <label>IP<input id="dnsQueryIp" placeholder="142.251.151.119"></label>
-        <button onclick="queryDnsCacheIp()">Query Domain By IP</button>
-        <button onclick="clearDnsDomain()">Clear Domain</button>
-        <button onclick="clearDnsAll()">Clear All Cache</button>
-        <p class="hint" id="dnsCacheMessage"></p>
-      </div>
-      <div class="dns-panel">
-        <h3 class="card-title">Cached Results</h3>
-        <div id="dnsCacheOut" class="scroll-panel section-scroll"></div>
-      </div>
-    </div>
-  </section>
-
   <section id="connections" class="tab">
-    <div class="activity-toolbar">
-      <label class="inline-check"><input id="activityRecord" type="checkbox" onchange="toggleActivityRecord(this.checked)"> Record</label>
-    </div>
-    <div class="activity-grid">
-      <div class="activity-card">
-        <h3 class="card-title">Recent DNS</h3>
-        <div id="dnsOut" class="scroll-panel section-scroll"></div>
+    <div class="connections-layout">
+      <div class="activity-toolbar">
+        <label class="inline-check"><input id="activityRecord" type="checkbox" onchange="toggleActivityRecord(this.checked)"> Record <span id="activityRecordCountdown" class="record-countdown"></span></label>
       </div>
-      <div class="activity-card">
-        <h3 class="card-title">Recent Connections</h3>
-        <div id="connOut" class="scroll-panel section-scroll"></div>
+      <div class="activity-grid">
+        <div class="activity-card">
+          <h3 class="card-title">Recent DNS</h3>
+          <div id="dnsOut" class="scroll-panel section-scroll"></div>
+        </div>
+        <div class="activity-card">
+          <h3 class="card-title">Recent Connections</h3>
+          <div id="connOut" class="scroll-panel section-scroll"></div>
+        </div>
+      </div>
+      <div class="dns-layout connections-dns">
+        <div class="panel dns-panel">
+          <h3 class="card-title">Cache Management</h3>
+          <label>Domain<input id="dnsQueryDomain" placeholder="example.com"></label>
+          <label>Record Type<select id="dnsQueryType"><option>A</option><option>AAAA</option></select></label>
+          <button onclick="queryDnsCache()">Query Cache</button>
+          <button onclick="clearDnsDomain()">Clear Domain Dns Cache</button>
+          <button onclick="clearDnsAll()">Clear All Dns Cache</button>
+          <label>IP<input id="dnsQueryIp" placeholder="142.251.151.119"></label>
+          <button onclick="queryDnsCacheIp()">Query Domain By IP</button>
+          <p class="hint" id="dnsCacheMessage"></p>
+        </div>
+        <div class="dns-panel">
+          <h3 class="card-title">Cached Results</h3>
+          <div id="dnsCacheOut" class="scroll-panel section-scroll"></div>
+        </div>
       </div>
     </div>
   </section>
@@ -1657,6 +1662,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function downloadRules(){await startRuleJob('/api/rules/download','starting download')}
     async function generateRules(){await startRuleJob('/api/rules/update','starting generation')}
     function table(rows,cols,cls=''){return `<table class="${cls}"><thead><tr>`+cols.map(c=>'<th>'+c[0]+'</th>').join('')+'</tr></thead><tbody>'+(rows.length?rows.map(r=>'<tr>'+cols.map(c=>'<td>'+String(c[1](r)??'')+'</td>').join('')+'</tr>').join(''):`<tr><td colspan="${cols.length}" class="hint">No data</td></tr>` )+'</tbody></table>'}
+    async function copyText(text){if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(text);return}let ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.left='-9999px';document.body.appendChild(ta);ta.focus();ta.select();document.execCommand('copy');ta.remove()}
+    document.addEventListener('click',async e=>{let td=e.target.closest('table.copyable-table td');if(!td||td.classList.contains('hint'))return;let text=td.innerText.trim();if(!text)return;try{await copyText(text);td.classList.add('copied');setTimeout(()=>td.classList.remove('copied'),450)}catch(err){console.warn(err)}})
     function fmtTime(ts){return ts?new Date(ts*1000).toLocaleString():''}
     function ms(v){let n=Number(v);return Number.isFinite(n)?(n*1000).toFixed(1):'-'}
     function err(v){return v||'OK'}
@@ -1672,22 +1679,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
       let cols=[['Value',r=>r.value],['Regions',r=>(r.regions||[]).join(', ')],['Sources',r=>(r.sources||[]).join(', ')]];
       document.getElementById(id).innerHTML=table(rows,cols,'conflict-table')
     }
-    async function syncActivityRecordStatus(){let s=await api('/api/activity/record/status');activityRecord.checked=!!s.recording;if(!s.recording){dnsOut.innerHTML='';connOut.innerHTML=''}return s}
+    function fmtCountdown(seconds){let s=Math.max(0,Number(seconds)||0),m=Math.floor(s/60),r=s%60;return m+':'+String(r).padStart(2,'0')}
+    async function syncActivityRecordStatus(){let s=await api('/api/activity/record/status');activityRecord.checked=!!s.recording;activityRecordCountdown.textContent=s.recording?fmtCountdown(s.remaining_seconds):'';if(!s.recording){dnsOut.innerHTML='';connOut.innerHTML=''}return s}
     async function toggleActivityRecord(checked){await api(checked?'/api/activity/record/start':'/api/activity/record/stop',{method:'POST'});let s=await syncActivityRecordStatus();if(s.recording)refresh('connections')}
-    async function renderConnections(){let rows=await api('/api/activity/connections');connOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Source',r=>r.source_ip+':'+r.source_port],['Destination',r=>(r.destination_ip||r.destination_domain)+':'+r.destination_port],['Domain',r=>r.domain||'-'],['Protocol',r=>r.protocol],['Decision',r=>r.decision]])}
-    async function renderDns(){let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>r.error?('Error: '+r.error):(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']])}
+    async function renderConnections(){let rows=await api('/api/activity/connections');connOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Source',r=>r.source_ip+':'+r.source_port],['Destination',r=>(r.destination_ip||r.destination_domain)+':'+r.destination_port],['Domain',r=>r.domain||'-'],['Protocol',r=>r.protocol],['Decision',r=>r.decision]],'copyable-table')}
+    async function renderDns(){let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>r.error?('Error: '+r.error):(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']],'copyable-table')}
     async function renderRouteConflicts(){await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip')}
     async function renderSys(){let s=await api('/api/sys/status');let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p><p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body+`<h3 class="card-title">direct_ip.txt / proxy_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / proxy_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
     async function debugUrlCheck(mode){let [input,out]=debugEls(mode);let url=input.value.trim();if(!url){out.innerHTML='<p class="hint">Enter a URL first</p>';return}out.innerHTML='<p class="hint">Running debug, timeout 6s...</p>';let r=await api('/api/sys/debug-url',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url,mode})});out.innerHTML=debugCommand(r)+table([r],debugUrlColumns(mode))}
     async function debugIpCheck(){let query=debugIp.value.trim();if(!query){debugIpOut.innerHTML='<p class="hint">Enter an IP or CIDR first</p>';return}let r=await api('/api/sys/debug-ip',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query})});debugIpOut.innerHTML=table([r],[['Query',x=>x.query],['Valid',x=>x.valid?'yes':'no'],['proxy_ip.txt',x=>x.proxy_file?'yes':'no'],['proxy Matches',x=>(x.proxy_file_matches||[]).join('<br>')||'-'],['NFT Checked',x=>x.nft_checked?'yes':'no'],['NFT proxy',x=>x.nft_proxy?'yes':'no'],['NFT Matches',x=>(x.nft_matches||[]).join('<br>')||'-'],['Error',x=>err(x.error||x.nft_error)]])}
-    function syncDnsRefreshToBasic(){dnsCacheRefreshEnabled.checked=dnsCacheRefreshEnabledDns.checked;dnsCacheRefreshBatch.value=dnsCacheRefreshBatchDns.value;updateClientJson()}
-    async function saveDnsCacheSettings(){syncDnsRefreshToBasic();await saveClientConfig();dnsCacheMessage.textContent='Refresh settings saved, restarting service...'}
-    async function renderDnsCacheStats(){let s=await api('/api/dns/cache/stats');dnsCacheSize.textContent=s.size;dnsCacheCapacityOut.textContent=s.capacity;dnsCacheTtlOut.textContent=s.ttl_seconds;dnsCacheRefreshEnabledDns.checked=s.refresh_enabled!==false;dnsCacheRefreshBatchDns.value=s.refresh_batch_size||500}
-    async function queryDnsCache(){await renderDnsCacheStats();let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheOut.innerHTML='<p class="hint">Enter a domain</p>';return}let rows=await api('/api/dns/cache/query?domain='+encodeURIComponent(domain));let type=dnsQueryType.value;rows=rows.filter(r=>!type||r.query_type===type);dnsCacheOut.innerHTML=table(rows,[['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Results',r=>(r.results||[]).join('<br>')],['Expires',r=>fmtTime(r.expires_at)]])}
-    async function queryDnsCacheIp(){await renderDnsCacheStats();let ip=dnsQueryIp.value.trim();if(!ip){dnsCacheOut.innerHTML='<p class="hint">Enter an IP</p>';return}let rows=await api('/api/dns/cache/query-ip?ip='+encodeURIComponent(ip));dnsCacheOut.innerHTML=table(rows,[['IP',r=>r.ip],['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Expires',r=>fmtTime(r.expires_at)]])}
+    async function queryDnsCache(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheOut.innerHTML='<p class="hint">Enter a domain</p>';return}let rows=await api('/api/dns/cache/query?domain='+encodeURIComponent(domain));let type=dnsQueryType.value;rows=rows.filter(r=>!type||r.query_type===type);dnsCacheOut.innerHTML=table(rows,[['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Results',r=>(r.results||[]).join('<br>')],['Expires',r=>fmtTime(r.expires_at)]])}
+    async function queryDnsCacheIp(){let ip=dnsQueryIp.value.trim();if(!ip){dnsCacheOut.innerHTML='<p class="hint">Enter an IP</p>';return}let rows=await api('/api/dns/cache/query-ip?ip='+encodeURIComponent(ip));dnsCacheOut.innerHTML=table(rows,[['IP',r=>r.ip],['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Expires',r=>fmtTime(r.expires_at)]])}
     async function clearDnsDomain(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheMessage.textContent='Enter a domain first';return}let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({domain})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';await queryDnsCache()}
-    async function clearDnsAll(){let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';dnsCacheOut.innerHTML='';await renderDnsCacheStats()}
-    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='dns')await renderDnsCacheStats();if(id==='routeConfig')await reloadRouteTab();if(id==='sys')await renderSys();if(id==='connections'){let s=await syncActivityRecordStatus();if(s.recording){await renderDns();await renderConnections()}}}catch(e){alert(e.message)}}
+    async function clearDnsAll(){let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';dnsCacheOut.innerHTML=''}
+    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='routeConfig')await reloadRouteTab();if(id==='sys')await renderSys();if(id==='connections'){let s=await syncActivityRecordStatus();if(s.recording){await renderDns();await renderConnections()}}}catch(e){alert(e.message)}}
     document.querySelector("nav button[data-tab=\"basic\"]").classList.add('active');
     window.addEventListener('resize',updateNavIndicator);
     requestAnimationFrame(updateNavIndicator);

@@ -568,7 +568,7 @@ fn spawn_record_worker(
                             event
                                 .destination_ip
                                 .as_ref()
-                                .and_then(|ip| inner.reverse_domains.get(ip).cloned())
+                                .and_then(|ip| connection_domain_for_ip(&inner, ip))
                         });
                         if let (Some(dst_ip), Some(proto)) = (
                             event.destination_ip,
@@ -1784,6 +1784,11 @@ impl RoutingState {
         let key = dns_cache_key(domain, query_type, resolver);
         let now = now();
         let ttl = inner.sources.dns_cache_ttl_seconds.max(1);
+        if !key.domain.is_empty() {
+            for ip in &results {
+                inner.reverse_domains.insert(*ip, key.domain.clone());
+            }
+        }
         inner.dns_cache.insert(
             key.clone(),
             DnsCacheEntry {
@@ -1945,6 +1950,7 @@ impl RoutingState {
             inner.dns_cache.clear();
             inner.dns_cache_order.clear();
         }
+        rebuild_reverse_domains_from_dns_cache(&mut inner);
         before.saturating_sub(inner.dns_cache.len())
     }
 
@@ -1975,7 +1981,7 @@ impl RoutingState {
             return Vec::new();
         }
         let inner = self.inner.read().await;
-        let reverse_domains = inner.reverse_domains.clone();
+        let reverse_domains = build_reverse_domain_map(&inner);
         let flow_decisions = inner.flow_decisions.clone();
         let mut rows = inner
             .connections
@@ -1983,6 +1989,10 @@ impl RoutingState {
             .rev()
             .filter(|event| !is_excluded_remote(event, excluded_remotes))
             .cloned()
+            .map(|mut event| {
+                fill_connection_domain(&mut event, &reverse_domains);
+                event
+            })
             .collect::<Vec<_>>();
         drop(inner);
         let mut dedupped_recent_connections = rows.iter().map(connection_key).collect::<HashSet<_>>();
@@ -2652,6 +2662,72 @@ fn connection_record_key(row: &ConnectionEvent) -> String {
         row.protocol,
         row.decision
     )
+}
+
+fn build_reverse_domain_map(inner: &RoutingInner) -> HashMap<IpAddr, String> {
+    let mut domains = inner.reverse_domains.clone();
+    for (ip, domain) in latest_dns_cache_domain_map(inner) {
+        domains.entry(ip).or_insert(domain);
+    }
+    domains
+}
+
+fn rebuild_reverse_domains_from_dns_cache(inner: &mut RoutingInner) {
+    inner.reverse_domains = latest_dns_cache_domain_map(inner);
+}
+
+fn latest_dns_cache_domain_map(inner: &RoutingInner) -> HashMap<IpAddr, String> {
+    let mut cache_domains = HashMap::<IpAddr, (u64, String)>::new();
+    let now = now();
+    for (key, entry) in &inner.dns_cache {
+        if key.domain.is_empty() || entry.expires_at <= now {
+            continue;
+        }
+        let freshness = entry.refreshed_at.max(entry.inserted_at);
+        for ip in &entry.results {
+            cache_domains
+                .entry(*ip)
+                .and_modify(|(current, domain)| {
+                    if freshness > *current {
+                        *current = freshness;
+                        *domain = key.domain.clone();
+                    }
+                })
+                .or_insert_with(|| (freshness, key.domain.clone()));
+        }
+    }
+    cache_domains
+        .into_iter()
+        .map(|(ip, (_, domain))| (ip, domain))
+        .collect()
+}
+
+fn connection_domain_for_ip(inner: &RoutingInner, ip: &IpAddr) -> Option<String> {
+    inner.reverse_domains.get(ip).cloned().or_else(|| {
+        let now = now();
+        inner
+            .dns_cache
+            .iter()
+            .filter(|(key, entry)| {
+                !key.domain.is_empty()
+                    && entry.expires_at > now
+                    && entry.results.iter().any(|result| result == ip)
+            })
+            .max_by_key(|(_, entry)| entry.refreshed_at.max(entry.inserted_at))
+            .map(|(key, _)| key.domain.clone())
+    })
+}
+
+fn fill_connection_domain(event: &mut ConnectionEvent, reverse_domains: &HashMap<IpAddr, String>) {
+    if event.domain.is_some() {
+        return;
+    }
+    event.domain = event.destination_domain.clone().or_else(|| {
+        event
+            .destination_ip
+            .as_ref()
+            .and_then(|ip| reverse_domains.get(ip).cloned())
+    });
 }
 
 fn is_excluded_remote(event: &ConnectionEvent, excluded_remotes: &HashSet<IpAddr>) -> bool {
@@ -3515,6 +3591,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recent_connections_backfills_domain_from_dns_cache() {
+        let dir = temp_rules_dir("record-domain-backfill");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        config.dns_cache_ttl_seconds = 60;
+        let state = RoutingState::load(config).await.unwrap();
+        state.start_activity_recording().await.unwrap();
+
+        let source = "127.0.0.1:40002".parse::<SocketAddr>().unwrap();
+        let destination = "203.0.113.20".parse::<IpAddr>().unwrap();
+        let target = Address::SocketAddress(SocketAddr::new(destination, 443));
+        state
+            .record_connection(source, &target, "tcp", ConnectionDecision::Direct)
+            .await;
+
+        let row = wait_for_recorded_connection(&state, source, destination, 443).await;
+        assert_eq!(row.domain, None);
+
+        state
+            .dns_cache_insert(
+                "api.example.",
+                "A",
+                RouteDecision::Direct,
+                Message::query(),
+                vec![destination],
+            )
+            .await;
+
+        let row = wait_for_recorded_connection(&state, source, destination, 443).await;
+        assert_eq!(row.domain.as_deref(), Some("api.example"));
+    }
+
+    #[tokio::test]
     async fn temporary_rules_override_persistent_rules() {
         let dir = temp_rules_dir("override");
         write_lines_atomic(dir.join(DIRECT_IP_FILE), &["1.1.1.1".to_owned()]).unwrap();
@@ -4102,7 +4213,12 @@ mod tests {
             )
             .await;
 
+        let ip = "1.2.3.4".parse().unwrap();
         assert_eq!(state.dns_cache_stats().await.size, 1);
+        assert_eq!(
+            state.inner.read().await.reverse_domains.get(&ip).map(String::as_str),
+            Some("example.com")
+        );
         assert!(
             state
                 .dns_cache_lookup("example.com", "a", RouteDecision::Direct)
@@ -4117,6 +4233,7 @@ mod tests {
         let cleared = state.dns_cache_clear(Some("example.com")).await;
         assert_eq!(cleared, 1);
         assert_eq!(state.dns_cache_stats().await.size, 0);
+        assert!(!state.inner.read().await.reverse_domains.contains_key(&ip));
     }
 
     #[tokio::test]
