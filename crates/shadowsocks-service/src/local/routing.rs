@@ -77,7 +77,7 @@ const SOURCE_DIR: &str = "source";
 const SOURCE_TEMP_DIR: &str = "temp";
 const GENERATED_RULE_FILES: [&str; 4] = [DIRECT_IP_FILE, DIRECT_DOMAIN_FILE, PROXY_IP_FILE, PROXY_DOMAIN_FILE];
 const MAX_EVENTS: usize = 4096;
-const RECORD_MAX_DURATION: Duration = Duration::from_secs(300);
+const RECORD_MAX_DURATION: Duration = Duration::from_secs(120);
 const RECORD_QUEUE_CAPACITY: usize = 8192;
 const PROXY_IP_PERSIST_DELAY: Duration = Duration::from_secs(30);
 const DNS_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -267,6 +267,9 @@ enum RecordCommand {
     },
     Stop {
         session_id: u64,
+        ack: oneshot::Sender<io::Result<()>>,
+    },
+    Flush {
         ack: oneshot::Sender<io::Result<()>>,
     },
     Connection(RecordConnectionEvent),
@@ -547,6 +550,9 @@ fn spawn_record_worker(
                     }
                     let _ = ack.send(Ok(()));
                 }
+                RecordCommand::Flush { ack } => {
+                    let _ = ack.send(Ok(()));
+                }
                 RecordCommand::Connection(event) => {
                     if !is_record_session_active(&control, event.session_id) {
                         continue;
@@ -766,6 +772,21 @@ impl RoutingState {
     pub async fn stop_activity_recording(&self) -> io::Result<ActivityRecordStatus> {
         self.stop_activity_recording_inner().await?;
         Ok(self.activity_record_status_no_expire())
+    }
+
+    pub async fn flush_activity_recording(&self) -> io::Result<()> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self
+            .record_tx
+            .send(RecordCommand::Flush { ack: ack_tx })
+            .await
+            .is_err()
+        {
+            return Err(io::Error::other("record worker is not running"));
+        }
+        ack_rx
+            .await
+            .map_err(|err| io::Error::other(format!("record worker dropped flush ack: {err}")))?
     }
 
     pub async fn activity_record_status(&self) -> ActivityRecordStatus {

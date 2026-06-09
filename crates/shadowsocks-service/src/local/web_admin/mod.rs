@@ -4,11 +4,14 @@ use std::{
     collections::HashSet,
     convert::Infallible,
     fs, io,
-    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
     path::PathBuf,
     pin::Pin,
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -19,14 +22,16 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, Response, StatusCode, body::Incoming, server::conn::http1, service::service_fn};
 use log::{error, info, trace};
 use pin_project::pin_project;
-use tokio::{net::TcpListener, time};
+use tokio::{net::TcpListener, sync::Mutex, time};
 
 use crate::{
     config::{DEFAULT_DEPLOY_DIR, WebAdminConfig},
-    local::routing::{RoutingState, RuleLists},
+    local::routing::{ConnectionDecision, ConnectionEvent, RouteDecision, RoutingState, RuleLists},
 };
 
 type ResponseBody = Full<Bytes>;
+const DEBUG_RANDOM_PARAM: &str = "deubg_random";
+static DEBUG_RANDOM_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub struct WebAdminBuilder {
     config: WebAdminConfig,
@@ -65,6 +70,7 @@ impl WebAdmin {
             config_path: self.config_path,
             routing_state: self.routing_state,
             server_filters,
+            debug_lock: Mutex::new(()),
         });
 
         loop {
@@ -97,6 +103,7 @@ struct WebAdminHandler {
     config_path: PathBuf,
     routing_state: RoutingState,
     server_filters: Arc<HashSet<IpAddr>>,
+    debug_lock: Mutex<()>,
 }
 
 impl WebAdminHandler {
@@ -313,7 +320,10 @@ impl WebAdminHandler {
             (Method::GET, "/api/sys/platform") => Ok(json_response(StatusCode::OK, &platform_info())),
             (Method::POST, "/api/sys/debug-url") => {
                 let payload: DebugUrlPayload = read_json(req).await?;
-                Ok(json_response(StatusCode::OK, &self.debug_url(payload.url).await?))
+                Ok(json_response(
+                    StatusCode::OK,
+                    &self.debug_url(payload.url, payload.mode.as_deref()).await?,
+                ))
             }
             (Method::POST, "/api/sys/debug-ip") => {
                 let payload: DebugIpPayload = read_json(req).await?;
@@ -359,26 +369,63 @@ impl WebAdminHandler {
         status
     }
 
-    async fn debug_url(&self, url: String) -> io::Result<serde_json::Value> {
+    async fn debug_url(&self, url: String, mode: Option<&str>) -> io::Result<serde_json::Value> {
         let url = normalize_debug_url(&url)?;
         let host = debug_url_host(&url)?;
+        let mode = DebugUrlMode::parse(mode)?;
+        let _debug_guard = self.debug_lock.lock().await;
+        let debug_random = debug_random_string();
+        let debug_url = append_debug_random_param(&url, &debug_random);
+        let redir_port = local_port_from_config_path(&self.config_path, DebugUrlMode::Redir.protocol());
+        let http_port = local_port_from_config_path(&self.config_path, DebugUrlMode::Http.protocol());
+        let socks_port = local_port_from_config_path(&self.config_path, DebugUrlMode::Socks.protocol());
+        let redir_port_running = redir_port.is_some_and(local_port_running);
+        let http_port_running = http_port.is_some_and(local_port_running);
+        let socks_port_running = socks_port.is_some_and(local_port_running);
+        let (local_port, port_running) = match mode {
+            DebugUrlMode::Redir => (redir_port, redir_port_running),
+            DebugUrlMode::Http => (http_port, http_port_running),
+            DebugUrlMode::Socks => (socks_port, socks_port_running),
+        };
+        let dns_relevant = mode == DebugUrlMode::Redir;
+        let record_started_by_debug = {
+            let status = self.routing_state.activity_record_status().await;
+            if status.recording {
+                false
+            } else {
+                self.routing_state.start_activity_recording().await?;
+                true
+            }
+        };
         let started_at = unix_now();
         let decision = self.routing_state.route_domain(&host).await;
-        let cached_before = self
-            .routing_state
-            .dns_cache_query(&host)
+        let cached_before_entries = if dns_relevant {
+            self.routing_state.dns_cache_query(&host).await
+        } else {
+            Vec::new()
+        };
+        let cached_before = cached_before_entries
+            .iter()
+            .any(|entry| entry.query_type.eq_ignore_ascii_case("A") && decision.map_or(true, |d| entry.resolver == d));
+        let curl_command = intended_debug_curl_command(&debug_url, mode, local_port);
+
+        let curl_result = if port_running {
+            tokio::task::spawn_blocking({
+                let debug_url = debug_url.clone();
+                move || run_debug_curl(&debug_url, mode, local_port)
+            })
             .await
-            .into_iter()
-            .any(|entry| entry.query_type.eq_ignore_ascii_case("A") && Some(entry.resolver) == decision);
+            .map_err(io::Error::other)??
+        } else {
+            DebugCurlResult::not_running(curl_command, format!("{} port not running", mode.as_str()))
+        };
+        self.routing_state.flush_activity_recording().await?;
 
-        let curl_result = tokio::task::spawn_blocking({
-            let url = url.clone();
-            move || run_debug_curl(&url)
-        })
-        .await
-        .map_err(io::Error::other)??;
-
-        let dns_events = self.routing_state.recent_dns().await;
+        let dns_events = if dns_relevant {
+            self.routing_state.recent_dns().await
+        } else {
+            Vec::new()
+        };
         let matching_dns = dns_events
             .iter()
             .filter(|event| event.timestamp >= started_at && domain_matches_debug_host(&event.domain, &host))
@@ -388,34 +435,113 @@ impl WebAdminHandler {
             .iter()
             .flat_map(|event| event.results.iter().copied())
             .collect::<Vec<_>>();
-        let connections = self.routing_state.recent_connections(&self.server_filters).await;
-        let transparent_connection = connections.iter().find(|event| {
-            event.timestamp >= started_at
-                && matches!(
-                    event.decision,
-                    crate::local::routing::ConnectionDecision::Redir | crate::local::routing::ConnectionDecision::Tun
-                )
-                && event
-                    .destination_ip
-                    .is_some_and(|ip| resolved_ips.iter().any(|resolved| *resolved == ip))
-        });
+        let cache_entries = if dns_relevant {
+            self.routing_state.dns_cache_query(&host).await
+        } else {
+            Vec::new()
+        };
+        let mut resolved_ips = resolved_ips;
+        resolved_ips.extend(
+            cache_entries
+                .iter()
+                .filter(|entry| entry.query_type.eq_ignore_ascii_case("A"))
+                .filter(|entry| decision.map_or(true, |d| entry.resolver == d))
+                .flat_map(|entry| entry.results.iter().copied()),
+        );
+        let mut seen_ips = HashSet::new();
+        resolved_ips.retain(|ip| seen_ips.insert(*ip));
+
+        let mut nft_proxy = false;
+        let mut nft_matches: Vec<String> = Vec::new();
+        let mut nft_error: Option<String> = None;
+        let nft_checked = cfg!(all(target_os = "linux", feature = "local-dns")) && dns_relevant;
+        #[cfg(all(target_os = "linux", feature = "local-dns"))]
+        {
+            if nft_checked {
+                for ip in &resolved_ips {
+                    match crate::local::dns::intercept_linux::proxy_set_matches(&ip.to_string()) {
+                        Ok(matches) => {
+                            nft_proxy |= !matches.is_empty();
+                            nft_matches.extend(matches);
+                        }
+                        Err(err) => nft_error = Some(err.to_string()),
+                    }
+                }
+                nft_matches.sort();
+                nft_matches.dedup();
+            }
+        }
+
+        let debug_connection = self.wait_debug_connection(mode, &host, &resolved_ips, started_at).await;
+        let port_received = debug_connection.is_some();
+        let route_decision = debug_route_decision(mode, decision, debug_connection.as_ref());
+        if record_started_by_debug {
+            let _ = self.routing_state.stop_activity_recording().await;
+        }
 
         Ok(serde_json::json!({
             "url": url,
+            "debug_url": debug_url,
+            "debug_random_param": DEBUG_RANDOM_PARAM,
+            "debug_random": debug_random,
+            "debug_mode": mode.as_str(),
             "host": host,
-            "proxy_domain": matches!(decision, Some(crate::local::routing::RouteDecision::Proxy)),
-            "route_decision": decision,
-            "dns_intercepted": !matching_dns.is_empty(),
-            "dns_cache_hit": cached_before,
+            "proxy_domain": matches!(decision, Some(RouteDecision::Proxy)),
+            "rule_route_decision": decision,
+            "route_decision": route_decision,
+            "dns_intercepted": dns_relevant.then_some(!matching_dns.is_empty()),
+            "dns_cache_hit": dns_relevant.then_some(cached_before),
             "resolved_ips": resolved_ips,
-            "transparent_port_received": transparent_connection.is_some(),
+            "nft_checked": nft_checked,
+            "nft_proxy": nft_checked.then_some(nft_proxy),
+            "nft_matches": nft_matches,
+            "nft_error": nft_error,
+            "connection_recorded": port_received,
+            "transparent_connection_recorded": mode == DebugUrlMode::Redir && port_received,
+            "local_port": local_port,
+            "port_running": port_running,
+            "port_received": port_received,
+            "port_status": debug_port_status(port_running, port_received),
+            "transparent_port_running": redir_port_running,
+            "transparent_port_received": mode == DebugUrlMode::Redir && port_received,
+            "http_port_running": http_port_running,
+            "http_port_received": mode == DebugUrlMode::Http && port_received,
+            "socks_port_running": socks_port_running,
+            "socks_port_received": mode == DebugUrlMode::Socks && port_received,
             "response_received": curl_result.response_received,
             "http_code": curl_result.http_code,
+            "time_namelookup": curl_result.time_namelookup,
+            "time_connect": curl_result.time_connect,
+            "time_appconnect": curl_result.time_appconnect,
+            "time_starttransfer": curl_result.time_starttransfer,
+            "time_total": curl_result.time_total,
+            "curl_command": curl_result.command,
             "curl_exit_code": curl_result.exit_code,
             "curl_error": curl_result.error,
         }))
     }
 
+    async fn wait_debug_connection(
+        &self,
+        mode: DebugUrlMode,
+        host: &str,
+        resolved_ips: &[IpAddr],
+        started_at: u64,
+    ) -> Option<ConnectionEvent> {
+        for attempt in 0..10 {
+            let connections = self.routing_state.recent_connections(&self.server_filters).await;
+            if let Some(event) = connections
+                .into_iter()
+                .find(|event| debug_connection_matches(event, mode, host, resolved_ips, started_at))
+            {
+                return Some(event);
+            }
+            if attempt < 9 {
+                time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        None
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -432,6 +558,44 @@ struct DnsCacheClearPayload {
 #[derive(serde::Deserialize)]
 struct DebugUrlPayload {
     url: String,
+    mode: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DebugUrlMode {
+    Redir,
+    Http,
+    Socks,
+}
+
+impl DebugUrlMode {
+    fn parse(mode: Option<&str>) -> io::Result<Self> {
+        match mode.unwrap_or("redir").trim().to_ascii_lowercase().as_str() {
+            "" | "redir" | "transparent" => Ok(Self::Redir),
+            "http" => Ok(Self::Http),
+            "socks" | "socks5" => Ok(Self::Socks),
+            mode => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported debug mode: {mode}"),
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Redir => "redir",
+            Self::Http => "http",
+            Self::Socks => "socks",
+        }
+    }
+
+    fn protocol(self) -> &'static str {
+        match self {
+            Self::Redir => "redir",
+            Self::Http => "http",
+            Self::Socks => "socks",
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -445,10 +609,33 @@ struct ClientConfigPayload {
 }
 
 struct DebugCurlResult {
+    command: String,
     response_received: bool,
     http_code: String,
+    time_namelookup: String,
+    time_connect: String,
+    time_appconnect: String,
+    time_starttransfer: String,
+    time_total: String,
     exit_code: Option<i32>,
     error: Option<String>,
+}
+
+impl DebugCurlResult {
+    fn not_running(command: String, error: String) -> Self {
+        Self {
+            command,
+            response_received: false,
+            http_code: "000".to_owned(),
+            time_namelookup: String::new(),
+            time_connect: String::new(),
+            time_appconnect: String::new(),
+            time_starttransfer: String::new(),
+            time_total: String::new(),
+            exit_code: None,
+            error: Some(error),
+        }
+    }
 }
 
 fn restart_service_after_response() {
@@ -607,6 +794,30 @@ fn normalize_debug_url(url: &str) -> io::Result<String> {
     }
 }
 
+fn debug_random_string() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let counter = DEBUG_RANDOM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}{:x}{:x}", nanos, std::process::id(), counter)
+}
+
+fn append_debug_random_param(url: &str, value: &str) -> String {
+    let (base, fragment) = url.split_once('#').map_or((url, None), |(base, fragment)| (base, Some(fragment)));
+    let separator = if base.contains('?') {
+        if base.ends_with('?') || base.ends_with('&') { "" } else { "&" }
+    } else {
+        "?"
+    };
+    let mut out = format!("{base}{separator}{DEBUG_RANDOM_PARAM}={value}");
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    out
+}
+
 fn debug_url_host(url: &str) -> io::Result<String> {
     let uri = url
         .parse::<hyper::Uri>()
@@ -649,6 +860,133 @@ fn server_filters_from_config_path(config_path: &PathBuf) -> HashSet<IpAddr> {
         .collect()
 }
 
+fn local_port_from_config_path(config_path: &PathBuf, protocol: &str) -> Option<u16> {
+    let content = fs::read_to_string(config_path).ok()?;
+    let config = json5::from_str::<serde_json::Value>(&content).ok()?;
+    config
+        .get("locals")
+        .and_then(|locals| locals.as_array())
+        .into_iter()
+        .flatten()
+        .find(|local| local.get("protocol").and_then(|value| value.as_str()) == Some(protocol))
+        .and_then(|local| local.get("local_port"))
+        .and_then(|value| value.as_u64())
+        .and_then(|port| u16::try_from(port).ok())
+}
+
+fn local_port_running(port: u16) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(listening) = tcp_port_listening(port) {
+        return listening;
+    }
+    local_port_accepts_connection(port)
+}
+
+fn local_port_accepts_connection(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn tcp_port_listening(port: u16) -> Option<bool> {
+    let tcp4 = fs::read_to_string("/proc/net/tcp").ok()?;
+    let tcp6 = fs::read_to_string("/proc/net/tcp6").ok()?;
+    Some(proc_net_tcp_has_listener(&tcp4, port) || proc_net_tcp_has_listener(&tcp6, port))
+}
+
+#[cfg(target_os = "linux")]
+fn proc_net_tcp_has_listener(content: &str, port: u16) -> bool {
+    let port_hex = format!("{port:04X}");
+    content.lines().skip(1).any(|line| {
+        let mut fields = line.split_whitespace();
+        let _slot = fields.next();
+        let Some(local_address) = fields.next() else {
+            return false;
+        };
+        let _remote_address = fields.next();
+        let Some(state) = fields.next() else {
+            return false;
+        };
+        state == "0A"
+            && local_address
+                .rsplit_once(':')
+                .is_some_and(|(_, local_port)| local_port.eq_ignore_ascii_case(&port_hex))
+    })
+}
+
+fn debug_port_status(port_running: bool, port_received: bool) -> &'static str {
+    if !port_running {
+        return "not running";
+    }
+    if port_received {
+        "received"
+    } else {
+        "not received"
+    }
+}
+
+fn debug_route_decision(
+    mode: DebugUrlMode,
+    rule_decision: Option<RouteDecision>,
+    connection: Option<&ConnectionEvent>,
+) -> &'static str {
+    if let Some(connection) = connection {
+        return connection_decision_label(connection.decision);
+    }
+    match (mode, rule_decision) {
+        (DebugUrlMode::Redir, Some(RouteDecision::Proxy)) => "proxy",
+        (DebugUrlMode::Redir, Some(RouteDecision::Direct) | None) => "direct",
+        (DebugUrlMode::Http, Some(RouteDecision::Direct)) => "direct",
+        (DebugUrlMode::Socks, Some(RouteDecision::Direct)) => "direct",
+        (DebugUrlMode::Http | DebugUrlMode::Socks, Some(RouteDecision::Proxy) | None) => "proxy",
+    }
+}
+
+fn connection_decision_label(decision: ConnectionDecision) -> &'static str {
+    match decision {
+        ConnectionDecision::Direct => "direct",
+        ConnectionDecision::HttpProxy => "http_proxy",
+        ConnectionDecision::Socks5Proxy => "socks5_proxy",
+        ConnectionDecision::Redir => "redir",
+        ConnectionDecision::Tun => "tun",
+    }
+}
+
+fn debug_connection_matches(
+    event: &ConnectionEvent,
+    mode: DebugUrlMode,
+    host: &str,
+    resolved_ips: &[IpAddr],
+    started_at: u64,
+) -> bool {
+    if event.timestamp < started_at || event.protocol != "tcp" {
+        return false;
+    }
+    let decision_matches = match mode {
+        DebugUrlMode::Redir => matches!(event.decision, ConnectionDecision::Redir | ConnectionDecision::Tun),
+        DebugUrlMode::Http => event.decision == ConnectionDecision::HttpProxy,
+        DebugUrlMode::Socks => event.decision == ConnectionDecision::Socks5Proxy,
+    };
+    if !decision_matches {
+        return false;
+    }
+    debug_connection_target_matches(event, host, resolved_ips)
+}
+
+fn debug_connection_target_matches(event: &ConnectionEvent, host: &str, resolved_ips: &[IpAddr]) -> bool {
+    event
+        .destination_domain
+        .as_deref()
+        .is_some_and(|domain| domain_matches_debug_host(domain, host))
+        || event
+            .domain
+            .as_deref()
+            .is_some_and(|domain| domain_matches_debug_host(domain, host))
+        || event
+            .destination_ip
+            .is_some_and(|ip| resolved_ips.iter().any(|resolved| *resolved == ip))
+}
+
 fn server_filter_ips(host: &str, port: u16) -> Vec<IpAddr> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return vec![ip];
@@ -659,19 +997,103 @@ fn server_filter_ips(host: &str, port: u16) -> Vec<IpAddr> {
         .unwrap_or_default()
 }
 
-fn run_debug_curl(url: &str) -> io::Result<DebugCurlResult> {
+fn debug_curl_args(url: &str, mode: DebugUrlMode, port: Option<u16>) -> io::Result<Vec<String>> {
+    let mut args = vec![
+        "-4".to_owned(),
+        "-sS".to_owned(),
+        "--max-time".to_owned(),
+        "6".to_owned(),
+        "-o".to_owned(),
+        null_device().to_owned(),
+        "-w".to_owned(),
+        "http_code=%{http_code}\n\
+time_namelookup=%{time_namelookup}\n\
+time_connect=%{time_connect}\n\
+time_appconnect=%{time_appconnect}\n\
+time_starttransfer=%{time_starttransfer}\n\
+time_total=%{time_total}\n"
+            .to_owned(),
+    ];
+    match (mode, port) {
+        (DebugUrlMode::Redir, _) => {
+            args.push("--noproxy".to_owned());
+            args.push("*".to_owned());
+        }
+        (DebugUrlMode::Http, Some(port)) => {
+            args.push("-x".to_owned());
+            args.push(format!("http://127.0.0.1:{port}"));
+        }
+        (DebugUrlMode::Socks, Some(port)) => {
+            args.push("-x".to_owned());
+            args.push(format!("socks5h://127.0.0.1:{port}"));
+        }
+        (mode, None) => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} port not running", mode.as_str()),
+            ));
+        }
+    }
+    args.push(url.to_owned());
+    Ok(args)
+}
+
+fn intended_debug_curl_command(url: &str, mode: DebugUrlMode, port: Option<u16>) -> String {
+    match debug_curl_args(url, mode, port) {
+        Ok(args) => format_curl_command(&args),
+        Err(err) => format!("not executed: {err}"),
+    }
+}
+
+fn format_curl_command(args: &[String]) -> String {
+    let mut parts = [
+        "env",
+        "-u",
+        "http_proxy",
+        "-u",
+        "https_proxy",
+        "-u",
+        "HTTP_PROXY",
+        "-u",
+        "HTTPS_PROXY",
+        "-u",
+        "all_proxy",
+        "-u",
+        "ALL_PROXY",
+        "-u",
+        "no_proxy",
+        "-u",
+        "NO_PROXY",
+        "curl",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    parts.extend(args.iter().cloned());
+    parts
+        .iter()
+        .map(|part| shell_quote_command_arg(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote_command_arg(arg: &str) -> String {
+    if arg
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '=' | '%' | '{' | '}'))
+    {
+        return arg.replace('\n', "\\n");
+    }
+    let escaped = arg.replace('\n', "\\n").replace('\'', "'\\''");
+    format!("'{escaped}'")
+}
+
+fn run_debug_curl(url: &str, mode: DebugUrlMode, port: Option<u16>) -> io::Result<DebugCurlResult> {
+    let args = debug_curl_args(url, mode, port)?;
+    let command = format_curl_command(&args);
+
     let output = Command::new("curl")
-        .args([
-            "-4",
-            "-sS",
-            "--max-time",
-            "6",
-            "-o",
-            null_device(),
-            "-w",
-            "%{http_code}",
-            url,
-        ])
+        .args(args)
         .env_remove("HTTP_PROXY")
         .env_remove("HTTPS_PROXY")
         .env_remove("http_proxy")
@@ -682,11 +1104,24 @@ fn run_debug_curl(url: &str) -> io::Result<DebugCurlResult> {
         .env_remove("no_proxy")
         .stdin(Stdio::null())
         .output()?;
-    let http_code = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value = |key: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(key).map(str::to_owned))
+            .unwrap_or_default()
+    };
+    let http_code = value("http_code=");
     let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     Ok(DebugCurlResult {
+        command,
         response_received: http_code != "000",
         http_code,
+        time_namelookup: value("time_namelookup="),
+        time_connect: value("time_connect="),
+        time_appconnect: value("time_appconnect="),
+        time_starttransfer: value("time_starttransfer="),
+        time_total: value("time_total="),
         exit_code: output.status.code(),
         error: (!error.is_empty()).then_some(error),
     })
@@ -1025,12 +1460,24 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <div class="panel sys-layout">
       <h3 class="card-title">System Checks</h3>
       <div id="sysStatusOut"></div>
-      <h3 class="card-title">Debug URL</h3>
+      <h3 class="card-title">Debug redir</h3>
       <div class="row">
-        <input id="debugUrl" value="http://www.google.com/generate_204">
-        <button onclick="debugUrlCheck()">Debug</button>
+        <input id="debugRedirUrl" value="https://www.google.com/generate_204">
+        <button onclick="debugUrlCheck('redir')">Debug redir</button>
       </div>
-      <div id="debugUrlOut" class="scroll-panel" style="padding:9px;margin-top:8px"></div>
+      <div id="debugRedirOut" class="scroll-panel" style="padding:9px;margin-top:8px"></div>
+      <h3 class="card-title">Debug http</h3>
+      <div class="row">
+        <input id="debugHttpUrl" value="https://www.google.com/generate_204">
+        <button onclick="debugUrlCheck('http')">Debug http</button>
+      </div>
+      <div id="debugHttpOut" class="scroll-panel" style="padding:9px;margin-top:8px"></div>
+      <h3 class="card-title">Debug socks</h3>
+      <div class="row">
+        <input id="debugSocksUrl" value="https://www.google.com/generate_204">
+        <button onclick="debugUrlCheck('socks')">Debug socks</button>
+      </div>
+      <div id="debugSocksOut" class="scroll-panel" style="padding:9px;margin-top:8px"></div>
       <h3 class="card-title">Debug IP / CIDR</h3>
       <div class="row">
         <input id="debugIp" placeholder="142.251.155.119 or 142.251.155.0/24">
@@ -1211,6 +1658,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function generateRules(){await startRuleJob('/api/rules/update','starting generation')}
     function table(rows,cols,cls=''){return `<table class="${cls}"><thead><tr>`+cols.map(c=>'<th>'+c[0]+'</th>').join('')+'</tr></thead><tbody>'+(rows.length?rows.map(r=>'<tr>'+cols.map(c=>'<td>'+String(c[1](r)??'')+'</td>').join('')+'</tr>').join(''):`<tr><td colspan="${cols.length}" class="hint">No data</td></tr>` )+'</tbody></table>'}
     function fmtTime(ts){return ts?new Date(ts*1000).toLocaleString():''}
+    function ms(v){let n=Number(v);return Number.isFinite(n)?(n*1000).toFixed(1):'-'}
+    function err(v){return v||'OK'}
+    function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+    function debugPortLabel(mode){return mode==='http'?'Http Port':(mode==='socks'?'Socks Port':'Transparent Port')}
+    function debugPortValue(mode,r){return r.port_status||(!r.port_running?'not running':(r.port_received?'received':'not received'))}
+    function debugEls(mode){return mode==='http'?[debugHttpUrl,debugHttpOut]:(mode==='socks'?[debugSocksUrl,debugSocksOut]:[debugRedirUrl,debugRedirOut])}
+    function debugCommand(r){return `<p class="hint">Command</p><pre>${esc(r.curl_command||'-')}</pre>`}
+    function debugUrlColumns(mode){let cols=[['Route Decision',x=>x.route_decision||'-'],['Proxy Domain',x=>x.proxy_domain?'yes':'no']];if(mode==='redir')cols.push(['DNS Intercepted',x=>x.dns_intercepted?'yes':'no'],['DNS Cache',x=>x.dns_cache_hit?'hit':'miss'],['Resolved IPs',x=>(x.resolved_ips||[]).join('<br>')||'-'],['NFT Proxy',x=>x.nft_proxy?'yes':'no'],['NFT Matches',x=>(x.nft_matches||[]).join('<br>')||'-']);cols.push([debugPortLabel(mode),x=>debugPortValue(mode,x)],['Response',x=>x.response_received?'received':'none'],['HTTP',x=>x.http_code||'-'],['DNS Resolve Time (ms)',x=>ms(x.time_namelookup)],['TCP Connect (ms)',x=>ms(x.time_connect)],['TLS Handshake (ms)',x=>ms(x.time_appconnect)],['First Byte (ms)',x=>ms(x.time_starttransfer)],['Error',x=>err(x.curl_error||(mode==='redir'?x.nft_error:null))]);return cols}
     function cleanDomain(v){return (v||'').replace(/\.$/,'')}
     async function renderConflicts(id,path){
       let rows=await api(path);
@@ -1223,8 +1678,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function renderDns(){let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>r.error?('Error: '+r.error):(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']])}
     async function renderRouteConflicts(){await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip')}
     async function renderSys(){let s=await api('/api/sys/status');let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p><p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body+`<h3 class="card-title">direct_ip.txt / proxy_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / proxy_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
-    async function debugUrlCheck(){let url=debugUrl.value.trim();if(!url){debugUrlOut.innerHTML='<p class="hint">Enter a URL first</p>';return}debugUrlOut.innerHTML='<p class="hint">Running debug, timeout 6s...</p>';let r=await api('/api/sys/debug-url',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url})});debugUrlOut.innerHTML=table([r],[['URL',x=>x.url],['Proxy Domain',x=>x.proxy_domain?'yes':'no'],['DNS Intercepted',x=>x.dns_intercepted?'yes':'no'],['DNS Cache',x=>x.dns_cache_hit?'hit':'miss'],['Resolved IPs',x=>(x.resolved_ips||[]).join('<br>')||'-'],['Transparent Port',x=>x.transparent_port_received?'received':'not received'],['Response',x=>x.response_received?'received':'none'],['HTTP',x=>x.http_code||'-'],['Error',x=>x.curl_error||'-']])}
-    async function debugIpCheck(){let query=debugIp.value.trim();if(!query){debugIpOut.innerHTML='<p class="hint">Enter an IP or CIDR first</p>';return}let r=await api('/api/sys/debug-ip',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query})});debugIpOut.innerHTML=table([r],[['Query',x=>x.query],['Valid',x=>x.valid?'yes':'no'],['proxy_ip.txt',x=>x.proxy_file?'yes':'no'],['proxy Matches',x=>(x.proxy_file_matches||[]).join('<br>')||'-'],['NFT Checked',x=>x.nft_checked?'yes':'no'],['NFT proxy',x=>x.nft_proxy?'yes':'no'],['NFT Matches',x=>(x.nft_matches||[]).join('<br>')||'-'],['Error',x=>x.error||x.nft_error||'-']])}
+    async function debugUrlCheck(mode){let [input,out]=debugEls(mode);let url=input.value.trim();if(!url){out.innerHTML='<p class="hint">Enter a URL first</p>';return}out.innerHTML='<p class="hint">Running debug, timeout 6s...</p>';let r=await api('/api/sys/debug-url',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url,mode})});out.innerHTML=debugCommand(r)+table([r],debugUrlColumns(mode))}
+    async function debugIpCheck(){let query=debugIp.value.trim();if(!query){debugIpOut.innerHTML='<p class="hint">Enter an IP or CIDR first</p>';return}let r=await api('/api/sys/debug-ip',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query})});debugIpOut.innerHTML=table([r],[['Query',x=>x.query],['Valid',x=>x.valid?'yes':'no'],['proxy_ip.txt',x=>x.proxy_file?'yes':'no'],['proxy Matches',x=>(x.proxy_file_matches||[]).join('<br>')||'-'],['NFT Checked',x=>x.nft_checked?'yes':'no'],['NFT proxy',x=>x.nft_proxy?'yes':'no'],['NFT Matches',x=>(x.nft_matches||[]).join('<br>')||'-'],['Error',x=>err(x.error||x.nft_error)]])}
     function syncDnsRefreshToBasic(){dnsCacheRefreshEnabled.checked=dnsCacheRefreshEnabledDns.checked;dnsCacheRefreshBatch.value=dnsCacheRefreshBatchDns.value;updateClientJson()}
     async function saveDnsCacheSettings(){syncDnsRefreshToBasic();await saveClientConfig();dnsCacheMessage.textContent='Refresh settings saved, restarting service...'}
     async function renderDnsCacheStats(){let s=await api('/api/dns/cache/stats');dnsCacheSize.textContent=s.size;dnsCacheCapacityOut.textContent=s.capacity;dnsCacheTtlOut.textContent=s.ttl_seconds;dnsCacheRefreshEnabledDns.checked=s.refresh_enabled!==false;dnsCacheRefreshBatchDns.value=s.refresh_batch_size||500}
@@ -1304,5 +1759,28 @@ where
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<Result<usize, std::io::Error>> {
         tokio::io::AsyncWrite::poll_write_vectored(self.project().inner, cx, bufs)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::proc_net_tcp_has_listener;
+
+    #[test]
+    fn proc_net_tcp_listener_detects_listen_state() {
+        let content = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:3039 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 5600722";
+
+        assert!(proc_net_tcp_has_listener(content, 12345));
+    }
+
+    #[test]
+    fn proc_net_tcp_listener_ignores_non_listen_state() {
+        let content = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:3039 0200007F:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 5600722";
+
+        assert!(!proc_net_tcp_has_listener(content, 12345));
     }
 }
