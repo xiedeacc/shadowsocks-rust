@@ -157,9 +157,6 @@ if [[ -d "$UBUNTU_DIR/data" && -z "$(ls -A "$INSTALL_DIR/data" 2>/dev/null)" ]];
 	tar -C "$UBUNTU_DIR/data" -cf - . | "${SUDO[@]}" tar -C "$INSTALL_DIR/data" -xf -
 fi
 
-log "migrating route rule names to proxy terminology"
-"${SUDO[@]}" sh "$ROOT_DIR/deploy/scripts/migrate_proxy_rules.sh" "$INSTALL_DIR"
-
 # 5) Sysctl tuning — mirrors deploy/openwrt/conf/shadowsocks-rust.init
 #    apply_network_tuning(). Volatile (no /etc/sysctl.d) on purpose:
 #    this is a debugging workstation, not a permanent gateway.

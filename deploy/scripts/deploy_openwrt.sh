@@ -257,7 +257,6 @@ ssh_cmd "mkdir -p '$REMOTE_TMP' '$REMOTE_DIR/bin' '$REMOTE_DIR/conf' '$REMOTE_DI
 scp_cmd "$OPENWRT_DIR/bin/sslocal" "$HOST:$REMOTE_TMP/sslocal"
 scp_cmd "$OPENWRT_DIR/conf/shadowsocks-client.json" "$HOST:$REMOTE_TMP/shadowsocks-client.json"
 scp_cmd "$OPENWRT_DIR/conf/shadowsocks-rust.init" "$HOST:$REMOTE_TMP/$SERVICE_NAME.init"
-scp_cmd "$ROOT_DIR/deploy/scripts/migrate_proxy_rules.sh" "$HOST:$REMOTE_TMP/migrate_proxy_rules.sh"
 # sslocal-watch — independent /etc/init.d service that samples runtime
 # health every 30s. Decoupled from sslocal so a wedged proxy still leaves
 # us a forensic trail (see conf/sslocal-watch.sh for sampling logic).
@@ -294,7 +293,6 @@ cp -f \"\$REMOTE_TMP/sslocal\" \"\$REMOTE_DIR/bin/sslocal\"
 chmod 755 \"\$REMOTE_DIR/bin/sslocal\"
 cp -f \"\$REMOTE_TMP/shadowsocks-client.json\" \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
 chmod 644 \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
-sh \"\$REMOTE_TMP/migrate_proxy_rules.sh\" \"\$REMOTE_DIR\"
 find \"\$REMOTE_TMP\" -maxdepth 1 -type f \\
 	! -name sslocal \\
 	! -name shadowsocks-client.json \\
