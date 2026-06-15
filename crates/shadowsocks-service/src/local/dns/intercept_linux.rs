@@ -27,7 +27,7 @@ const PROXY6_SET: &str = "proxy6";
 const TPROXY_PREROUTING_CHAIN: &str = "prerouting_tproxy";
 const TPROXY_OUTPUT_CHAIN: &str = "output_tproxy";
 const TPROXY_MARK: &str = "0x5355";
-const TPROXY_TABLE: &str = "5355";
+const TPROXY_TABLE: &str = "100";
 const FIXED_DIRECT4_RULES: [&str; 10] = [
     "0.0.0.0/8",
     "10.0.0.0/8",

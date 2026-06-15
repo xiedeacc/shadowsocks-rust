@@ -263,6 +263,9 @@ fi
 
 ssh_cmd "mkdir -p '$REMOTE_TMP' '$REMOTE_DIR/bin' '$REMOTE_DIR/conf' '$REMOTE_DIR/data' '$REMOTE_DIR/logs'"
 scp_cmd "$OPENWRT_DIR/bin/sslocal" "$HOST:$REMOTE_TMP/sslocal"
+if [[ -x "$OPENWRT_DIR/bin/xray-plugin" ]]; then
+	scp_cmd "$OPENWRT_DIR/bin/xray-plugin" "$HOST:$REMOTE_TMP/xray-plugin"
+fi
 scp_cmd "$OPENWRT_DIR/conf/shadowsocks-client.json" "$HOST:$REMOTE_TMP/shadowsocks-client.json"
 scp_cmd "$OPENWRT_DIR/conf/shadowsocks-rust.init" "$HOST:$REMOTE_TMP/$SERVICE_NAME.init"
 
@@ -280,6 +283,10 @@ DISABLE_LEGACY='$DISABLE_LEGACY'
 mkdir -p \"\$REMOTE_DIR/bin\" \"\$REMOTE_DIR/conf\" \"\$REMOTE_DIR/data\" \"\$REMOTE_DIR/data/temp\" \"\$REMOTE_DIR/logs\"
 cp -f \"\$REMOTE_TMP/sslocal\" \"\$REMOTE_DIR/bin/sslocal\"
 chmod 755 \"\$REMOTE_DIR/bin/sslocal\"
+if [ -x \"\$REMOTE_TMP/xray-plugin\" ]; then
+	cp -f \"\$REMOTE_TMP/xray-plugin\" \"\$REMOTE_DIR/bin/xray-plugin\"
+	chmod 755 \"\$REMOTE_DIR/bin/xray-plugin\"
+fi
 if [ ! -s \"\$REMOTE_DIR/conf/shadowsocks-client.json\" ]; then
 	cp -f \"\$REMOTE_TMP/shadowsocks-client.json\" \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
 fi
@@ -335,6 +342,11 @@ for legacy_service in shadowsocks-rust; do
 		\"/etc/init.d/\$legacy_service\" disable || true
 	fi
 done
+
+if command -v apk >/dev/null 2>&1 && ! lsmod | grep -q '^nft_tproxy'; then
+	apk update || true
+	apk add kmod-nft-tproxy || true
+fi
 
 if [ \"\$DISABLE_LEGACY\" = 1 ] && [ \"\$SERVICE_NAME\" != shadowsocks ] && [ -x /etc/init.d/shadowsocks ]; then
 	/etc/init.d/shadowsocks stop || true
