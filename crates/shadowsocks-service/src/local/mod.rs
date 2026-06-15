@@ -764,11 +764,13 @@ impl Server {
 
                     #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
                     if matches!(dns_intercept_mode.as_str(), "firewall" | "both") {
+                        let global_proxy = config.route_rules.global_proxy;
                         match self::dns::intercept_linux::setup_firewall_redirect(
                             client_addr.port(),
                             dns_intercept_redir_port,
                             &dns_intercept_exempt_ips,
                             &dns_intercept_proxy_exempt_endpoints,
+                            global_proxy,
                         ) {
                             Ok(guard) => {
                                 if let Err(err) = routing_state.sync_persistent_ip_rules_to_firewall().await {

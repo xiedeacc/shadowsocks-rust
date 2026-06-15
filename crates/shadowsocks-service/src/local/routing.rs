@@ -109,6 +109,8 @@ pub enum RouteDecision {
 pub struct RoutingSources {
     pub geoip_sources: Vec<String>,
     pub proxy_domain_sources: Vec<String>,
+    #[serde(default)]
+    pub global_proxy: bool,
     #[serde(default = "default_dns_cache_capacity")]
     pub dns_cache_capacity: usize,
     #[serde(default = "default_dns_cache_ttl_seconds")]
@@ -171,6 +173,7 @@ impl From<&RouteRulesConfig> for RoutingSources {
         sanitize_sources(Self {
             geoip_sources: config.geoip_sources.clone(),
             proxy_domain_sources: config.proxy_domain_sources.clone(),
+            global_proxy: config.global_proxy,
             dns_cache_capacity: config.dns_cache_capacity,
             dns_cache_ttl_seconds: config.dns_cache_ttl_seconds,
             dns_cache_refresh_enabled: config.dns_cache_refresh_enabled,
@@ -892,9 +895,9 @@ impl RoutingState {
         let rules = with_private_direct_rules(normalize_rule_lists(rules));
         validate_temporary_rules(&rules)?;
         #[cfg(all(target_os = "linux", feature = "local-dns"))]
-        let (rules_dir, proxy_nets) = {
+        let (rules_dir, direct_nets, proxy_nets) = {
             let inner = self.inner.read().await;
-            (inner.rules_dir.clone(), temporary_nft_proxy_nets(&inner, &rules))
+            temporary_nft_route_nets(&inner, &rules)
         };
         let mut inner = self.inner.write().await;
         write_temporary_rule_lists(&inner.rules_dir, &rules)?;
@@ -905,7 +908,7 @@ impl RoutingState {
         drop(inner);
         #[cfg(all(target_os = "linux", feature = "local-dns"))]
         {
-            if let Err(err) = crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &[], &proxy_nets) {
+            if let Err(err) = crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct_nets, &proxy_nets) {
                 warn!("failed to refresh nft proxy set after temporary rule change: {}", err);
             }
         }
@@ -928,9 +931,10 @@ impl RoutingState {
         validate_temporary_rules(&rules)?;
         let temporary_fingerprint = temporary_files_fingerprint(&rules_dir)?;
         #[cfg(all(target_os = "linux", feature = "local-dns"))]
-        let proxy_nets = {
+        let (direct_nets, proxy_nets) = {
             let inner = self.inner.read().await;
-            temporary_nft_proxy_nets(&inner, &rules)
+            let (_, direct_nets, proxy_nets) = temporary_nft_route_nets(&inner, &rules);
+            (direct_nets, proxy_nets)
         };
         let mut inner = self.inner.write().await;
         inner.temporary_fingerprint = temporary_fingerprint;
@@ -941,7 +945,7 @@ impl RoutingState {
         drop(inner);
         #[cfg(all(target_os = "linux", feature = "local-dns"))]
         {
-            if let Err(err) = crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &[], &proxy_nets) {
+            if let Err(err) = crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct_nets, &proxy_nets) {
                 warn!("failed to refresh nft proxy set after temporary rule reload: {}", err);
             }
         }
@@ -976,8 +980,14 @@ impl RoutingState {
         ADD_DNS_RESULTS_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
 
         let mut schedule_proxy_persist = false;
-        let nft_ips = {
+        let (nft_ips, global_proxy) = {
             let mut inner = self.inner.write().await;
+            let global_proxy = inner.sources.global_proxy;
+            if global_proxy && matches!(decision, RouteDecision::Proxy) {
+                let elapsed = total_start.elapsed();
+                ADD_DNS_RESULTS_TOTAL_NS.fetch_add(elapsed.as_nanos() as u64, AtomicOrdering::Relaxed);
+                return Ok(());
+            }
             let mut nft_ips = Vec::new();
             let mut lines = Vec::new();
             let mut proxy_changed = false;
@@ -1047,7 +1057,7 @@ impl RoutingState {
                 }
             }
             rebuild_ip_conflicts(&mut inner);
-            nft_ips
+            (nft_ips, global_proxy)
         };
         if !nft_ips.is_empty() {
             warn!(
@@ -1071,6 +1081,9 @@ impl RoutingState {
             let additions_for_nft = nft_ips.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<(), io::Error> {
                 let res = match decision {
+                    RouteDecision::Direct if global_proxy => {
+                        crate::local::dns::intercept_linux::add_route_ips(RouteDecision::Direct, &additions_for_nft)
+                    }
                     RouteDecision::Direct => {
                         crate::local::dns::intercept_linux::remove_route_ips(RouteDecision::Proxy, &additions_for_nft)
                     }
@@ -1106,6 +1119,9 @@ impl RoutingState {
             }
             if let Err(err) = result {
                 match decision {
+                    RouteDecision::Direct if global_proxy => {
+                        warn!("failed to sync direct DNS result IPs to nft direct set: {}", err)
+                    }
                     RouteDecision::Direct => {
                         warn!("failed to remove direct DNS result IPs from nft proxy set: {}", err)
                     }
@@ -1687,11 +1703,11 @@ impl RoutingState {
 
     #[cfg(all(target_os = "linux", feature = "local-dns"))]
     pub async fn sync_persistent_ip_rules_to_firewall(&self) -> io::Result<()> {
-        let (rules_dir, proxy) = {
+        let (rules_dir, direct, proxy) = {
             let inner = self.inner.read().await;
-            (inner.rules_dir.clone(), persistent_nft_proxy_nets(&inner))
+            persistent_nft_route_nets(&inner)
         };
-        crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &[], &proxy)
+        crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct, &proxy)
     }
 
     pub async fn record_connection(
@@ -2219,6 +2235,8 @@ fn route_ip_inner(inner: &mut RoutingInner, ip: &IpAddr) -> Option<RouteDecision
         Some(RouteDecision::Direct)
     } else if proxy {
         Some(RouteDecision::Proxy)
+    } else if inner.sources.global_proxy && !is_fixed_direct_ip(ip) {
+        Some(RouteDecision::Proxy)
     } else {
         None
     }
@@ -2246,6 +2264,8 @@ fn route_domain_inner(inner: &mut RoutingInner, domain: &str) -> Option<RouteDec
     if direct {
         Some(RouteDecision::Direct)
     } else if proxy {
+        Some(RouteDecision::Proxy)
+    } else if inner.sources.global_proxy {
         Some(RouteDecision::Proxy)
     } else {
         None
@@ -3051,13 +3071,13 @@ fn validate_temporary_rules(lists: &RuleLists) -> io::Result<()> {
 }
 
 #[cfg(all(target_os = "linux", feature = "local-dns"))]
-fn persistent_nft_proxy_nets(inner: &RoutingInner) -> Vec<IpNet> {
+fn persistent_nft_route_nets(inner: &RoutingInner) -> (PathBuf, Vec<IpNet>, Vec<IpNet>) {
     let mut direct = inner.persistent.direct_ip.clone();
     direct.extend(inner.temporary.direct_ip.iter().copied());
     let mut proxy = inner.persistent.proxy_ip.clone();
     proxy.extend(inner.temporary.proxy_ip.iter().copied());
     proxy.retain(|net| !direct.iter().any(|direct| ip_nets_overlap(direct, net)));
-    proxy
+    (inner.rules_dir.clone(), direct, proxy)
 }
 
 fn dns_proxy_ip_blocked_from_nft_by_direct_rule(inner: &RoutingInner, ip: &IpAddr) -> bool {
@@ -3066,7 +3086,7 @@ fn dns_proxy_ip_blocked_from_nft_by_direct_rule(inner: &RoutingInner, ip: &IpAdd
 }
 
 #[cfg(all(target_os = "linux", feature = "local-dns"))]
-fn temporary_nft_proxy_nets(inner: &RoutingInner, rules: &RuleLists) -> Vec<IpNet> {
+fn temporary_nft_route_nets(inner: &RoutingInner, rules: &RuleLists) -> (PathBuf, Vec<IpNet>, Vec<IpNet>) {
     let temporary_direct = rules
         .direct_ip
         .iter()
@@ -3079,7 +3099,7 @@ fn temporary_nft_proxy_nets(inner: &RoutingInner, rules: &RuleLists) -> Vec<IpNe
     proxy.extend(rules.proxy_ip.iter().filter_map(|rule| parse_ip_net(rule)));
     proxy.retain(|net| !direct.iter().any(|direct| ip_nets_overlap(direct, net)));
 
-    proxy
+    (inner.rules_dir.clone(), direct, proxy)
 }
 
 fn normalize_lines(lines: Vec<String>) -> Vec<String> {
@@ -3788,6 +3808,67 @@ mod tests {
             Some(RouteDecision::Proxy)
         );
         assert_eq!(state.route_domain("example.com").await, Some(RouteDecision::Proxy));
+    }
+
+    #[tokio::test]
+    async fn global_proxy_routes_unknown_public_targets_through_proxy() {
+        let dir = temp_rules_dir("global-proxy");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &["1.1.1.1".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["direct.example".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &[]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.global_proxy = true;
+        let state = RoutingState::load(config).await.unwrap();
+
+        assert_eq!(
+            state.route_ip(&"8.8.8.8".parse().unwrap()).await,
+            Some(RouteDecision::Proxy)
+        );
+        assert_eq!(state.route_domain("unknown.example").await, Some(RouteDecision::Proxy));
+        assert_eq!(
+            state.route_ip(&"1.1.1.1".parse().unwrap()).await,
+            Some(RouteDecision::Direct)
+        );
+        assert_eq!(
+            state.route_ip(&"192.168.1.1".parse().unwrap()).await,
+            Some(RouteDecision::Direct)
+        );
+        assert_eq!(
+            state.route_domain("direct.example").await,
+            Some(RouteDecision::Direct)
+        );
+    }
+
+    #[tokio::test]
+    async fn global_proxy_does_not_learn_proxy_dns_result_ips() {
+        let dir = temp_rules_dir("global-proxy-no-proxy-ip-learning");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &[]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        config.global_proxy = true;
+        let state = RoutingState::load(config).await.unwrap();
+        let ip = "203.0.113.10".parse().unwrap();
+
+        state
+            .add_dns_results(RouteDecision::Proxy, "www.example.com", &[ip])
+            .await
+            .unwrap();
+        state.persist_proxy_ip_if_dirty().await;
+
+        assert!(read_lines(dir.join(PROXY_IP_FILE)).unwrap().is_empty());
+        let inner = state.inner.read().await;
+        assert!(inner.persistent_raw.proxy_ip.is_empty());
+        assert!(!inner.proxy_ip_dirty);
+        assert!(!inner.proxy_ip_persist_scheduled);
     }
 
     #[tokio::test]

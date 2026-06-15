@@ -8,7 +8,7 @@ UBUNTU_DATA_FALLBACK="$ROOT_DIR/deploy/ubuntu/arm64/data"
 HOST="${HOST:-root@openwrt}"
 SSH_PORT="${SSH_PORT:-}"
 REMOTE_DIR="${REMOTE_DIR:-/usr/local/shadowsocks}"
-SERVICE_NAME="${SERVICE_NAME:-shadowsocks-rust}"
+SERVICE_NAME="${SERVICE_NAME:-shadowsocks}"
 REMOTE_TMP="${REMOTE_TMP:-/tmp/shadowsocks-rust-deploy}"
 FEATURES="${FEATURES:-full local-web-admin local-http-rustls}"
 TARGET_TRIPLE="${TARGET_TRIPLE:-}"
@@ -25,14 +25,14 @@ while [[ $# -gt 0 ]]; do
 deploy_openwrt.sh — cross-build sslocal and push it to the OpenWrt router.
 
 Flags:
-  --cleanup    SSH to the router, stop /etc/init.d/shadowsocks-rust,
+  --cleanup    SSH to the router, stop /etc/init.d/shadowsocks,
                flush the inet ssrust_dns nft table + iptables remnants,
                then exit without rebuilding/redeploying.
 
 Env knobs:
   HOST=root@openwrt        SSH_PORT=10022
   REMOTE_DIR=/usr/local/shadowsocks
-  SERVICE_NAME=shadowsocks-rust
+  SERVICE_NAME=shadowsocks
   TARGET_TRIPLE / OPENWRT_TOOLCHAIN / FEATURES / DISABLE_LEGACY
 EOF
 			exit 0 ;;
@@ -65,7 +65,7 @@ scp_cmd() {
 }
 
 # Best-effort cleanup of leftover sslocal firewall state on the router:
-#   * stop /etc/init.d/shadowsocks-rust so it can't recreate the table
+#   * stop /etc/init.d/shadowsocks so it can't recreate the table
 #     while we're flushing,
 #   * delete `inet ssrust_dns` (the only nft table sslocal ever creates),
 #   * delete any iptables nat rules redirecting dport 53 to localhost
@@ -280,7 +280,9 @@ DISABLE_LEGACY='$DISABLE_LEGACY'
 mkdir -p \"\$REMOTE_DIR/bin\" \"\$REMOTE_DIR/conf\" \"\$REMOTE_DIR/data\" \"\$REMOTE_DIR/data/temp\" \"\$REMOTE_DIR/logs\"
 cp -f \"\$REMOTE_TMP/sslocal\" \"\$REMOTE_DIR/bin/sslocal\"
 chmod 755 \"\$REMOTE_DIR/bin/sslocal\"
-cp -f \"\$REMOTE_TMP/shadowsocks-client.json\" \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
+if [ ! -s \"\$REMOTE_DIR/conf/shadowsocks-client.json\" ]; then
+	cp -f \"\$REMOTE_TMP/shadowsocks-client.json\" \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
+fi
 chmod 644 \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
 find \"\$REMOTE_TMP\" -maxdepth 1 -type f \\
 	! -name sslocal \\
@@ -327,7 +329,14 @@ for removed_service in sslocal-watch sslocal-probe; do
 	rm -f \"/etc/init.d/\$removed_service\" /etc/rc.d/*\"\$removed_service\"* \"\$REMOTE_DIR/bin/\$removed_service.sh\"
 done
 
-if [ \"\$DISABLE_LEGACY\" = 1 ] && [ -x /etc/init.d/shadowsocks ]; then
+for legacy_service in shadowsocks-rust; do
+	if [ \"\$SERVICE_NAME\" != \"\$legacy_service\" ] && [ -x \"/etc/init.d/\$legacy_service\" ]; then
+		\"/etc/init.d/\$legacy_service\" stop || true
+		\"/etc/init.d/\$legacy_service\" disable || true
+	fi
+done
+
+if [ \"\$DISABLE_LEGACY\" = 1 ] && [ \"\$SERVICE_NAME\" != shadowsocks ] && [ -x /etc/init.d/shadowsocks ]; then
 	/etc/init.d/shadowsocks stop || true
 	/etc/init.d/shadowsocks disable || true
 fi
@@ -341,8 +350,8 @@ EOS
 sh '$REMOTE_TMP/install.sh'"
 
 printf 'Deployed %s to %s:%s with service %s\n' "$TARGET_TRIPLE" "$HOST" "$REMOTE_DIR" "$SERVICE_NAME"
-if [[ "$DISABLE_LEGACY" = 1 ]]; then
+if [[ "$DISABLE_LEGACY" = 1 && "$SERVICE_NAME" != shadowsocks ]]; then
 	printf 'Legacy /etc/init.d/shadowsocks was stopped and disabled if present.\n'
-else
+elif [[ "$SERVICE_NAME" != shadowsocks ]]; then
 	printf 'Legacy /etc/init.d/shadowsocks was not touched. Set DISABLE_LEGACY=1 to stop and disable it during deploy.\n'
 fi

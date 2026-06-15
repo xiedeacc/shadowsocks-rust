@@ -632,6 +632,8 @@ struct SSRouteRulesConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     proxy_domain_sources: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    global_proxy: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     dns_cache_capacity: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dns_cache_ttl_seconds: Option<u64>,
@@ -1574,6 +1576,7 @@ pub struct RouteRulesConfig {
     pub rules_dir: PathBuf,
     pub geoip_sources: Vec<String>,
     pub proxy_domain_sources: Vec<String>,
+    pub global_proxy: bool,
     pub dns_cache_capacity: usize,
     pub dns_cache_ttl_seconds: u64,
     pub dns_cache_refresh_enabled: bool,
@@ -1593,6 +1596,7 @@ impl Default for RouteRulesConfig {
             rules_dir: PathBuf::from(DEFAULT_DEPLOY_DIR).join("data"),
             geoip_sources: vec![DEFAULT_GEOIP_SOURCE.to_owned()],
             proxy_domain_sources: DEFAULT_PROXY_DOMAIN_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
+            global_proxy: false,
             dns_cache_capacity: 100_000,
             dns_cache_ttl_seconds: 7 * 24 * 60 * 60,
             dns_cache_refresh_enabled: true,
@@ -2789,6 +2793,9 @@ impl Config {
                 if let Some(sources) = route_rules.proxy_domain_sources {
                     parsed.proxy_domain_sources = sources;
                 }
+                if let Some(global_proxy) = route_rules.global_proxy {
+                    parsed.global_proxy = global_proxy;
+                }
                 if let Some(capacity) = route_rules.dns_cache_capacity {
                     parsed.dns_cache_capacity = capacity.max(1);
                 }
@@ -3594,6 +3601,7 @@ impl fmt::Display for Config {
             jconf.route_rules = Some(SSRouteRulesConfig {
                 geoip_sources: Some(self.route_rules.geoip_sources.clone()),
                 proxy_domain_sources: Some(self.route_rules.proxy_domain_sources.clone()),
+                global_proxy: Some(self.route_rules.global_proxy),
                 dns_cache_capacity: Some(self.route_rules.dns_cache_capacity),
                 dns_cache_ttl_seconds: Some(self.route_rules.dns_cache_ttl_seconds),
                 dns_cache_refresh_enabled: Some(self.route_rules.dns_cache_refresh_enabled),

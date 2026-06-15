@@ -1375,6 +1375,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <h3 class="card-title">Transparent Proxy</h3>
         <fieldset>
           <div class="form-line"><label>Enable Redir</label><input id="redirEnable" type="checkbox"></div>
+          <div class="form-line"><label>Global Proxy</label><input id="globalProxy" type="checkbox"></div>
           <div class="form-line"><label>Bind Address</label><select id="redirBind"><option>127.0.0.1</option><option>0.0.0.0</option></select></div>
           <div class="form-line"><label>Port</label><input id="redirPort" type="number" min="1" max="65535"></div>
           <div class="form-line"><label>Mode</label><select id="redirMode"><option>tcp_only</option><option>tcp_and_udp</option></select></div>
@@ -1581,7 +1582,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       let routeRules=currentRawConfig.route_rules||{};
       setSelect('socksBind',socks.local_address||'127.0.0.1'); socksPort.value=socks.local_port||1080;
       setSelect('httpBind',http.local_address||'127.0.0.1'); httpPort.value=http.local_port||1081;
-      redirEnable.checked=!!(redir.protocol||tun.protocol);
+      globalProxy.checked=!!routeRules.global_proxy;
+      redirEnable.checked=!!(redir.protocol||tun.protocol)||globalProxy.checked;
       setSelect('redirBind',redir.local_address||'0.0.0.0'); redirPort.value=redir.local_port||12345;
       setSelect('redirMode',redir.mode||tun.mode||'tcp_and_udp'); setSelect('tcpRedir',redir.tcp_redir||'redirect'); setSelect('udpRedir',redir.udp_redir||'tproxy');
       tunName.value=tun.tun_interface_name||'shadowsocks-tun';
@@ -1607,6 +1609,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       updateClientJson();
     }
     function buildClientConfig(){
+      if(globalProxy.checked){
+        redirEnable.checked=true;
+        dnsEnable.checked=true;
+        if(!isWindowsService()&&dnsInterceptMode.value==='off')setSelect('dnsInterceptMode','firewall');
+      }
       let locals=[
         {local_address:socksBind.value,local_port:num(socksPort.value,1080),protocol:'socks'},
         {local_address:httpBind.value,local_port:num(httpPort.value,1081),protocol:'http'}
@@ -1630,6 +1637,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       routeRules.dns_cache_ttl_seconds=num(dnsCacheTtl.value,604800);
       routeRules.dns_cache_refresh_enabled=dnsCacheRefreshEnabled.checked;
       routeRules.dns_cache_refresh_batch_size=num(dnsCacheRefreshBatch.value,500);
+      routeRules.global_proxy=globalProxy.checked;
       routeRules.dns_intercept_mode=windowsTun?'tun':(redirEnable.checked?(isWindowsService()&&dnsInterceptMode.value==='firewall'?'tun':dnsInterceptMode.value):'off');
       routeRules.dns_ipv4_only=(dnsIpv4Only.value!=='false');
       let domesticDns=readDns('dnsDomesticList');
@@ -1702,7 +1710,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function saveClientConfig(){if(restartInProgress)return;updateClientJson();setRestartControls(true);configPath.textContent='saving config...';try{await api('/api/client-config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:clientConfig.value})})}catch(e){configPath.textContent='save failed: '+e.message;setRestartControls(false);return}configPath.textContent='saved, restarting service...';await waitForRestartComplete(currentConfigPath+' saved and service restarted')}
     async function restartService(){if(restartInProgress)return;setRestartControls(true);configPath.textContent='restarting service...';try{await api('/api/restart',{method:'POST'})}catch(e){console.warn(e)}await waitForRestartComplete('service restarted')}
-    ['socksBind','socksPort','httpBind','httpPort','redirEnable','redirBind','redirPort','redirMode','tcpRedir','udpRedir','tunName','tunAddress','tunDestination','dnsEnable','dnsBind','dnsPort','dnsCacheCapacity','dnsCacheTtl','dnsCacheRefreshEnabled','dnsCacheRefreshBatch','dnsInterceptMode','serverHost','serverPort','method','serverSecret','timeout','plugin','pluginOpts'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
+    ['socksBind','socksPort','httpBind','httpPort','redirEnable','globalProxy','redirBind','redirPort','redirMode','tcpRedir','udpRedir','tunName','tunAddress','tunDestination','dnsEnable','dnsBind','dnsPort','dnsCacheCapacity','dnsCacheTtl','dnsCacheRefreshEnabled','dnsCacheRefreshBatch','dnsInterceptMode','serverHost','serverPort','method','serverSecret','timeout','plugin','pluginOpts'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
 
     async function loadRules(){
       let tmp=await api('/api/temp-rules');
