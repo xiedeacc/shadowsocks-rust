@@ -1589,7 +1589,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       tunAddress.value=tun.tun_interface_address||'10.255.0.1/24';
       tunDestination.value=tun.tun_interface_destination||'10.255.0.2/24';
       document.querySelectorAll('.tun-field').forEach(e=>e.style.display=isWindowsService()?'grid':'none');
-      dnsEnable.checked=!!dns.protocol||!!tun.protocol;
+      dnsEnable.checked=(!!dns.protocol&&dns.disabled!==true)||!!tun.protocol;
       if(tun.protocol&&isWindowsService()){
         setSelect('dnsBind','0.0.0.0'); dnsPort.value=53; setSelect('dnsInterceptMode','tun');
       }else{
@@ -1634,13 +1634,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       routeRules.dns_ipv4_only=(dnsIpv4Only.value!=='false');
       let domesticEntry=dnsDomestic.value.trim()||'223.5.5.5:53';
       let foreignEntry=dnsForeign.value.trim()||'8.8.8.8:53';
-      if(wantsDns){
-        let domestic=parseHostPort(domesticEntry,'223.5.5.5',53);
-        let foreign=parseHostPort(foreignEntry,'8.8.8.8',53);
-        const dnsPortValue=windowsTun?53:num(dnsPort.value,1053);
-        const dnsBindValue=windowsTun?'0.0.0.0':dnsBind.value;
-        locals.push({local_address:dnsBindValue,local_port:dnsPortValue,protocol:'dns',mode:'tcp_and_udp',local_dns_address:domestic.host,local_dns_port:domestic.port,remote_dns_address:foreign.host,remote_dns_port:foreign.port,client_cache_size:64});
-      }
+      let domestic=parseHostPort(domesticEntry,'223.5.5.5',53);
+      let foreign=parseHostPort(foreignEntry,'8.8.8.8',53);
+      const dnsPortValue=windowsTun?53:num(dnsPort.value,1053);
+      const dnsBindValue=windowsTun?'0.0.0.0':dnsBind.value;
+      locals.push({disabled:!wantsDns,local_address:dnsBindValue,local_port:dnsPortValue,protocol:'dns',mode:'tcp_and_udp',local_dns_address:domestic.host,local_dns_port:domestic.port,remote_dns_address:foreign.host,remote_dns_port:foreign.port,client_cache_size:64});
       let server={server:serverHost.value.trim(),server_port:num(serverPort.value,443),password:serverSecret.value,timeout:num(timeout.value,300),method:method.value};
       if(plugin.value.trim())server.plugin=plugin.value.trim();
       if(pluginOpts.value.trim())server.plugin_opts=pluginOpts.value.trim();
