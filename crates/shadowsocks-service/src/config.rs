@@ -1154,6 +1154,9 @@ impl FromStr for ProtocolType {
 /// Local server configuration
 #[derive(Clone, Debug)]
 pub struct LocalConfig {
+    /// Whether this local server should be skipped at runtime.
+    pub disabled: bool,
+
     /// Listen address for local servers
     pub addr: Option<ServerAddr>,
 
@@ -1292,6 +1295,8 @@ impl LocalConfig {
         };
 
         Self {
+            disabled: false,
+
             addr: None,
 
             protocol,
@@ -1960,10 +1965,6 @@ impl Config {
                 // `locals` are only effective in local server
                 if let Some(locals) = config.locals {
                     for local in locals {
-                        if local.disabled.unwrap_or(false) {
-                            continue;
-                        }
-
                         let protocol = match local.protocol {
                             None => ProtocolType::Socks,
                             Some(p) => match p.parse::<ProtocolType>() {
@@ -1980,6 +1981,7 @@ impl Config {
                         };
 
                         let mut local_config = LocalConfig::new(protocol);
+                        local_config.disabled = local.disabled.unwrap_or(false);
 
                         if let Some(local_port) = local.local_port {
                             if local_port == 0 {
@@ -3011,7 +3013,9 @@ impl Config {
             }
 
             for local_config in &self.local {
-                local_config.config.check_integrity()?;
+                if !local_config.config.disabled {
+                    local_config.config.check_integrity()?;
+                }
             }
 
             // Balancer related checks
@@ -3199,7 +3203,7 @@ impl fmt::Display for Config {
                             ServerAddr::SocketAddr(sa) => sa.port(),
                             ServerAddr::DomainName(.., port) => *port,
                         }),
-                        disabled: None,
+                        disabled: local.disabled.then_some(true),
                         local_udp_address: local.udp_addr.as_ref().map(|udp_addr| match udp_addr {
                             ServerAddr::SocketAddr(sa) => sa.ip().to_string(),
                             ServerAddr::DomainName(dm, ..) => dm.to_string(),

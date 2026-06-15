@@ -150,7 +150,10 @@ impl Server {
 
         #[cfg(all(windows, feature = "local-tun"))]
         let (outbound_bind_interface, outbound_bind_addr) = {
-            let has_tun = config.local.iter().any(|l| matches!(l.config.protocol, ProtocolType::Tun));
+            let has_tun = config
+                .local
+                .iter()
+                .any(|l| !l.config.disabled && matches!(l.config.protocol, ProtocolType::Tun));
             let need_auto = has_tun
                 && config.outbound_bind_interface.is_none()
                 && config.outbound_bind_addr.is_none();
@@ -473,7 +476,10 @@ impl Server {
         context.set_security_config(&config.security);
 
         if !config.outbound_proxy.is_empty() {
-            let has_udp = config.local.iter().any(|local| local.config.mode.enable_udp());
+            let has_udp = config
+                .local
+                .iter()
+                .any(|local| !local.config.disabled && local.config.mode.enable_udp());
             if has_udp {
                 let preview = crate::net::OutboundProxyClient::from_config(&config.outbound_proxy);
                 if !preview.supports_udp() {
@@ -486,13 +492,19 @@ impl Server {
             context.set_outbound_proxies(config.outbound_proxy);
         }
 
-        assert!(!config.local.is_empty(), "no valid local server configuration");
+        assert!(
+            config.local.iter().any(|local| !local.config.disabled),
+            "no enabled local server configuration"
+        );
 
         // Create a service balancer for choosing between multiple servers
         let balancer = {
             let mut mode: Option<Mode> = None;
 
             for local in &config.local {
+                if local.config.disabled {
+                    continue;
+                }
                 mode = Some(match mode {
                     None => local.config.mode,
                     Some(m) => m.merge(local.config.mode),
@@ -599,7 +611,7 @@ impl Server {
         let primary_dns_listener = config
             .local
             .iter()
-            .find(|local| matches!(local.config.protocol, ProtocolType::Dns));
+            .find(|local| !local.config.disabled && matches!(local.config.protocol, ProtocolType::Dns));
         #[cfg(feature = "local-web-admin")]
         let dns_runtime_state = {
             #[cfg(feature = "local-dns")]
@@ -621,11 +633,14 @@ impl Server {
         let dns_intercept_redir_port = config
             .local
             .iter()
-            .find(|local| matches!(local.config.protocol, ProtocolType::Redir))
+            .find(|local| !local.config.disabled && matches!(local.config.protocol, ProtocolType::Redir))
             .and_then(|local| local.config.addr.as_ref().map(|addr| addr.port()));
 
         for local_instance in config.local {
             let local_config = local_instance.config;
+            if local_config.disabled {
+                continue;
+            }
 
             // Clone from global ServiceContext instance
             // It will shares Shadowsocks' global context, and FlowStat, DNS reverse cache
