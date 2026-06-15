@@ -28,6 +28,19 @@ const TPROXY_PREROUTING_CHAIN: &str = "prerouting_tproxy";
 const TPROXY_OUTPUT_CHAIN: &str = "output_tproxy";
 const TPROXY_MARK: &str = "0x5355";
 const TPROXY_TABLE: &str = "5355";
+const FIXED_DIRECT4_RULES: [&str; 10] = [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+];
+const FIXED_DIRECT6_RULES: [&str; 5] = ["::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"];
 
 pub struct DnsInterceptGuard {
     backend: Backend,
@@ -499,6 +512,7 @@ fn setup_nft(
     let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
     command("nft", &["add", "table", "inet", NFT_TABLE])?;
     add_nft_sets()?;
+    add_fixed_direct_set_elements()?;
     command(
         "nft",
         &[
@@ -650,6 +664,7 @@ fn add_nft_tcp_redir_rule(
     redir_port: u16,
     global_proxy: bool,
 ) -> io::Result<()> {
+    add_fixed_direct_return_rules(chain, family_expr, "tcp")?;
     let redir_port_arg = format!(":{redir_port}");
     let mut args = vec!["add", "rule", "inet", NFT_TABLE, chain, family_expr, "daddr"];
     if global_proxy {
@@ -657,16 +672,41 @@ fn add_nft_tcp_redir_rule(
     } else {
         args.push(proxy_set_name);
     }
-    args.extend([
-        "tcp",
-        "dport",
-        "!=",
-        "53",
-        "redirect",
-        "to",
-        &redir_port_arg,
-    ]);
+    args.extend(["tcp", "dport", "!=", "53", "redirect", "to", &redir_port_arg]);
     command("nft", &args)
+}
+
+fn add_fixed_direct_return_rules(
+    chain: &'static str,
+    family_expr: &'static str,
+    proto: &'static str,
+) -> io::Result<()> {
+    let rules = match family_expr {
+        "ip" => &FIXED_DIRECT4_RULES[..],
+        "ip6" => &FIXED_DIRECT6_RULES[..],
+        _ => return Ok(()),
+    };
+    for rule in rules {
+        command(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                NFT_TABLE,
+                chain,
+                family_expr,
+                "daddr",
+                rule,
+                proto,
+                "dport",
+                "!=",
+                "53",
+                "return",
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn setup_nft_udp_tproxy(
@@ -765,6 +805,7 @@ fn add_nft_udp_tproxy_prerouting_rule(
     redir_port: u16,
     global_proxy: bool,
 ) -> io::Result<()> {
+    add_fixed_direct_return_rules(TPROXY_PREROUTING_CHAIN, family_expr, "udp")?;
     let redir_port_arg = format!(":{redir_port}");
     let mut args = vec![
         "add",
@@ -804,6 +845,7 @@ fn add_nft_udp_tproxy_output_rule(
     direct_set_name: &'static str,
     global_proxy: bool,
 ) -> io::Result<()> {
+    add_fixed_direct_return_rules(TPROXY_OUTPUT_CHAIN, family_expr, "udp")?;
     let mut args = vec![
         "add",
         "rule",
@@ -818,16 +860,7 @@ fn add_nft_udp_tproxy_output_rule(
     } else {
         args.push(set_name);
     }
-    args.extend([
-        "udp",
-        "dport",
-        "!=",
-        "53",
-        "meta",
-        "mark",
-        "set",
-        TPROXY_MARK,
-    ]);
+    args.extend(["udp", "dport", "!=", "53", "meta", "mark", "set", TPROXY_MARK]);
     command("nft", &args)
 }
 
@@ -908,6 +941,27 @@ fn add_nft_sets() -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+fn add_fixed_direct_set_elements() -> io::Result<()> {
+    let mut script = String::new();
+    write_add_literal_elements(&mut script, DIRECT4_SET, &FIXED_DIRECT4_RULES);
+    write_add_literal_elements(&mut script, DIRECT6_SET, &FIXED_DIRECT6_RULES);
+    nft_apply_script(&script)
+}
+
+fn write_add_literal_elements(script: &mut String, set_name: &str, rules: &[&str]) {
+    if rules.is_empty() {
+        return;
+    }
+    let _ = write!(script, "add element inet {NFT_TABLE} {set_name} {{ ");
+    for (idx, rule) in rules.iter().enumerate() {
+        if idx > 0 {
+            let _ = script.write_str(", ");
+        }
+        let _ = script.write_str(rule);
+    }
+    let _ = script.write_str(" }\n");
 }
 
 fn setup_iptables(port: u16, dns_exempt_ips: &[IpAddr]) -> io::Result<()> {

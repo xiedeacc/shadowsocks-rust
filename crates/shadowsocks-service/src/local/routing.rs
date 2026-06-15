@@ -82,7 +82,7 @@ const RECORD_QUEUE_CAPACITY: usize = 8192;
 const PROXY_IP_PERSIST_DELAY: Duration = Duration::from_secs(30);
 const DNS_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const SOURCE_REFRESH_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const PRIVATE_DIRECT_IP_RULES: [&str; 13] = [
+const PRIVATE_DIRECT_IP_RULES: [&str; 15] = [
     "0.0.0.0/8",
     "127.0.0.0/8",
     "10.0.0.0/8",
@@ -91,6 +91,8 @@ const PRIVATE_DIRECT_IP_RULES: [&str; 13] = [
     "172.16.0.0/12",
     "192.168.0.0/16",
     "198.18.0.0/15",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
     "::/128",
     "::1/128",
     "fc00::/7",
@@ -2049,6 +2051,7 @@ impl RoutingState {
         let reverse_domains = build_reverse_domain_map(&inner);
         let flow_decisions = inner.flow_decisions.clone();
         let system_connection_baseline = inner.system_connection_baseline.clone();
+        let global_proxy = inner.sources.global_proxy;
         let mut rows = inner
             .connections
             .iter()
@@ -2101,6 +2104,8 @@ impl RoutingState {
                 }
                 if let Some(decision) = flow_decisions.get(&key) {
                     event.decision = *decision;
+                } else if global_proxy && system_connection_should_be_redir(&event) {
+                    event.decision = ConnectionDecision::Redir;
                 }
             }
             if dedupped_recent_connections.insert(connection_key(&event)) {
@@ -2870,6 +2875,16 @@ fn collect_system_connection_keys() -> HashSet<FlowKey> {
         .iter()
         .filter_map(flow_key_for_event)
         .collect()
+}
+
+fn system_connection_should_be_redir(event: &ConnectionEvent) -> bool {
+    if event.destination_port == 53 {
+        return false;
+    }
+    let Some(destination_ip) = event.destination_ip else {
+        return false;
+    };
+    matches!(event.protocol.as_str(), "tcp" | "udp") && !is_fixed_direct_ip(&destination_ip)
 }
 
 fn collect_conntrack_connections(reverse_domains: &HashMap<IpAddr, String>) -> Vec<ConnectionEvent> {
@@ -3691,6 +3706,29 @@ mod tests {
     }
 
     #[test]
+    fn global_proxy_system_rows_only_assume_redir_for_public_non_dns() {
+        let mut event = ConnectionEvent {
+            timestamp: now(),
+            source_ip: "192.168.2.246".parse().unwrap(),
+            source_port: 54000,
+            destination_ip: Some("172.64.155.209".parse().unwrap()),
+            destination_domain: None,
+            domain: None,
+            destination_port: 443,
+            protocol: "tcp".to_owned(),
+            decision: ConnectionDecision::Direct,
+        };
+        assert!(system_connection_should_be_redir(&event));
+
+        event.destination_port = 53;
+        assert!(!system_connection_should_be_redir(&event));
+
+        event.destination_port = 443;
+        event.destination_ip = Some("192.168.2.1".parse().unwrap());
+        assert!(!system_connection_should_be_redir(&event));
+    }
+
+    #[test]
     fn fixed_direct_ip_matches_documented_ranges() {
         for ip in [
             "0.1.2.3",
@@ -3704,6 +3742,10 @@ mod tests {
             "192.168.1.1",
             "198.18.0.1",
             "198.19.255.255",
+            "224.0.0.1",
+            "239.255.255.250",
+            "240.0.0.1",
+            "255.255.255.255",
             "::",
             "::1",
             "fc00::1",
@@ -3714,7 +3756,14 @@ mod tests {
             assert!(is_fixed_direct_ip(&ip.parse().unwrap()), "{ip}");
         }
 
-        for ip in ["1.1.1.1", "100.128.0.1", "172.32.0.1", "198.20.0.1", "2001:db8::1"] {
+        for ip in [
+            "1.1.1.1",
+            "100.128.0.1",
+            "172.32.0.1",
+            "198.20.0.1",
+            "223.5.5.5",
+            "2001:db8::1",
+        ] {
             assert!(!is_fixed_direct_ip(&ip.parse().unwrap()), "{ip}");
         }
     }

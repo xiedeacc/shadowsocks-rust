@@ -21,13 +21,10 @@ use crate::{
         loadbalancing::PingBalancer,
         net::AutoProxyClientStream,
         redir::redir_ext::{TcpListenerRedirExt, TcpStreamRedirExt},
-        utils::{establish_tcp_tunnel, establish_tcp_tunnel_bypassed},
+        utils::establish_tcp_tunnel,
     },
     net::utils::to_ipv4_mapped,
 };
-
-#[cfg(feature = "local-web-admin")]
-use crate::local::net::AutoProxyIo;
 
 #[allow(unused_imports)]
 mod sys;
@@ -43,30 +40,24 @@ async fn establish_client_tcp_redir(
     addr: &Address,
 ) -> io::Result<()> {
     if balancer.is_empty() {
-        let mut remote = AutoProxyClientStream::connect_bypassed(context.clone(), addr).await?;
-        #[cfg(feature = "local-web-admin")]
-        if let Some(routing_state) = context.routing_state() {
-            routing_state
-                .record_connection(peer_addr, addr, "tcp", crate::local::routing::ConnectionDecision::Direct)
-                .await;
-        }
-        return establish_tcp_tunnel_bypassed(&mut stream, &mut remote, peer_addr, addr).await;
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "redir requires at least one proxy server",
+        ));
     }
 
     let server = balancer.best_tcp_server();
     let svr_cfg = server.server_config();
 
     let mut remote =
-        AutoProxyClientStream::connect_with_opts(context.clone(), &server, addr, server.connect_opts_ref()).await?;
+        AutoProxyClientStream::connect_proxied_with_opts(context.clone(), &server, addr, server.connect_opts_ref())
+            .await?;
 
     #[cfg(feature = "local-web-admin")]
     if let Some(routing_state) = context.routing_state() {
-        let decision = if remote.is_proxied() {
-            crate::local::routing::ConnectionDecision::Redir
-        } else {
-            crate::local::routing::ConnectionDecision::Direct
-        };
-        routing_state.record_connection(peer_addr, addr, "tcp", decision).await;
+        routing_state
+            .record_connection(peer_addr, addr, "tcp", crate::local::routing::ConnectionDecision::Redir)
+            .await;
     }
 
     establish_tcp_tunnel(svr_cfg, &mut stream, &mut remote, peer_addr, addr).await

@@ -527,6 +527,16 @@ where
     }
 
     async fn dispatch_received_packet(&mut self, target_addr: &Address, data: &[u8]) {
+        if matches!(self.kind, UdpAssociationKind::Redir) && self.balancer.is_empty() {
+            error!(
+                "udp relay {} -> {} (Proxy) with {} bytes, error: redir requires at least one proxy server",
+                self.peer_addr,
+                target_addr,
+                data.len()
+            );
+            return;
+        }
+
         let direct = self.target_should_dispatch_direct(target_addr).await;
 
         #[cfg(feature = "local-web-admin")]
@@ -574,9 +584,8 @@ where
 
         match self.kind {
             UdpAssociationKind::Socks5 => address_is_fixed_direct(target_addr),
-            UdpAssociationKind::Redir | UdpAssociationKind::Tun | UdpAssociationKind::Tunnel => {
-                self.route_target_is_direct(target_addr).await
-            }
+            UdpAssociationKind::Redir => false,
+            UdpAssociationKind::Tun | UdpAssociationKind::Tunnel => self.route_target_is_direct(target_addr).await,
         }
     }
 
@@ -780,7 +789,8 @@ fn udp_connection_decision(kind: UdpAssociationKind, direct: bool) -> Option<Con
         } else {
             ConnectionDecision::Socks5Proxy
         }),
-        UdpAssociationKind::Redir | UdpAssociationKind::Tun => {
+        UdpAssociationKind::Redir => Some(ConnectionDecision::Redir),
+        UdpAssociationKind::Tun => {
             if direct {
                 Some(ConnectionDecision::Direct)
             } else {
@@ -799,7 +809,7 @@ mod tests {
     fn udp_redir_and_tun_decisions_follow_actual_dispatch() {
         assert_eq!(
             udp_connection_decision(UdpAssociationKind::Redir, true),
-            Some(ConnectionDecision::Direct)
+            Some(ConnectionDecision::Redir)
         );
         assert_eq!(
             udp_connection_decision(UdpAssociationKind::Redir, false),

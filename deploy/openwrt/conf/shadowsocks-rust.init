@@ -7,20 +7,9 @@ USE_PROCD=1
 NAME=shadowsocks-rust
 PROG=/usr/local/shadowsocks/bin/sslocal
 CONF=/usr/local/shadowsocks/conf/shadowsocks-client.json
-DATA_DIR=/usr/local/shadowsocks/data
-LOG_DIR=/usr/local/shadowsocks/logs
 
 start_service() {
-	mkdir -p "$DATA_DIR" "$LOG_DIR"
 	procd_open_instance
-	# RLIMIT_NOFILE is passed as a CLI flag rather than via
-	# `procd_set_param limits nofile=...`, because on this OpenWrt
-	# build (procd from r32933) the `limits` directive silently fails
-	# to override the kernel default of 1024 soft / 4096 hard. The
-	# shadowsocks binary calls setrlimit(RLIMIT_NOFILE) itself when
-	# given --nofile, which raises both soft+hard reliably (root has
-	# CAP_SYS_RESOURCE, system-wide cap fs.nr_open=1048576 is already
-	# at least this big on stock OpenWrt).
 	procd_set_param command "$PROG" -c "$CONF" --nofile 1048576
 	procd_set_param respawn 3600 5 5
 	procd_set_param stdout 1

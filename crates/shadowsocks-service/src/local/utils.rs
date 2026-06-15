@@ -30,6 +30,7 @@ pub(crate) fn is_fixed_direct_ip(ip: &IpAddr) -> bool {
                 || (octets[0] == 172 && (16..=31).contains(&octets[1]))
                 || (octets[0] == 192 && octets[1] == 168)
                 || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+                || octets[0] >= 224
         }
         IpAddr::V6(ip) => {
             ip.is_unspecified()

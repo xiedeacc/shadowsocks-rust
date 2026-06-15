@@ -1549,7 +1549,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     const defaultGeoipSources=['https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'];
     const defaultProxyDomainSources=['https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt'];
     function token(){return new URLSearchParams(location.search).get('token')||''}
-    async function api(path,opt={}){opt.headers=Object.assign({'x-admin-token':token()},opt.headers||{});let r=await fetch(path,opt);let j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}
+    async function api(path,opt={}){let timeoutMs=opt.timeoutMs||0;delete opt.timeoutMs;let timer=null,controller=null;if(timeoutMs){controller=new AbortController();opt.signal=controller.signal;timer=setTimeout(()=>controller.abort(),timeoutMs)}opt.headers=Object.assign({'x-admin-token':token()},opt.headers||{});try{let r=await fetch(path,opt);let j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}finally{if(timer)clearTimeout(timer)}}
     async function platform(){if(!servicePlatform)servicePlatform=await api('/api/sys/platform');return servicePlatform}
     function isWindowsService(){return servicePlatform&&servicePlatform.target_os==='windows'}
     let activeTab='basic', activityTimer=null, activityPaused=false, recentDnsRows=[], restartInProgress=false;
@@ -1666,14 +1666,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms))}
     function setRestartControls(running){restartInProgress=running;restartButton.disabled=running;saveButton.disabled=running;reloadButton.disabled=running;restartButton.textContent=running?'Restarting...':'Restart'}
-    async function waitForAdminReady(timeoutMs=45000){
-      let deadline=Date.now()+timeoutMs,lastError=null;
-      await sleep(900);
+    async function waitForAdminReady(timeoutMs=60000){
+      let deadline=Date.now()+timeoutMs,lastError=null,successes=0;
+      await sleep(1200);
       while(Date.now()<deadline){
         try{
-          await api('/api/sys/platform?restart_probe='+Date.now(),{cache:'no-store'});
-          return true;
+          await api('/api/sys/platform?restart_probe='+Date.now(),{cache:'no-store',timeoutMs:2500});
+          successes++;
+          if(successes>=2)return true;
+          await sleep(500);
         }catch(e){
+          successes=0;
           lastError=e;
           await sleep(1000);
         }
