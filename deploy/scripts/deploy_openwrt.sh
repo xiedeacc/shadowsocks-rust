@@ -5,8 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OPENWRT_DIR="$ROOT_DIR/deploy/openwrt"
 UBUNTU_DATA_FALLBACK="$ROOT_DIR/deploy/ubuntu/arm64/data"
 
-HOST="${HOST:-root@192.168.2.1}"
-SSH_PORT="${SSH_PORT:-10022}"
+HOST="${HOST:-root@openwrt}"
+SSH_PORT="${SSH_PORT:-}"
 REMOTE_DIR="${REMOTE_DIR:-/usr/local/shadowsocks}"
 SERVICE_NAME="${SERVICE_NAME:-shadowsocks-rust}"
 REMOTE_TMP="${REMOTE_TMP:-/tmp/shadowsocks-rust-deploy}"
@@ -30,7 +30,7 @@ Flags:
                then exit without rebuilding/redeploying.
 
 Env knobs:
-  HOST=root@192.168.2.1   SSH_PORT=10022
+  HOST=root@openwrt        SSH_PORT=10022
   REMOTE_DIR=/usr/local/shadowsocks
   SERVICE_NAME=shadowsocks-rust
   TARGET_TRIPLE / OPENWRT_TOOLCHAIN / FEATURES / DISABLE_LEGACY
@@ -49,11 +49,19 @@ TOOLCHAIN_SEARCH_ROOTS=(
 )
 
 ssh_cmd() {
-	ssh -o ConnectTimeout=8 -p "$SSH_PORT" "$HOST" "$@"
+	local ssh_args=(-o ConnectTimeout=8)
+	if [[ -n "$SSH_PORT" ]]; then
+		ssh_args+=(-p "$SSH_PORT")
+	fi
+	ssh "${ssh_args[@]}" "$HOST" "$@"
 }
 
 scp_cmd() {
-	scp -O -P "$SSH_PORT" "$@"
+	local scp_args=(-O)
+	if [[ -n "$SSH_PORT" ]]; then
+		scp_args+=(-P "$SSH_PORT")
+	fi
+	scp "${scp_args[@]}" "$@"
 }
 
 # Best-effort cleanup of leftover sslocal firewall state on the router:
@@ -257,25 +265,6 @@ ssh_cmd "mkdir -p '$REMOTE_TMP' '$REMOTE_DIR/bin' '$REMOTE_DIR/conf' '$REMOTE_DI
 scp_cmd "$OPENWRT_DIR/bin/sslocal" "$HOST:$REMOTE_TMP/sslocal"
 scp_cmd "$OPENWRT_DIR/conf/shadowsocks-client.json" "$HOST:$REMOTE_TMP/shadowsocks-client.json"
 scp_cmd "$OPENWRT_DIR/conf/shadowsocks-rust.init" "$HOST:$REMOTE_TMP/$SERVICE_NAME.init"
-# sslocal-watch — independent /etc/init.d service that samples runtime
-# health every 30s. Decoupled from sslocal so a wedged proxy still leaves
-# us a forensic trail (see conf/sslocal-watch.sh for sampling logic).
-if [[ -f "$OPENWRT_DIR/conf/sslocal-watch.sh" ]]; then
-	scp_cmd "$OPENWRT_DIR/conf/sslocal-watch.sh" "$HOST:$REMOTE_TMP/sslocal-watch.sh"
-fi
-if [[ -f "$OPENWRT_DIR/conf/sslocal-watch.init" ]]; then
-	scp_cmd "$OPENWRT_DIR/conf/sslocal-watch.init" "$HOST:$REMOTE_TMP/sslocal-watch.init"
-fi
-# sslocal-probe — active liveness probe + on-failure forensic dumper.
-# Runs alongside sslocal-watch but uses curl-through-redir to detect the
-# precise moment user-visible traffic dies, then snapshots stacks /
-# perf / dmesg into $LOG_DIR/dumps/. See conf/sslocal-probe.sh.
-if [[ -f "$OPENWRT_DIR/conf/sslocal-probe.sh" ]]; then
-	scp_cmd "$OPENWRT_DIR/conf/sslocal-probe.sh" "$HOST:$REMOTE_TMP/sslocal-probe.sh"
-fi
-if [[ -f "$OPENWRT_DIR/conf/sslocal-probe.init" ]]; then
-	scp_cmd "$OPENWRT_DIR/conf/sslocal-probe.init" "$HOST:$REMOTE_TMP/sslocal-probe.init"
-fi
 
 if [[ -d "$DATA_SOURCE_DIR" ]]; then
 	tar -C "$DATA_SOURCE_DIR" -cf - . | ssh_cmd "tar -C '$REMOTE_TMP' -xf -"
@@ -298,10 +287,6 @@ find \"\$REMOTE_TMP\" -maxdepth 1 -type f \\
 	! -name shadowsocks-client.json \\
 	! -name \"\$SERVICE_NAME.init\" \\
 	! -name install.sh \\
-	! -name sslocal-watch.sh \\
-	! -name sslocal-watch.init \\
-	! -name sslocal-probe.sh \\
-	! -name sslocal-probe.init \\
 	! -name direct_ip.txt \\
 	! -name direct_domain.txt \\
 	! -name proxy_ip.txt \\
@@ -334,34 +319,13 @@ fi
 cp -f \"\$REMOTE_TMP/\$SERVICE_NAME.init\" \"/etc/init.d/\$SERVICE_NAME\"
 chmod 755 \"/etc/init.d/\$SERVICE_NAME\"
 
-# sslocal-watch / sslocal-probe — optional but strongly recommended.
-# Installed when the files are present in the deploy bundle.
-if [ -f \"\$REMOTE_TMP/sslocal-watch.sh\" ]; then
-	cp -f \"\$REMOTE_TMP/sslocal-watch.sh\" \"\$REMOTE_DIR/bin/sslocal-watch.sh\"
-	chmod 755 \"\$REMOTE_DIR/bin/sslocal-watch.sh\"
-fi
-if [ -f \"\$REMOTE_TMP/sslocal-watch.init\" ]; then
-	cp -f \"\$REMOTE_TMP/sslocal-watch.init\" \"/etc/init.d/sslocal-watch\"
-	chmod 755 \"/etc/init.d/sslocal-watch\"
-	/etc/init.d/sslocal-watch enable || true
-elif [ -x /etc/init.d/sslocal-watch ]; then
-	/etc/init.d/sslocal-watch stop || true
-	/etc/init.d/sslocal-watch disable || true
-	rm -f /etc/init.d/sslocal-watch /etc/rc.d/*sslocal-watch*
-fi
-if [ -f \"\$REMOTE_TMP/sslocal-probe.sh\" ]; then
-	cp -f \"\$REMOTE_TMP/sslocal-probe.sh\" \"\$REMOTE_DIR/bin/sslocal-probe.sh\"
-	chmod 755 \"\$REMOTE_DIR/bin/sslocal-probe.sh\"
-fi
-if [ -f \"\$REMOTE_TMP/sslocal-probe.init\" ]; then
-	cp -f \"\$REMOTE_TMP/sslocal-probe.init\" \"/etc/init.d/sslocal-probe\"
-	chmod 755 \"/etc/init.d/sslocal-probe\"
-	/etc/init.d/sslocal-probe enable || true
-elif [ -x /etc/init.d/sslocal-probe ]; then
-	/etc/init.d/sslocal-probe stop || true
-	/etc/init.d/sslocal-probe disable || true
-	rm -f /etc/init.d/sslocal-probe /etc/rc.d/*sslocal-probe*
-fi
+for removed_service in sslocal-watch sslocal-probe; do
+	if [ -x \"/etc/init.d/\$removed_service\" ]; then
+		\"/etc/init.d/\$removed_service\" stop || true
+		\"/etc/init.d/\$removed_service\" disable || true
+	fi
+	rm -f \"/etc/init.d/\$removed_service\" /etc/rc.d/*\"\$removed_service\"* \"\$REMOTE_DIR/bin/\$removed_service.sh\"
+done
 
 if [ \"\$DISABLE_LEGACY\" = 1 ] && [ -x /etc/init.d/shadowsocks ]; then
 	/etc/init.d/shadowsocks stop || true
@@ -373,16 +337,6 @@ fi
 sleep 2
 /etc/init.d/\$SERVICE_NAME status || true
 
-if [ -x /etc/init.d/sslocal-watch ]; then
-	/etc/init.d/sslocal-watch restart || true
-	sleep 1
-	/etc/init.d/sslocal-watch status || true
-fi
-if [ -x /etc/init.d/sslocal-probe ]; then
-	/etc/init.d/sslocal-probe restart || true
-	sleep 1
-	/etc/init.d/sslocal-probe status || true
-fi
 EOS
 sh '$REMOTE_TMP/install.sh'"
 

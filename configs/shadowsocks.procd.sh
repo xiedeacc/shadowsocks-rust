@@ -141,5 +141,5 @@ service_stopped() {
 
 service_triggers() {
     #procd_add_reload_interface_trigger "pppoe-wan"
-    procd_add_interface_trigger "interface.*" "pppoe-wan" /etc/init.d/shadowsocks restart
+    procd_add_interface_trigger "interface.*" "pppoe-wan" /etc/init.d/shadowsocks-rust restart
 }
