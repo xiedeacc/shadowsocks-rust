@@ -1612,8 +1612,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       updateClientJson();
     }
     function buildClientConfig(){
-      const wantsGlobalProxy=globalProxy.checked;
-      const wantsRedir=redirEnable.checked||wantsGlobalProxy;
+      const wantsRedir=redirEnable.checked;
+      const wantsGlobalProxy=wantsRedir&&globalProxy.checked;
       const wantsDns=dnsEnable.checked||wantsGlobalProxy;
       const effectiveDnsInterceptMode=wantsGlobalProxy&&!isWindowsService()&&dnsInterceptMode.value==='off'?'firewall':dnsInterceptMode.value;
       let locals=[
@@ -1635,7 +1635,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       routeRules.dns_cache_ttl_seconds=num(dnsCacheTtl.value,604800);
       routeRules.dns_cache_refresh_enabled=dnsCacheRefreshEnabled.checked;
       routeRules.dns_cache_refresh_batch_size=num(dnsCacheRefreshBatch.value,500);
-      routeRules.global_proxy=globalProxy.checked;
+      routeRules.global_proxy=wantsGlobalProxy;
       routeRules.dns_intercept_mode=windowsTun?'tun':(wantsRedir?(isWindowsService()&&effectiveDnsInterceptMode==='firewall'?'tun':effectiveDnsInterceptMode):'off');
       routeRules.dns_ipv4_only=(dnsIpv4Only.value!=='false');
       let domesticDns=readDns('dnsDomesticList');
