@@ -1586,7 +1586,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       setSelect('socksBind',socks.local_address||'127.0.0.1'); socksPort.value=socks.local_port||1080;
       setSelect('httpBind',http.local_address||'127.0.0.1'); httpPort.value=http.local_port||1081;
       globalProxy.checked=!!routeRules.global_proxy;
-      redirEnable.checked=!!(redir.protocol||tun.protocol)||globalProxy.checked;
+      redirEnable.checked=!!(redir.protocol||tun.protocol);
       setSelect('redirBind',redir.local_address||'0.0.0.0'); redirPort.value=redir.local_port||12345;
       setSelect('redirMode',redir.mode||tun.mode||'tcp_and_udp'); setSelect('tcpRedir',redir.tcp_redir||'redirect'); setSelect('udpRedir',redir.udp_redir||'tproxy');
       tunName.value=tun.tun_interface_name||'shadowsocks-tun';
@@ -1612,27 +1612,22 @@ const INDEX_HTML: &str = r#"<!doctype html>
       updateClientJson();
     }
     function buildClientConfig(){
-      if(globalProxy.checked){
-        redirEnable.checked=true;
-        dnsEnable.checked=true;
-        if(!isWindowsService()&&dnsInterceptMode.value==='off')setSelect('dnsInterceptMode','firewall');
-      }
+      const wantsGlobalProxy=globalProxy.checked;
+      const wantsRedir=redirEnable.checked||wantsGlobalProxy;
+      const wantsDns=dnsEnable.checked||wantsGlobalProxy;
+      const effectiveDnsInterceptMode=wantsGlobalProxy&&!isWindowsService()&&dnsInterceptMode.value==='off'?'firewall':dnsInterceptMode.value;
       let locals=[
         {local_address:socksBind.value,local_port:num(socksPort.value,1080),protocol:'socks'},
         {local_address:httpBind.value,local_port:num(httpPort.value,1081),protocol:'http'}
       ];
-      if(redirEnable.checked){
+      if(wantsRedir){
         if(isWindowsService()){
           locals.push({protocol:'tun',mode:redirMode.value,tun_interface_name:tunName.value.trim()||'shadowsocks-tun',tun_interface_address:tunAddress.value.trim()||'10.255.0.1/24',tun_interface_destination:tunDestination.value.trim()||'10.255.0.2/24'});
-          dnsEnable.checked=true;
-          dnsBind.value='0.0.0.0';
-          dnsPort.value=53;
-          setSelect('dnsInterceptMode','tun');
         }else{
           locals.push({local_address:redirBind.value,local_port:num(redirPort.value,12345),protocol:'redir',mode:redirMode.value,tcp_redir:tcpRedir.value,udp_redir:udpRedir.value});
         }
       }
-      const windowsTun=redirEnable.checked&&isWindowsService();
+      const windowsTun=wantsRedir&&isWindowsService();
       let routeRules=Object.assign({},currentRawConfig.route_rules||{});
       if(!Array.isArray(routeRules.geoip_sources)||!routeRules.geoip_sources.length)routeRules.geoip_sources=defaultGeoipSources.slice();
       if(!Array.isArray(routeRules.proxy_domain_sources)||!routeRules.proxy_domain_sources.length)routeRules.proxy_domain_sources=defaultProxyDomainSources.slice();
@@ -1641,13 +1636,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       routeRules.dns_cache_refresh_enabled=dnsCacheRefreshEnabled.checked;
       routeRules.dns_cache_refresh_batch_size=num(dnsCacheRefreshBatch.value,500);
       routeRules.global_proxy=globalProxy.checked;
-      routeRules.dns_intercept_mode=windowsTun?'tun':(redirEnable.checked?(isWindowsService()&&dnsInterceptMode.value==='firewall'?'tun':dnsInterceptMode.value):'off');
+      routeRules.dns_intercept_mode=windowsTun?'tun':(wantsRedir?(isWindowsService()&&effectiveDnsInterceptMode==='firewall'?'tun':effectiveDnsInterceptMode):'off');
       routeRules.dns_ipv4_only=(dnsIpv4Only.value!=='false');
       let domesticDns=readDns('dnsDomesticList');
       let foreignDns=readDns('dnsForeignList');
       let domesticEntry=domesticDns.length?domesticDns[0]:'223.5.5.5:53';
       let foreignEntry=foreignDns.length?foreignDns[0]:'8.8.8.8:53';
-      if(dnsEnable.checked){
+      if(wantsDns){
         let domestic=parseHostPort(domesticEntry,'223.5.5.5',53);
         let foreign=parseHostPort(foreignEntry,'8.8.8.8',53);
         const dnsPortValue=windowsTun?53:num(dnsPort.value,1053);
