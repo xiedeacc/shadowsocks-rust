@@ -5,7 +5,7 @@ use std::{
     convert::Infallible,
     fs, io,
     net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     process::{Command, Stdio},
     sync::{
@@ -655,14 +655,19 @@ fn restart_service_after_response() {
             log::warn!("failed to restart ssservice after config save: {}", err);
         }
         #[cfg(not(windows))]
-        if let Err(err) = Command::new("systemctl")
-            .args(["restart", "shadowsocks-client.service"])
-            .status()
         {
-            log::warn!(
-                "failed to restart shadowsocks-client.service after config save: {}",
-                err
-            );
+            let openwrt_init = Path::new("/etc/init.d/shadowsocks-rust");
+            let restart = if openwrt_init.exists() {
+                Command::new(openwrt_init).arg("restart").status()
+            } else {
+                Command::new("systemctl")
+                    .args(["restart", "shadowsocks-client.service"])
+                    .status()
+            };
+
+            if let Err(err) = restart {
+                log::warn!("failed to restart shadowsocks service after config save: {}", err);
+            }
         }
     });
 }
@@ -1257,6 +1262,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     textarea{min-height:96px;font-family:ui-monospace,monospace}
     button{margin:6px 4px 6px 0;padding:8px 12px;border:0;border-radius:7px;background:var(--brand);color:#fff;font-weight:600;cursor:pointer}
     button:hover{background:var(--brand2)}
+    button:disabled{background:#b8c5d1;color:#f7fafc;cursor:not-allowed}
+    button:disabled:hover{background:#b8c5d1}
     table{border-collapse:collapse;width:100%;margin-top:10px}
     th,td{border:1px solid var(--line);padding:7px;text-align:left;vertical-align:top;background:var(--panel)}
     th{background:var(--soft);color:var(--brand2)}
@@ -1278,9 +1285,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .tab{display:none;height:calc(100vh - 88px);min-height:0;overflow:hidden}.tab.active{display:block}
     #basic.tab.active,#connections.tab.active,#routeConfig.tab.active,#sys.tab.active{display:flex;flex-direction:column}
     .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
-    .activity-toolbar{display:flex;align-items:center;margin:0 0 8px}
+    .activity-toolbar{display:flex;align-items:center;gap:10px;margin:0 0 8px}
+    .activity-toolbar button{margin:0}
+    .activity-toolbar .hint{margin-left:auto}
     .activity-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:16px;align-items:stretch;flex:1;min-height:0}
     .activity-card{min-width:0;min-height:0;display:flex;flex-direction:column}
+    .activity-card-head{display:flex;align-items:center;gap:10px;margin:8px 0 5px}
+    .activity-card-head .card-title{margin:0}
     .connections-layout{height:100%;min-height:0;flex:1;overflow:hidden;display:flex;flex-direction:column;gap:2px}
     .connections-layout .activity-toolbar{margin:0;flex:0 0 auto}
     .connections-layout .activity-grid{flex:0 0 clamp(360px,58vh,600px);grid-template-rows:minmax(0,1fr);min-height:360px}
@@ -1411,9 +1422,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       </div>
     </div>
     <div class="basic-actions">
-      <button onclick="loadClientConfig()">Reload</button>
-      <button onclick="saveClientConfig()">Save</button>
-      <button onclick="restartService()">Restart</button>
+      <button id="reloadButton" onclick="loadClientConfig()">Reload</button>
+      <button id="saveButton" onclick="saveClientConfig()">Save</button>
+      <button id="restartButton" onclick="restartService()">Restart</button>
     </div>
   </section>
 
@@ -1421,10 +1432,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <div class="connections-layout">
       <div class="activity-toolbar">
         <label class="inline-check"><input id="activityRecord" type="checkbox" onchange="toggleActivityRecord(this.checked)"> Record <span id="activityRecordCountdown" class="record-countdown"></span></label>
+        <button id="activityPause" type="button" onclick="toggleActivityPause()">Pause</button>
+        <span id="activityPauseState" class="hint"></span>
       </div>
       <div class="activity-grid">
         <div class="activity-card">
-          <h3 class="card-title">Recent DNS</h3>
+          <div class="activity-card-head">
+            <h3 class="card-title">Recent DNS</h3>
+            <label class="inline-check"><input id="dnsShowAaaa" type="checkbox" onchange="renderDnsTable()"> Show AAAA</label>
+          </div>
           <div id="dnsOut" class="scroll-panel section-scroll"></div>
         </div>
         <div class="activity-card">
@@ -1536,7 +1552,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function api(path,opt={}){opt.headers=Object.assign({'x-admin-token':token()},opt.headers||{});let r=await fetch(path,opt);let j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}
     async function platform(){if(!servicePlatform)servicePlatform=await api('/api/sys/platform');return servicePlatform}
     function isWindowsService(){return servicePlatform&&servicePlatform.target_os==='windows'}
-    let activeTab='basic', activityTimer=null;
+    let activeTab='basic', activityTimer=null, activityPaused=false, recentDnsRows=[], restartInProgress=false;
     function updateNavIndicator(){
       let active=document.querySelector('nav button.active'), indicator=document.querySelector('.nav-indicator'), tabs=document.querySelector('.nav-tabs');
       if(!active||!indicator||!tabs)return;
@@ -1551,7 +1567,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===id));
       updateNavIndicator();
       refresh(id);
-      if(id==='connections')activityTimer=setInterval(()=>refresh('connections').catch(e=>{console.warn(e)}),1000);
+      if(id==='connections')activityTimer=setInterval(()=>{if(!activityPaused)refresh('connections').catch(e=>{console.warn(e)})},1000);
       if(id==='routeConfig')activityTimer=setInterval(()=>renderRouteConflicts().catch(e=>{console.warn(e)}),3000);
     }
     function lines(v){return (v||'').split('\n').map(s=>s.trim()).filter(Boolean)}
@@ -1656,8 +1672,36 @@ const INDEX_HTML: &str = r#"<!doctype html>
       currentRawConfig.route_rules=currentRawConfig.route_rules||{};
       renderBasic();
     }
-    async function saveClientConfig(){updateClientJson(); await api('/api/client-config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:clientConfig.value})}); configPath.textContent=currentConfigPath+' saved, restarting service...'}
-    async function restartService(){await api('/api/restart',{method:'POST'}); configPath.textContent='restarting service...'}
+    function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms))}
+    function setRestartControls(running){restartInProgress=running;restartButton.disabled=running;saveButton.disabled=running;reloadButton.disabled=running;restartButton.textContent=running?'Restarting...':'Restart'}
+    async function waitForAdminReady(timeoutMs=45000){
+      let deadline=Date.now()+timeoutMs,lastError=null;
+      await sleep(900);
+      while(Date.now()<deadline){
+        try{
+          await api('/api/sys/platform?restart_probe='+Date.now(),{cache:'no-store'});
+          return true;
+        }catch(e){
+          lastError=e;
+          await sleep(1000);
+        }
+      }
+      throw lastError||new Error('admin did not respond after restart');
+    }
+    async function waitForRestartComplete(doneText){
+      try{
+        await waitForAdminReady();
+        servicePlatform=null;
+        await loadClientConfig();
+        configPath.textContent=doneText;
+      }catch(e){
+        configPath.textContent='restart status unknown: '+e.message;
+      }finally{
+        setRestartControls(false);
+      }
+    }
+    async function saveClientConfig(){if(restartInProgress)return;updateClientJson();setRestartControls(true);configPath.textContent='saving config...';try{await api('/api/client-config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:clientConfig.value})})}catch(e){configPath.textContent='save failed: '+e.message;setRestartControls(false);return}configPath.textContent='saved, restarting service...';await waitForRestartComplete(currentConfigPath+' saved and service restarted')}
+    async function restartService(){if(restartInProgress)return;setRestartControls(true);configPath.textContent='restarting service...';try{await api('/api/restart',{method:'POST'})}catch(e){console.warn(e)}await waitForRestartComplete('service restarted')}
     ['socksBind','socksPort','httpBind','httpPort','redirEnable','redirBind','redirPort','redirMode','tcpRedir','udpRedir','tunName','tunAddress','tunDestination','dnsEnable','dnsBind','dnsPort','dnsCacheCapacity','dnsCacheTtl','dnsCacheRefreshEnabled','dnsCacheRefreshBatch','dnsInterceptMode','serverHost','serverPort','method','serverSecret','timeout','plugin','pluginOpts'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
 
     async function loadRules(){
@@ -1717,10 +1761,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       document.getElementById(id).innerHTML=table(rows,cols,'conflict-table')
     }
     function fmtCountdown(seconds){let s=Math.max(0,Number(seconds)||0),m=Math.floor(s/60),r=s%60;return m+':'+String(r).padStart(2,'0')}
-    async function syncActivityRecordStatus(){let s=await api('/api/activity/record/status');activityRecord.checked=!!s.recording;activityRecordCountdown.textContent=s.recording?fmtCountdown(s.remaining_seconds):'';if(!s.recording){dnsOut.innerHTML='';connOut.innerHTML=''}return s}
+    function updateActivityPauseButton(){activityPause.textContent=activityPaused?'Resume':'Pause';activityPause.setAttribute('aria-pressed',activityPaused?'true':'false');activityPauseState.textContent=activityPaused?'Paused':''}
+    async function toggleActivityPause(){activityPaused=!activityPaused;updateActivityPauseButton();if(!activityPaused&&activeTab==='connections')await refresh('connections')}
+    async function syncActivityRecordStatus(){let s=await api('/api/activity/record/status');activityRecord.checked=!!s.recording;activityRecordCountdown.textContent=s.recording?fmtCountdown(s.remaining_seconds):'';if(!s.recording&&!activityPaused){dnsOut.innerHTML='';connOut.innerHTML=''}return s}
     async function toggleActivityRecord(checked){await api(checked?'/api/activity/record/start':'/api/activity/record/stop',{method:'POST'});let s=await syncActivityRecordStatus();if(s.recording)refresh('connections')}
     async function renderConnections(){let rows=await api('/api/activity/connections');connOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Source',r=>r.source_ip+':'+r.source_port],['Destination',r=>(r.destination_ip||r.destination_domain)+':'+r.destination_port],['Domain',r=>r.domain||'-'],['Protocol',r=>r.protocol],['Decision',r=>r.decision]],'copyable-table')}
-    async function renderDns(){let rows=await api('/api/activity/dns');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>r.error?('Error: '+r.error):(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']],'copyable-table')}
+    function renderDnsTable(){let rows=recentDnsRows;if(!dnsShowAaaa.checked)rows=rows.filter(r=>r.query_type!=='AAAA');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>r.error?('Error: '+r.error):(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']],'copyable-table')}
+    async function renderDns(){recentDnsRows=await api('/api/activity/dns');renderDnsTable()}
     async function renderRouteConflicts(){await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip')}
     function nftCountsHtml(s){let c=s.nft_set_counts||{};if(!c.checked)return '';if(c.error)return `<p><strong>nft set entries:</strong> <span class="status-warn">unavailable</span> <span class="hint">${esc(c.error)}</span></p>`;let rows=[{set:'direct4',entries:c.direct4},{set:'direct6',entries:c.direct6},{set:'proxy4',entries:c.proxy4},{set:'proxy6',entries:c.proxy6}];return `<p><strong>nft set entries:</strong> ${c.total??0} total, ${c.proxy_total??0} proxy, ${c.direct_total??0} direct</p>`+table(rows,[['Set',r=>r.set],['Entries',r=>r.entries??0]])}
     async function renderSys(){let s=await api('/api/sys/status');let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p>${nftCountsHtml(s)}<p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body+`<h3 class="card-title">direct_ip.txt / proxy_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / proxy_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
@@ -1730,7 +1777,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function queryDnsCacheIp(){let ip=dnsQueryIp.value.trim();if(!ip){dnsCacheOut.innerHTML='<p class="hint">Enter an IP</p>';return}let rows=await api('/api/dns/cache/query-ip?ip='+encodeURIComponent(ip));dnsCacheOut.innerHTML=table(rows,[['IP',r=>r.ip],['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Expires',r=>fmtTime(r.expires_at)]])}
     async function clearDnsDomain(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheMessage.textContent='Enter a domain first';return}let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({domain})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';await queryDnsCache()}
     async function clearDnsAll(){let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';dnsCacheOut.innerHTML=''}
-    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='routeConfig')await reloadRouteTab();if(id==='sys')await renderSys();if(id==='connections'){let s=await syncActivityRecordStatus();if(s.recording){await renderDns();await renderConnections()}}}catch(e){alert(e.message)}}
+    async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='routeConfig')await reloadRouteTab();if(id==='sys')await renderSys();if(id==='connections'){updateActivityPauseButton();if(activityPaused)return;let s=await syncActivityRecordStatus();if(s.recording){await renderDns();await renderConnections()}}}catch(e){alert(e.message)}}
     document.querySelector("nav button[data-tab=\"basic\"]").classList.add('active');
     window.addEventListener('resize',updateNavIndicator);
     requestAnimationFrame(updateNavIndicator);

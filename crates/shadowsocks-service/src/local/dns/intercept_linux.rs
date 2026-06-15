@@ -11,6 +11,7 @@ use std::{
     net::IpAddr,
     path::Path,
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use ipnet::IpNet;
@@ -145,6 +146,48 @@ pub fn add_route_ips(decision: RouteDecision, ips: &[IpAddr]) -> io::Result<()> 
     // so map the failure to Ok — same semantics as the per-IP loop.
     let _ = nft_apply_script(&script);
     Ok(())
+}
+
+/// Logged at most once so a router without `conntrack-tools` doesn't spam.
+static CONNTRACK_MISSING_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Best-effort: drop conntrack entries whose original-direction destination is
+/// one of `ips`, forcing the next packet of each such flow to be re-evaluated
+/// by the prerouting redirect/tproxy rules. Without this, a connection
+/// established *before* its destination IP entered the proxy set stays pinned
+/// to its original (direct) verdict in conntrack and never switches to redir
+/// until the application reconnects.
+///
+/// Uses the `conntrack` CLI (one `-D -d <ip>` per IP). Returning non-zero
+/// (e.g. "0 flow entries deleted") is expected and ignored. If the binary is
+/// not installed we log once and skip — on OpenWrt: `opkg install conntrack-tools`.
+pub fn flush_conntrack_dst(ips: &[IpAddr]) {
+    if ips.is_empty() || CONNTRACK_MISSING_WARNED.load(Ordering::Relaxed) {
+        return;
+    }
+    for ip in ips {
+        let ip_str = ip.to_string();
+        match Command::new("conntrack")
+            .args(["-D", "-d", &ip_str])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if !CONNTRACK_MISSING_WARNED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        "conntrack binary not found; cannot re-evaluate established flows after \
+                         proxy-set changes (install conntrack-tools). Newly opened connections are \
+                         unaffected."
+                    );
+                }
+                return;
+            }
+            Err(err) => warn!("failed to flush conntrack for {}: {}", ip_str, err),
+        }
+    }
 }
 
 /// Group IPs by the nft set they belong to, returning one bucket per

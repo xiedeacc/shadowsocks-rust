@@ -20,7 +20,7 @@ use log::warn;
 use serde::{Deserialize, Serialize};
 use shadowsocks::relay::socks5::Address;
 use tokio::{
-    sync::{RwLock as TokioRwLock, mpsc, oneshot},
+    sync::{Notify, RwLock as TokioRwLock, mpsc, oneshot},
     time,
 };
 
@@ -528,6 +528,11 @@ pub struct RoutingState {
     /// `/api/dns` so the web admin can hot-reload upstreams without
     /// editing the config file.
     dns_runtime: Arc<TokioRwLock<DnsRuntimeState>>,
+    /// Notified whenever the temporary proxy domain list changes so the DNS
+    /// server can (re-)resolve those domains and pre-seed the nft proxy set,
+    /// instead of waiting for a client to query them through us. See
+    /// [`RoutingState::proxy_warmup_notify`].
+    proxy_warmup_notify: Arc<Notify>,
 }
 
 fn spawn_record_worker(
@@ -741,6 +746,7 @@ impl RoutingState {
             record_tx,
             dns_ipv4_only_flag: Arc::new(std::sync::atomic::AtomicBool::new(v4_only)),
             dns_runtime: Arc::new(TokioRwLock::new(DnsRuntimeState::default())),
+            proxy_warmup_notify: Arc::new(Notify::new()),
         };
         state.spawn_periodic_source_update();
         state.spawn_periodic_temporary_reload();
@@ -859,6 +865,20 @@ impl RoutingState {
         }
     }
 
+    /// Handle for the DNS server to wait on temporary-proxy-domain changes.
+    /// Each `notified()` wake means the temporary proxy domain list may have
+    /// changed and should be (re-)resolved to warm the nft proxy set.
+    pub fn proxy_warmup_notify(&self) -> Arc<Notify> {
+        self.proxy_warmup_notify.clone()
+    }
+
+    /// Snapshot of the current temporary proxy *domain* rules. These cannot be
+    /// pre-loaded into nft directly (the set holds IPs, not names), so the DNS
+    /// server resolves them and injects the answers via `add_dns_results`.
+    pub async fn temporary_proxy_domains(&self) -> Vec<String> {
+        self.inner.read().await.temporary_raw.proxy_domain.clone()
+    }
+
     pub async fn set_sources(&self, sources: RoutingSources) {
         let mut inner = self.inner.write().await;
         inner.sources = sanitize_sources(sources);
@@ -889,6 +909,9 @@ impl RoutingState {
                 warn!("failed to refresh nft proxy set after temporary rule change: {}", err);
             }
         }
+        // Newly added proxy domains have no IP in nft yet — ask the DNS server
+        // to resolve them and pre-seed the proxy set proactively.
+        self.proxy_warmup_notify.notify_one();
         Ok(())
     }
 
@@ -922,6 +945,7 @@ impl RoutingState {
                 warn!("failed to refresh nft proxy set after temporary rule reload: {}", err);
             }
         }
+        self.proxy_warmup_notify.notify_one();
         Ok(temporary)
     }
 
@@ -1046,14 +1070,22 @@ impl RoutingState {
             let nft_start = Instant::now();
             let additions_for_nft = nft_ips.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<(), io::Error> {
-                match decision {
+                let res = match decision {
                     RouteDecision::Direct => {
                         crate::local::dns::intercept_linux::remove_route_ips(RouteDecision::Proxy, &additions_for_nft)
                     }
                     RouteDecision::Proxy => {
                         crate::local::dns::intercept_linux::add_route_ips(decision, &additions_for_nft)
                     }
-                }
+                };
+                // The nft set membership for these IPs just changed. Any flow
+                // already pinned in conntrack (established before the change)
+                // keeps its old prerouting verdict, so a connection that went
+                // direct before the IP entered proxy4 would stay direct. Drop
+                // those conntrack entries so the next packet is re-evaluated
+                // against the updated sets.
+                crate::local::dns::intercept_linux::flush_conntrack_dst(&additions_for_nft);
+                res
             })
             .await
             .unwrap_or_else(|join_err| Err(io::Error::other(format!("nft join error: {join_err}"))));

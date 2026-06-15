@@ -138,6 +138,8 @@ impl DnsBuilder {
         let remote_addr = Arc::new(self.remote_addr);
         #[cfg(feature = "local-web-admin")]
         client.spawn_proxy_dns_cache_refresh(remote_addr.clone());
+        #[cfg(feature = "local-web-admin")]
+        client.spawn_proxy_domain_warmup(remote_addr.clone());
 
         let mut tcp_server = None;
         if self.mode.enable_tcp() {
@@ -885,6 +887,69 @@ impl DnsClient {
                     "failed to refresh proxy dns cache for {} {}: {}",
                     candidate.domain, candidate.query_type, err
                 ),
+            }
+        }
+    }
+
+    /// Resolve every temporary proxy *domain* once at startup (and again every
+    /// time the temporary rule set changes) and inject the answers into the
+    /// nft proxy set, so the IPs are routed through the tunnel before any
+    /// client connects — even if the client resolved the name elsewhere or
+    /// from its own cache. Bounded by the temporary list size (a handful of
+    /// user-curated entries), unlike the full persistent proxy-domain file.
+    ///
+    /// Suffix rules (e.g. `futunn.com`) only resolve the literal name here;
+    /// their subdomains are still learned on demand and persisted to
+    /// `proxy_ip.txt`, which the startup nft sync already reloads.
+    #[cfg(feature = "local-web-admin")]
+    fn spawn_proxy_domain_warmup(self: &Arc<Self>, remote_addr: Arc<Address>) {
+        let client = self.clone();
+        tokio::spawn(async move {
+            let Some(routing_state) = client.context.routing_state() else {
+                return;
+            };
+            let notify = routing_state.proxy_warmup_notify();
+            // Let the listeners and balancer settle before the first pass.
+            time::sleep(Duration::from_secs(2)).await;
+            loop {
+                client.warm_proxy_domains(&remote_addr).await;
+                notify.notified().await;
+            }
+        });
+    }
+
+    #[cfg(feature = "local-web-admin")]
+    async fn warm_proxy_domains(&self, remote_addr: &Address) {
+        let Some(routing_state) = self.context.routing_state() else {
+            return;
+        };
+        let domains = routing_state.temporary_proxy_domains().await;
+        if domains.is_empty() {
+            return;
+        }
+        debug!("warming {} temporary proxy domain(s) into nft proxy set", domains.len());
+        for domain in domains {
+            let query = match dns_cache_refresh_query(&domain, "A") {
+                Ok(query) => query,
+                Err(err) => {
+                    warn!("failed to build proxy warmup query for {}: {}", domain, err);
+                    continue;
+                }
+            };
+            match self.lookup_remote(&query, remote_addr).await {
+                Ok(msg) => {
+                    let ips = collect_answer_ips(&msg);
+                    if ips.is_empty() {
+                        continue;
+                    }
+                    routing_state
+                        .dns_cache_insert(&domain, "A", RouteDecision::Proxy, msg, ips.clone())
+                        .await;
+                    let _ = routing_state
+                        .add_dns_results(RouteDecision::Proxy, &domain, &ips)
+                        .await;
+                }
+                Err(err) => debug!("proxy warmup resolve failed for {}: {}", domain, err),
             }
         }
     }
