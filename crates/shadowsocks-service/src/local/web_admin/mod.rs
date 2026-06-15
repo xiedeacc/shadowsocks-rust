@@ -656,8 +656,11 @@ fn restart_service_after_response() {
         }
         #[cfg(not(windows))]
         {
-            let openwrt_init = Path::new("/etc/init.d/shadowsocks-rust");
-            let restart = if openwrt_init.exists() {
+            let openwrt_init = ["/etc/init.d/shadowsocks", "/etc/init.d/shadowsocks-rust"]
+                .iter()
+                .map(Path::new)
+                .find(|path| path.exists());
+            let restart = if let Some(openwrt_init) = openwrt_init {
                 Command::new(openwrt_init).arg("restart").status()
             } else {
                 Command::new("systemctl")
