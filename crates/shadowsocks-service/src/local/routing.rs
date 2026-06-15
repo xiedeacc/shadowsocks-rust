@@ -994,7 +994,9 @@ impl RoutingState {
             for ip in results {
                 match decision {
                     RouteDecision::Direct => {
-                        nft_ips.push(*ip);
+                        if !global_proxy || is_fixed_direct_ip(ip) {
+                            nft_ips.push(*ip);
+                        }
                     }
                     RouteDecision::Proxy => {
                         let target_exists =
@@ -2214,6 +2216,14 @@ impl RoutingState {
 }
 
 fn route_ip_inner(inner: &mut RoutingInner, ip: &IpAddr) -> Option<RouteDecision> {
+    if inner.sources.global_proxy {
+        return Some(if is_fixed_direct_ip(ip) {
+            RouteDecision::Direct
+        } else {
+            RouteDecision::Proxy
+        });
+    }
+
     let temp_direct = compiled_rules_match_ip(&inner.temporary.direct_ip_exact, &inner.temporary.direct_ip, ip);
     let temp_proxy = compiled_rules_match_ip(&inner.temporary.proxy_ip_exact, &inner.temporary.proxy_ip, ip);
     if temp_direct && temp_proxy {
@@ -2235,8 +2245,6 @@ fn route_ip_inner(inner: &mut RoutingInner, ip: &IpAddr) -> Option<RouteDecision
         Some(RouteDecision::Direct)
     } else if proxy {
         Some(RouteDecision::Proxy)
-    } else if inner.sources.global_proxy && !is_fixed_direct_ip(ip) {
-        Some(RouteDecision::Proxy)
     } else {
         None
     }
@@ -2244,6 +2252,10 @@ fn route_ip_inner(inner: &mut RoutingInner, ip: &IpAddr) -> Option<RouteDecision
 
 fn route_domain_inner(inner: &mut RoutingInner, domain: &str) -> Option<RouteDecision> {
     let domain = normalize_domain(domain);
+    if inner.sources.global_proxy {
+        return Some(RouteDecision::Proxy);
+    }
+
     let temp_direct = rules_match_domain(&inner.temporary.direct_domain, &domain);
     let temp_proxy = rules_match_domain(&inner.temporary.proxy_domain, &domain);
     if temp_direct && temp_proxy {
@@ -2264,8 +2276,6 @@ fn route_domain_inner(inner: &mut RoutingInner, domain: &str) -> Option<RouteDec
     if direct {
         Some(RouteDecision::Direct)
     } else if proxy {
-        Some(RouteDecision::Proxy)
-    } else if inner.sources.global_proxy {
         Some(RouteDecision::Proxy)
     } else {
         None
@@ -3072,8 +3082,14 @@ fn validate_temporary_rules(lists: &RuleLists) -> io::Result<()> {
 
 #[cfg(all(target_os = "linux", feature = "local-dns"))]
 fn persistent_nft_route_nets(inner: &RoutingInner) -> (PathBuf, Vec<IpNet>, Vec<IpNet>) {
-    let mut direct = inner.persistent.direct_ip.clone();
-    direct.extend(inner.temporary.direct_ip.iter().copied());
+    let mut direct = if inner.sources.global_proxy {
+        fixed_direct_nets()
+    } else {
+        inner.persistent.direct_ip.clone()
+    };
+    if !inner.sources.global_proxy {
+        direct.extend(inner.temporary.direct_ip.iter().copied());
+    }
     let mut proxy = inner.persistent.proxy_ip.clone();
     proxy.extend(inner.temporary.proxy_ip.iter().copied());
     proxy.retain(|net| !direct.iter().any(|direct| ip_nets_overlap(direct, net)));
@@ -3087,19 +3103,27 @@ fn dns_proxy_ip_blocked_from_nft_by_direct_rule(inner: &RoutingInner, ip: &IpAdd
 
 #[cfg(all(target_os = "linux", feature = "local-dns"))]
 fn temporary_nft_route_nets(inner: &RoutingInner, rules: &RuleLists) -> (PathBuf, Vec<IpNet>, Vec<IpNet>) {
-    let temporary_direct = rules
-        .direct_ip
-        .iter()
-        .filter_map(|rule| parse_ip_net(rule))
-        .collect::<Vec<_>>();
-
-    let mut direct = inner.persistent.direct_ip.clone();
-    direct.extend(temporary_direct);
+    let mut direct = if inner.sources.global_proxy {
+        fixed_direct_nets()
+    } else {
+        inner.persistent.direct_ip.clone()
+    };
+    if !inner.sources.global_proxy {
+        direct.extend(rules.direct_ip.iter().filter_map(|rule| parse_ip_net(rule)));
+    }
     let mut proxy = inner.persistent.proxy_ip.clone();
     proxy.extend(rules.proxy_ip.iter().filter_map(|rule| parse_ip_net(rule)));
     proxy.retain(|net| !direct.iter().any(|direct| ip_nets_overlap(direct, net)));
 
     (inner.rules_dir.clone(), direct, proxy)
+}
+
+#[cfg(all(target_os = "linux", feature = "local-dns"))]
+fn fixed_direct_nets() -> Vec<IpNet> {
+    PRIVATE_DIRECT_IP_RULES
+        .iter()
+        .filter_map(|rule| parse_ip_net(rule))
+        .collect()
 }
 
 fn normalize_lines(lines: Vec<String>) -> Vec<String> {
@@ -3830,7 +3854,7 @@ mod tests {
         assert_eq!(state.route_domain("unknown.example").await, Some(RouteDecision::Proxy));
         assert_eq!(
             state.route_ip(&"1.1.1.1".parse().unwrap()).await,
-            Some(RouteDecision::Direct)
+            Some(RouteDecision::Proxy)
         );
         assert_eq!(
             state.route_ip(&"192.168.1.1".parse().unwrap()).await,
@@ -3838,7 +3862,7 @@ mod tests {
         );
         assert_eq!(
             state.route_domain("direct.example").await,
-            Some(RouteDecision::Direct)
+            Some(RouteDecision::Proxy)
         );
     }
 
