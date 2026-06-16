@@ -113,6 +113,10 @@ pub struct RoutingSources {
     pub proxy_domain_sources: Vec<String>,
     #[serde(default)]
     pub global_proxy: bool,
+    #[serde(default)]
+    pub client_global_proxy_ips: Vec<IpAddr>,
+    #[serde(default)]
+    pub client_direct_ips: Vec<IpAddr>,
     #[serde(default = "default_dns_cache_capacity")]
     pub dns_cache_capacity: usize,
     #[serde(default = "default_dns_cache_ttl_seconds")]
@@ -176,6 +180,8 @@ impl From<&RouteRulesConfig> for RoutingSources {
             geoip_sources: config.geoip_sources.clone(),
             proxy_domain_sources: config.proxy_domain_sources.clone(),
             global_proxy: config.global_proxy,
+            client_global_proxy_ips: config.client_global_proxy_ips.clone(),
+            client_direct_ips: config.client_direct_ips.clone(),
             dns_cache_capacity: config.dns_cache_capacity,
             dns_cache_ttl_seconds: config.dns_cache_ttl_seconds,
             dns_cache_refresh_enabled: config.dns_cache_refresh_enabled,
@@ -241,6 +247,7 @@ type FlowKey = (IpAddr, u16, IpAddr, u16, &'static str);
 #[derive(Clone, Debug, Serialize)]
 pub struct DnsEvent {
     pub timestamp: u64,
+    pub source_ip: Option<IpAddr>,
     pub domain: String,
     pub query_type: String,
     pub results: Vec<IpAddr>,
@@ -295,6 +302,7 @@ struct RecordConnectionEvent {
 #[derive(Debug)]
 struct RecordDnsEvent {
     session_id: u64,
+    source_ip: Option<IpAddr>,
     domain: String,
     query_type: String,
     results: Vec<IpAddr>,
@@ -644,6 +652,7 @@ fn spawn_record_worker(
                         &mut inner.dns,
                         DnsEvent {
                             timestamp: now(),
+                            source_ip: event.source_ip,
                             domain: normalized_domain,
                             query_type: event.query_type,
                             results: event.results,
@@ -918,6 +927,54 @@ impl RoutingState {
         // to resolve them and pre-seed the proxy set proactively.
         self.proxy_warmup_notify.notify_one();
         Ok(())
+    }
+
+    pub async fn add_temporary_proxy_target(&self, target: &Address) -> io::Result<bool> {
+        let Address::SocketAddress(socket_addr) = target else {
+            return Ok(false);
+        };
+        self.add_temporary_proxy_ip(socket_addr.ip()).await
+    }
+
+    pub async fn add_temporary_proxy_ip(&self, ip: IpAddr) -> io::Result<bool> {
+        if is_fixed_direct_ip(&ip) {
+            return Ok(false);
+        }
+
+        {
+            let mut inner = self.inner.write().await;
+            if inner
+                .temporary_raw
+                .proxy_ip
+                .iter()
+                .any(|rule| proxy_ip_line_matches_ip(rule, &ip))
+            {
+                return Ok(false);
+            }
+            let mut rules = inner.temporary_raw.clone();
+            rules.proxy_ip.push(ip.to_string());
+            let rules = with_private_direct_rules(normalize_rule_lists(rules));
+            validate_temporary_rules(&rules)?;
+            write_temporary_rule_lists(&inner.rules_dir, &rules)?;
+            inner.temporary_fingerprint = temporary_files_fingerprint(&inner.rules_dir)?;
+            inner.temporary_raw = rules;
+            inner.temporary = compile_rules(&inner.temporary_raw)?;
+            rebuild_conflicts(&mut inner);
+        }
+
+        #[cfg(all(target_os = "linux", feature = "local-dns"))]
+        {
+            let (rules_dir, direct_nets, proxy_nets) = {
+                let inner = self.inner.read().await;
+                persistent_nft_route_nets(&inner)
+            };
+            if let Err(err) = crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct_nets, &proxy_nets) {
+                warn!("failed to refresh nft proxy set after learned SOCKS proxy IP: {}", err);
+            }
+            crate::local::dns::intercept_linux::flush_conntrack_dst(&[ip]);
+        }
+
+        Ok(true)
     }
 
     pub async fn save_temporary_rules_to_files(&self, rules: RuleLists) -> io::Result<()> {
@@ -1822,6 +1879,7 @@ impl RoutingState {
 
     pub async fn record_dns(
         &self,
+        source_ip: Option<IpAddr>,
         domain: String,
         query_type: String,
         results: Vec<IpAddr>,
@@ -1839,6 +1897,7 @@ impl RoutingState {
             .record_tx
             .try_send(RecordCommand::Dns(RecordDnsEvent {
                 session_id,
+                source_ip,
                 domain,
                 query_type,
                 results,
@@ -1856,6 +1915,7 @@ impl RoutingState {
 
     pub async fn record_dns_error(
         &self,
+        source_ip: Option<IpAddr>,
         domain: String,
         query_type: String,
         resolver: RouteDecision,
@@ -1873,6 +1933,7 @@ impl RoutingState {
             .record_tx
             .try_send(RecordCommand::Dns(RecordDnsEvent {
                 session_id,
+                source_ip,
                 domain,
                 query_type,
                 results: Vec::new(),
@@ -2111,7 +2172,11 @@ impl RoutingState {
         Ok(())
     }
 
-    pub async fn recent_connections(&self, excluded_remotes: &HashSet<IpAddr>) -> Vec<ConnectionEvent> {
+    pub async fn recent_connections(
+        &self,
+        excluded_remotes: &HashSet<IpAddr>,
+        source_filter: Option<IpAddr>,
+    ) -> Vec<ConnectionEvent> {
         self.stop_expired_activity_recording().await;
         if !self.record_control.recording.load(AtomicOrdering::Relaxed) {
             return Vec::new();
@@ -2121,10 +2186,23 @@ impl RoutingState {
         let flow_decisions = inner.flow_decisions.clone();
         let system_connection_baseline = inner.system_connection_baseline.clone();
         let global_proxy = inner.sources.global_proxy;
+        let client_global_proxy_ips = inner
+            .sources
+            .client_global_proxy_ips
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let client_direct_ips = inner
+            .sources
+            .client_direct_ips
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
         let mut rows = inner
             .connections
             .iter()
             .rev()
+            .filter(|event| source_filter.is_none_or(|ip| event.source_ip == ip))
             .filter(|event| !is_excluded_remote(event, excluded_remotes))
             .cloned()
             .map(|mut event| {
@@ -2140,6 +2218,9 @@ impl RoutingState {
             let mut inner = self.inner.write().await;
             let mut first_seen = HashMap::new();
             for event in &system_connections {
+                if source_filter.is_some_and(|ip| event.source_ip != ip) {
+                    continue;
+                }
                 if is_excluded_remote(event, excluded_remotes) {
                     continue;
                 }
@@ -2159,6 +2240,9 @@ impl RoutingState {
             first_seen
         };
         for mut event in system_connections.drain(..) {
+            if source_filter.is_some_and(|ip| event.source_ip != ip) {
+                continue;
+            }
             if is_excluded_remote(&event, excluded_remotes) {
                 continue;
             }
@@ -2173,7 +2257,11 @@ impl RoutingState {
                 }
                 if let Some(decision) = flow_decisions.get(&key) {
                     event.decision = *decision;
-                } else if global_proxy && system_connection_should_be_redir(&event) {
+                } else if client_direct_ips.contains(&event.source_ip) {
+                    event.decision = ConnectionDecision::Direct;
+                } else if (global_proxy || client_global_proxy_ips.contains(&event.source_ip))
+                    && system_connection_should_be_redir(&event)
+                {
                     event.decision = ConnectionDecision::Redir;
                 }
             }
@@ -2199,13 +2287,19 @@ impl RoutingState {
         append_lines(&path, &lines)
     }
 
-    pub async fn recent_dns(&self) -> Vec<DnsEvent> {
+    pub async fn recent_dns(&self, source_filter: Option<IpAddr>) -> Vec<DnsEvent> {
         self.stop_expired_activity_recording().await;
         if !self.record_control.recording.load(AtomicOrdering::Relaxed) {
             return Vec::new();
         }
         let inner = self.inner.read().await;
-        inner.dns.iter().rev().cloned().collect()
+        inner
+            .dns
+            .iter()
+            .rev()
+            .filter(|event| source_filter.is_none_or(|ip| event.source_ip == Some(ip)))
+            .cloned()
+            .collect()
     }
 
     pub async fn direct_proxy_file_conflicts(&self) -> (Vec<String>, Vec<String>) {
@@ -3327,7 +3421,15 @@ fn temp_file_path(dir: &Path, file_name: &str) -> PathBuf {
 }
 
 fn sanitize_sources(sources: RoutingSources) -> RoutingSources {
+    let mut sources = sources;
+    dedup_ip_list(&mut sources.client_global_proxy_ips);
+    dedup_ip_list(&mut sources.client_direct_ips);
     sources
+}
+
+fn dedup_ip_list(values: &mut Vec<IpAddr>) {
+    let mut seen = HashSet::new();
+    values.retain(|ip| seen.insert(*ip));
 }
 
 fn read_lines(path: impl AsRef<Path>) -> io::Result<Vec<String>> {
@@ -3725,7 +3827,7 @@ mod tests {
         port: u16,
     ) -> ConnectionEvent {
         for _ in 0..50 {
-            if let Some(row) = state.recent_connections(&HashSet::new()).await.into_iter().find(|row| {
+            if let Some(row) = state.recent_connections(&HashSet::new(), None).await.into_iter().find(|row| {
                 row.source_ip == source.ip()
                     && row.source_port == source.port()
                     && row.destination_ip == Some(destination)
@@ -3846,7 +3948,7 @@ mod tests {
         config.proxy_domain_sources.clear();
         let state = RoutingState::load(config).await.unwrap();
 
-        assert!(state.recent_connections(&HashSet::new()).await.is_empty());
+        assert!(state.recent_connections(&HashSet::new(), None).await.is_empty());
         state.start_activity_recording().await.unwrap();
 
         let source = "127.0.0.1:40000".parse::<SocketAddr>().unwrap();
@@ -3860,7 +3962,7 @@ mod tests {
         assert_eq!(row.decision, ConnectionDecision::Direct);
 
         state.stop_activity_recording().await.unwrap();
-        assert!(state.recent_connections(&HashSet::new()).await.is_empty());
+        assert!(state.recent_connections(&HashSet::new(), None).await.is_empty());
     }
 
     #[tokio::test]
@@ -3882,6 +3984,94 @@ mod tests {
 
         let row = wait_for_recorded_connection(&state, source, destination, 443).await;
         assert_eq!(row.decision, ConnectionDecision::Socks5Proxy);
+    }
+
+    #[tokio::test]
+    async fn recent_activity_filters_by_source_ip() {
+        let dir = temp_rules_dir("record-source-filter");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+        state.start_activity_recording().await.unwrap();
+
+        let source_a = "192.168.2.166:40001".parse::<SocketAddr>().unwrap();
+        let source_b = "192.168.2.188:40002".parse::<SocketAddr>().unwrap();
+        let destination_a = "203.0.113.10".parse::<IpAddr>().unwrap();
+        let destination_b = "203.0.113.11".parse::<IpAddr>().unwrap();
+        state
+            .record_connection(
+                source_a,
+                &Address::SocketAddress(SocketAddr::new(destination_a, 443)),
+                "tcp",
+                ConnectionDecision::Socks5Proxy,
+            )
+            .await;
+        state
+            .record_connection(
+                source_b,
+                &Address::SocketAddress(SocketAddr::new(destination_b, 443)),
+                "tcp",
+                ConnectionDecision::Direct,
+            )
+            .await;
+        state
+            .record_dns(
+                Some(source_a.ip()),
+                "api-a.example".to_owned(),
+                "A".to_owned(),
+                vec![destination_a],
+                RouteDecision::Proxy,
+                false,
+            )
+            .await;
+        state
+            .record_dns(
+                Some(source_b.ip()),
+                "api-b.example".to_owned(),
+                "A".to_owned(),
+                vec![destination_b],
+                RouteDecision::Direct,
+                false,
+            )
+            .await;
+
+        let _ = wait_for_recorded_connection(&state, source_a, destination_a, 443).await;
+        let _ = wait_for_recorded_connection(&state, source_b, destination_b, 443).await;
+        for _ in 0..50 {
+            if state.recent_dns(Some(source_a.ip())).await.len() == 1 {
+                break;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let connections = state.recent_connections(&HashSet::new(), Some(source_a.ip())).await;
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].source_ip, source_a.ip());
+
+        let dns = state.recent_dns(Some(source_a.ip())).await;
+        assert_eq!(dns.len(), 1);
+        assert_eq!(dns[0].domain, "api-a.example");
+    }
+
+    #[tokio::test]
+    async fn learned_socks_proxy_ip_is_saved_to_temporary_proxy_list() {
+        let dir = temp_rules_dir("socks-learn-temp-proxy-ip");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+        let ip = "203.0.113.77".parse::<IpAddr>().unwrap();
+
+        assert!(state.add_temporary_proxy_ip(ip).await.unwrap());
+        assert!(!state.add_temporary_proxy_ip(ip).await.unwrap());
+
+        let snapshot = state.snapshot().await;
+        assert!(snapshot.temporary.proxy_ip.iter().any(|rule| rule == "203.0.113.77"));
+        let proxy_temp = read_lines(temp_file_path(&dir, TEMP_PROXY_IP_FILE)).unwrap();
+        assert!(proxy_temp.iter().any(|rule| rule == "203.0.113.77"));
     }
 
     #[tokio::test]

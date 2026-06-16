@@ -506,6 +506,9 @@ struct SSLocalExtConfig {
     #[cfg(feature = "local")]
     #[serde(skip_serializing_if = "Option::is_none")]
     socks5_auth_config_path: Option<String>,
+    #[cfg(feature = "local-web-admin")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_proxy_ip: Option<bool>,
 
     /// HTTP
     #[cfg(feature = "local-http")]
@@ -633,6 +636,10 @@ struct SSRouteRulesConfig {
     proxy_domain_sources: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     global_proxy: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_global_proxy_ips: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_direct_ips: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dns_cache_capacity: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1264,6 +1271,8 @@ pub struct LocalConfig {
     /// SOCKS5 Authentication configuration
     #[cfg(feature = "local")]
     pub socks5_auth: Socks5AuthConfig,
+    #[cfg(feature = "local-web-admin")]
+    pub record_proxy_ip: bool,
 
     /// HTTP Authentication configuration
     #[cfg(feature = "local-http")]
@@ -1340,6 +1349,8 @@ impl LocalConfig {
 
             #[cfg(feature = "local")]
             socks5_auth: Socks5AuthConfig::default(),
+            #[cfg(feature = "local-web-admin")]
+            record_proxy_ip: false,
 
             #[cfg(feature = "local-http")]
             http_auth: HttpAuthConfig::default(),
@@ -1582,6 +1593,8 @@ pub struct RouteRulesConfig {
     pub geoip_sources: Vec<String>,
     pub proxy_domain_sources: Vec<String>,
     pub global_proxy: bool,
+    pub client_global_proxy_ips: Vec<IpAddr>,
+    pub client_direct_ips: Vec<IpAddr>,
     pub dns_cache_capacity: usize,
     pub dns_cache_ttl_seconds: u64,
     pub dns_cache_refresh_enabled: bool,
@@ -1602,6 +1615,8 @@ impl Default for RouteRulesConfig {
             geoip_sources: vec![DEFAULT_GEOIP_SOURCE.to_owned()],
             proxy_domain_sources: DEFAULT_PROXY_DOMAIN_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
             global_proxy: false,
+            client_global_proxy_ips: Vec::new(),
+            client_direct_ips: Vec::new(),
             dns_cache_capacity: 100_000,
             dns_cache_ttl_seconds: 7 * 24 * 60 * 60,
             dns_cache_refresh_enabled: true,
@@ -1610,6 +1625,28 @@ impl Default for RouteRulesConfig {
             dns_ipv4_only: true,
         }
     }
+}
+
+#[cfg(feature = "local-web-admin")]
+fn parse_route_rule_ip_list(field: &'static str, values: Vec<String>) -> Result<Vec<IpAddr>, Error> {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let ip = value.parse::<IpAddr>().map_err(|err| {
+            Error::new(
+                ErrorKind::Invalid,
+                "invalid route_rules client ip",
+                Some(format!("{field}: {value}: {err}")),
+            )
+        })?;
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    Ok(out)
 }
 
 /// Configuration
@@ -2150,6 +2187,11 @@ impl Config {
                         #[cfg(feature = "local")]
                         if let Some(socks5_auth_config_path) = local.socks5_auth_config_path {
                             local_config.socks5_auth = Socks5AuthConfig::load_from_file(&socks5_auth_config_path)?;
+                        }
+
+                        #[cfg(feature = "local-web-admin")]
+                        if let Some(record_proxy_ip) = local.record_proxy_ip {
+                            local_config.record_proxy_ip = record_proxy_ip;
                         }
 
                         #[cfg(feature = "local-http")]
@@ -2798,6 +2840,12 @@ impl Config {
                 if let Some(global_proxy) = route_rules.global_proxy {
                     parsed.global_proxy = global_proxy;
                 }
+                if let Some(ips) = route_rules.client_global_proxy_ips {
+                    parsed.client_global_proxy_ips = parse_route_rule_ip_list("client_global_proxy_ips", ips)?;
+                }
+                if let Some(ips) = route_rules.client_direct_ips {
+                    parsed.client_direct_ips = parse_route_rule_ip_list("client_direct_ips", ips)?;
+                }
                 if let Some(capacity) = route_rules.dns_cache_capacity {
                     parsed.dns_cache_capacity = capacity.max(1);
                 }
@@ -3302,6 +3350,8 @@ impl fmt::Display for Config {
 
                         #[cfg(feature = "local")]
                         socks5_auth_config_path: None,
+                        #[cfg(feature = "local-web-admin")]
+                        record_proxy_ip: local.record_proxy_ip.then_some(true),
 
                         #[cfg(feature = "local-http")]
                         http_auth_config_path: None,
@@ -3606,6 +3656,20 @@ impl fmt::Display for Config {
                 geoip_sources: Some(self.route_rules.geoip_sources.clone()),
                 proxy_domain_sources: Some(self.route_rules.proxy_domain_sources.clone()),
                 global_proxy: Some(self.route_rules.global_proxy),
+                client_global_proxy_ips: Some(
+                    self.route_rules
+                        .client_global_proxy_ips
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                ),
+                client_direct_ips: Some(
+                    self.route_rules
+                        .client_direct_ips
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                ),
                 dns_cache_capacity: Some(self.route_rules.dns_cache_capacity),
                 dns_cache_ttl_seconds: Some(self.route_rules.dns_cache_ttl_seconds),
                 dns_cache_refresh_enabled: Some(self.route_rules.dns_cache_refresh_enabled),

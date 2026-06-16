@@ -24,6 +24,10 @@ const DIRECT4_SET: &str = "direct4";
 const DIRECT6_SET: &str = "direct6";
 const PROXY4_SET: &str = "proxy4";
 const PROXY6_SET: &str = "proxy6";
+const CLIENT_PROXY4_SET: &str = "client_proxy4";
+const CLIENT_PROXY6_SET: &str = "client_proxy6";
+const CLIENT_DIRECT4_SET: &str = "client_direct4";
+const CLIENT_DIRECT6_SET: &str = "client_direct6";
 const TPROXY_PREROUTING_CHAIN: &str = "prerouting_tproxy";
 const TPROXY_OUTPUT_CHAIN: &str = "output_tproxy";
 const TPROXY_MARK: &str = "0x5355";
@@ -44,6 +48,12 @@ const FIXED_DIRECT6_RULES: [&str; 5] = ["::/128", "::1/128", "fc00::/7", "fe80::
 
 pub struct DnsInterceptGuard {
     backend: Backend,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ClientIpRules {
+    pub global_proxy: Vec<IpAddr>,
+    pub direct: Vec<IpAddr>,
 }
 
 enum Backend {
@@ -100,8 +110,16 @@ pub fn setup_firewall_redirect(
     dns_exempt_ips: &[IpAddr],
     proxy_exempt_endpoints: &[(IpAddr, u16)],
     global_proxy: bool,
+    client_ip_rules: &ClientIpRules,
 ) -> io::Result<DnsInterceptGuard> {
-    match setup_nft(port, redir_port, dns_exempt_ips, proxy_exempt_endpoints, global_proxy) {
+    match setup_nft(
+        port,
+        redir_port,
+        dns_exempt_ips,
+        proxy_exempt_endpoints,
+        global_proxy,
+        client_ip_rules,
+    ) {
         Ok(udp_tproxy) => {
             info!("installed nftables DNS interception rules on local port {}", port);
             if udp_tproxy && let Some(redir_port) = redir_port {
@@ -508,11 +526,13 @@ fn setup_nft(
     dns_exempt_ips: &[IpAddr],
     proxy_exempt_endpoints: &[(IpAddr, u16)],
     global_proxy: bool,
+    client_ip_rules: &ClientIpRules,
 ) -> io::Result<bool> {
     let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
     command("nft", &["add", "table", "inet", NFT_TABLE])?;
     add_nft_sets()?;
     add_fixed_direct_set_elements()?;
+    add_client_ip_set_elements(client_ip_rules)?;
     command(
         "nft",
         &[
@@ -559,8 +579,24 @@ fn setup_nft(
         if proto == "tcp"
             && let Some(redir_port) = redir_port
         {
-            add_nft_tcp_redir_rule("prerouting", "ip", "@proxy4", "@direct4", redir_port, global_proxy)?;
-            add_nft_tcp_redir_rule("prerouting", "ip6", "@proxy6", "@direct6", redir_port, global_proxy)?;
+            add_nft_tcp_redir_rule(
+                "prerouting",
+                "ip",
+                "@proxy4",
+                "@direct4",
+                redir_port,
+                global_proxy,
+                Some(client_ip_rules),
+            )?;
+            add_nft_tcp_redir_rule(
+                "prerouting",
+                "ip6",
+                "@proxy6",
+                "@direct6",
+                redir_port,
+                global_proxy,
+                Some(client_ip_rules),
+            )?;
         }
         for ip in dns_exempt_ips {
             let family_expr = match ip {
@@ -633,12 +669,12 @@ fn setup_nft(
             // The ssserver endpoint exemptions above keep OpenWrt safe from
             // redirecting sslocal/xray-plugin's own upstream TCP connection
             // back into the local redir listener.
-            add_nft_tcp_redir_rule("output", "ip", "@proxy4", "@direct4", redir_port, global_proxy)?;
-            add_nft_tcp_redir_rule("output", "ip6", "@proxy6", "@direct6", redir_port, global_proxy)?;
+            add_nft_tcp_redir_rule("output", "ip", "@proxy4", "@direct4", redir_port, global_proxy, None)?;
+            add_nft_tcp_redir_rule("output", "ip6", "@proxy6", "@direct6", redir_port, global_proxy, None)?;
         }
     }
     let udp_tproxy = if let Some(redir_port) = redir_port {
-        match setup_nft_udp_tproxy(redir_port, proxy_exempt_endpoints, global_proxy) {
+        match setup_nft_udp_tproxy(redir_port, proxy_exempt_endpoints, global_proxy, client_ip_rules) {
             Ok(()) => true,
             Err(err) => {
                 warn!(
@@ -663,9 +699,16 @@ fn add_nft_tcp_redir_rule(
     direct_set_name: &'static str,
     redir_port: u16,
     global_proxy: bool,
+    client_ip_rules: Option<&ClientIpRules>,
 ) -> io::Result<()> {
     add_fixed_direct_return_rules(chain, family_expr, "tcp")?;
     let redir_port_arg = format!(":{redir_port}");
+    if let Some(client_ip_rules) = client_ip_rules {
+        add_nft_client_direct_return_rule(chain, family_expr, "tcp", client_ip_rules)?;
+        if !global_proxy {
+            add_nft_client_tcp_redir_rule(chain, family_expr, redir_port, client_ip_rules)?;
+        }
+    }
     let mut args = vec!["add", "rule", "inet", NFT_TABLE, chain, family_expr, "daddr"];
     if global_proxy {
         args.extend(["!=", direct_set_name]);
@@ -674,6 +717,62 @@ fn add_nft_tcp_redir_rule(
     }
     args.extend(["tcp", "dport", "!=", "53", "redirect", "to", &redir_port_arg]);
     command("nft", &args)
+}
+
+fn add_nft_client_direct_return_rule(
+    chain: &'static str,
+    family_expr: &'static str,
+    proto: &'static str,
+    client_ip_rules: &ClientIpRules,
+) -> io::Result<()> {
+    if !client_rules_have_family(&client_ip_rules.direct, family_expr) {
+        return Ok(());
+    }
+    let Some(set_name) = client_set_name(RouteDecision::Direct, family_expr) else {
+        return Ok(());
+    };
+    command(
+        "nft",
+        &[
+            "add", "rule", "inet", NFT_TABLE, chain, family_expr, "saddr", set_name, proto, "dport", "!=", "53",
+            "return",
+        ],
+    )
+}
+
+fn add_nft_client_tcp_redir_rule(
+    chain: &'static str,
+    family_expr: &'static str,
+    redir_port: u16,
+    client_ip_rules: &ClientIpRules,
+) -> io::Result<()> {
+    if !client_rules_have_family(&client_ip_rules.global_proxy, family_expr) {
+        return Ok(());
+    }
+    let Some(set_name) = client_set_name(RouteDecision::Proxy, family_expr) else {
+        return Ok(());
+    };
+    let redir_port_arg = format!(":{redir_port}");
+    command(
+        "nft",
+        &[
+            "add",
+            "rule",
+            "inet",
+            NFT_TABLE,
+            chain,
+            family_expr,
+            "saddr",
+            set_name,
+            "tcp",
+            "dport",
+            "!=",
+            "53",
+            "redirect",
+            "to",
+            &redir_port_arg,
+        ],
+    )
 }
 
 fn add_fixed_direct_return_rules(
@@ -713,6 +812,7 @@ fn setup_nft_udp_tproxy(
     redir_port: u16,
     proxy_exempt_endpoints: &[(IpAddr, u16)],
     global_proxy: bool,
+    client_ip_rules: &ClientIpRules,
 ) -> io::Result<()> {
     setup_tproxy_policy_routing()?;
     command(
@@ -753,8 +853,24 @@ fn setup_nft_udp_tproxy(
             "}",
         ],
     )?;
-    add_nft_udp_tproxy_prerouting_rule("ip", "@proxy4", "@direct4", "ip", redir_port, global_proxy)?;
-    add_nft_udp_tproxy_prerouting_rule("ip6", "@proxy6", "@direct6", "ip6", redir_port, global_proxy)?;
+    add_nft_udp_tproxy_prerouting_rule(
+        "ip",
+        "@proxy4",
+        "@direct4",
+        "ip",
+        redir_port,
+        global_proxy,
+        client_ip_rules,
+    )?;
+    add_nft_udp_tproxy_prerouting_rule(
+        "ip6",
+        "@proxy6",
+        "@direct6",
+        "ip6",
+        redir_port,
+        global_proxy,
+        client_ip_rules,
+    )?;
     command(
         "nft",
         &[
@@ -804,9 +920,20 @@ fn add_nft_udp_tproxy_prerouting_rule(
     tproxy_family: &'static str,
     redir_port: u16,
     global_proxy: bool,
+    client_ip_rules: &ClientIpRules,
 ) -> io::Result<()> {
     add_fixed_direct_return_rules(TPROXY_PREROUTING_CHAIN, family_expr, "udp")?;
     let redir_port_arg = format!(":{redir_port}");
+    add_nft_client_direct_return_rule(TPROXY_PREROUTING_CHAIN, family_expr, "udp", client_ip_rules)?;
+    if !global_proxy {
+        add_nft_client_udp_tproxy_rule(
+            TPROXY_PREROUTING_CHAIN,
+            family_expr,
+            tproxy_family,
+            redir_port,
+            client_ip_rules,
+        )?;
+    }
     let mut args = vec![
         "add",
         "rule",
@@ -837,6 +964,48 @@ fn add_nft_udp_tproxy_prerouting_rule(
         "accept",
     ]);
     command("nft", &args)
+}
+
+fn add_nft_client_udp_tproxy_rule(
+    chain: &'static str,
+    family_expr: &'static str,
+    tproxy_family: &'static str,
+    redir_port: u16,
+    client_ip_rules: &ClientIpRules,
+) -> io::Result<()> {
+    if !client_rules_have_family(&client_ip_rules.global_proxy, family_expr) {
+        return Ok(());
+    }
+    let Some(set_name) = client_set_name(RouteDecision::Proxy, family_expr) else {
+        return Ok(());
+    };
+    let redir_port_arg = format!(":{redir_port}");
+    command(
+        "nft",
+        &[
+            "add",
+            "rule",
+            "inet",
+            NFT_TABLE,
+            chain,
+            family_expr,
+            "saddr",
+            set_name,
+            "udp",
+            "dport",
+            "!=",
+            "53",
+            "tproxy",
+            tproxy_family,
+            "to",
+            &redir_port_arg,
+            "meta",
+            "mark",
+            "set",
+            TPROXY_MARK,
+            "accept",
+        ],
+    )
 }
 
 fn add_nft_udp_tproxy_output_rule(
@@ -932,6 +1101,10 @@ fn add_nft_sets() -> io::Result<()> {
         (DIRECT6_SET, "ipv6_addr"),
         (PROXY4_SET, "ipv4_addr"),
         (PROXY6_SET, "ipv6_addr"),
+        (CLIENT_PROXY4_SET, "ipv4_addr"),
+        (CLIENT_PROXY6_SET, "ipv6_addr"),
+        (CLIENT_DIRECT4_SET, "ipv4_addr"),
+        (CLIENT_DIRECT6_SET, "ipv6_addr"),
     ] {
         let _ = command(
             "nft",
@@ -942,6 +1115,54 @@ fn add_nft_sets() -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+fn add_client_ip_set_elements(client_ip_rules: &ClientIpRules) -> io::Result<()> {
+    let mut script = String::new();
+    write_add_ip_elements(&mut script, CLIENT_PROXY4_SET, &client_ip_rules.global_proxy, IpFamily::V4);
+    write_add_ip_elements(&mut script, CLIENT_PROXY6_SET, &client_ip_rules.global_proxy, IpFamily::V6);
+    write_add_ip_elements(&mut script, CLIENT_DIRECT4_SET, &client_ip_rules.direct, IpFamily::V4);
+    write_add_ip_elements(&mut script, CLIENT_DIRECT6_SET, &client_ip_rules.direct, IpFamily::V6);
+    nft_apply_script(&script)
+}
+
+fn write_add_ip_elements(script: &mut String, set_name: &str, ips: &[IpAddr], family: IpFamily) {
+    let family_ips = ips
+        .iter()
+        .filter(|ip| matches!((family, ip), (IpFamily::V4, IpAddr::V4(..)) | (IpFamily::V6, IpAddr::V6(..))))
+        .collect::<Vec<_>>();
+    for chunk in family_ips.chunks(512) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let _ = write!(script, "add element inet {NFT_TABLE} {set_name} {{ ");
+        for (idx, ip) in chunk.iter().enumerate() {
+            if idx > 0 {
+                let _ = script.write_str(", ");
+            }
+            let _ = write!(script, "{ip}");
+        }
+        let _ = script.write_str(" }\n");
+    }
+}
+
+fn client_rules_have_family(ips: &[IpAddr], family_expr: &str) -> bool {
+    ips.iter().any(|ip| {
+        matches!(
+            (family_expr, ip),
+            ("ip", IpAddr::V4(..)) | ("ip6", IpAddr::V6(..))
+        )
+    })
+}
+
+fn client_set_name(decision: RouteDecision, family_expr: &str) -> Option<&'static str> {
+    match (decision, family_expr) {
+        (RouteDecision::Direct, "ip") => Some("@client_direct4"),
+        (RouteDecision::Direct, "ip6") => Some("@client_direct6"),
+        (RouteDecision::Proxy, "ip") => Some("@client_proxy4"),
+        (RouteDecision::Proxy, "ip6") => Some("@client_proxy6"),
+        _ => None,
+    }
 }
 
 fn add_fixed_direct_set_elements() -> io::Result<()> {

@@ -54,6 +54,9 @@ pub struct ServiceContext {
 
     #[cfg(feature = "local-web-admin")]
     routing_state: Option<RoutingState>,
+
+    #[cfg(feature = "local-web-admin")]
+    record_proxy_ip: bool,
 }
 
 impl Default for ServiceContext {
@@ -81,6 +84,8 @@ impl ServiceContext {
             fake_dns_manager: Arc::new(RwLock::new(Vec::new())),
             #[cfg(feature = "local-web-admin")]
             routing_state: None,
+            #[cfg(feature = "local-web-admin")]
+            record_proxy_ip: false,
         }
     }
 
@@ -132,6 +137,16 @@ impl ServiceContext {
     #[cfg(feature = "local-web-admin")]
     pub fn routing_state(&self) -> Option<&RoutingState> {
         self.routing_state.as_ref()
+    }
+
+    #[cfg(feature = "local-web-admin")]
+    pub fn set_record_proxy_ip(&mut self, record_proxy_ip: bool) {
+        self.record_proxy_ip = record_proxy_ip;
+    }
+
+    #[cfg(feature = "local-web-admin")]
+    pub fn record_proxy_ip(&self) -> bool {
+        self.record_proxy_ip
     }
 
     /// Set outbound proxy chain (connection to SS server routes through these proxies)

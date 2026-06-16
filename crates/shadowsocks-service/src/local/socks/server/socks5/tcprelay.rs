@@ -290,6 +290,15 @@ impl Socks5TcpHandler {
             routing_state
                 .record_connection(peer_addr, &target_addr, "tcp", decision)
                 .await;
+            if context.record_proxy_ip() && matches!(decision, ConnectionDecision::Socks5Proxy) {
+                let routing_state = routing_state.clone();
+                let target_addr = target_addr.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = routing_state.add_temporary_proxy_target(&target_addr).await {
+                        warn!("failed to learn SOCKS target IP into temporary proxy list: {}", err);
+                    }
+                });
+            }
         }
 
         match server_opt {

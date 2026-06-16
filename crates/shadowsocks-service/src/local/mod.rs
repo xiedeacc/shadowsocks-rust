@@ -635,6 +635,11 @@ impl Server {
             .iter()
             .find(|local| !local.config.disabled && matches!(local.config.protocol, ProtocolType::Redir))
             .and_then(|local| local.config.addr.as_ref().map(|addr| addr.port()));
+        #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
+        let dns_intercept_client_ip_rules = self::dns::intercept_linux::ClientIpRules {
+            global_proxy: config.route_rules.client_global_proxy_ips.clone(),
+            direct: config.route_rules.client_direct_ips.clone(),
+        };
 
         for local_instance in config.local {
             let local_config = local_instance.config;
@@ -645,6 +650,9 @@ impl Server {
             // Clone from global ServiceContext instance
             // It will shares Shadowsocks' global context, and FlowStat, DNS reverse cache
             let mut context = context.clone();
+
+            #[cfg(feature = "local-web-admin")]
+            context.set_record_proxy_ip(local_config.record_proxy_ip);
 
             // Private ACL
             if let Some(acl) = local_instance.acl {
@@ -786,6 +794,7 @@ impl Server {
                             &dns_intercept_exempt_ips,
                             &dns_intercept_proxy_exempt_endpoints,
                             global_proxy,
+                            &dns_intercept_client_ip_rules,
                         ) {
                             Ok(guard) => {
                                 if let Err(err) = routing_state.sync_persistent_ip_rules_to_firewall().await {

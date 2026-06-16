@@ -343,7 +343,7 @@ impl DnsTcpServer {
                 }
             };
 
-            let respond_message = match client.resolve(message, &local_addr, &remote_addr).await {
+            let respond_message = match client.resolve(message, &local_addr, &remote_addr, Some(peer_addr.ip())).await {
                 Ok(m) => m,
                 Err(err) => {
                     error!("dns tcp {} lookup error: {}", peer_addr, err);
@@ -520,7 +520,10 @@ impl DnsUdpServer {
                 query.name()
             );
         }
-        let respond_message = match client.resolve(message, &local_addr, &remote_addr).await {
+        let respond_message = match client
+            .resolve(message, &local_addr, &remote_addr, Some(peer_addr.ip()))
+            .await
+        {
             Ok(m) => m,
             Err(err) => {
                 error!("dns udp {} lookup failed, error: {}", peer_addr, err);
@@ -959,6 +962,7 @@ impl DnsClient {
         request: Message,
         local_addr: &NameServerAddr,
         remote_addr: &Address,
+        source_ip: Option<IpAddr>,
     ) -> io::Result<Message> {
         let mut message = Message::response(request.id, request.op_code);
         message.metadata.recursion_desired = true;
@@ -985,6 +989,7 @@ impl DnsClient {
             {
                 routing_state
                     .record_dns_error(
+                        source_ip,
                         request.queries[0].name().to_ascii(),
                         request.queries[0].query_type().to_string(),
                         RouteDecision::Direct,
@@ -998,7 +1003,9 @@ impl DnsClient {
 
             // Make queries according to ACL rules
 
-            let (r, forward) = self.acl_lookup(&request.queries[0], local_addr, remote_addr).await;
+            let (r, forward) = self
+                .acl_lookup(&request.queries[0], local_addr, remote_addr, source_ip)
+                .await;
             if let Ok(result) = r {
                 for rec in result.answers.iter() {
                     trace!("dns answer: {:?}", rec);
@@ -1039,6 +1046,7 @@ impl DnsClient {
         query: &Query,
         local_addr: &NameServerAddr,
         remote_addr: &Address,
+        source_ip: Option<IpAddr>,
     ) -> (io::Result<Message>, bool) {
         // Start querying name servers
         debug!("DNS lookup {:?} {}", query.query_type(), query.name());
@@ -1057,6 +1065,7 @@ impl DnsClient {
             };
             routing_state
                 .record_dns_error(
+                    source_ip,
                     query.name().to_ascii(),
                     query.query_type().to_string(),
                     RouteDecision::Direct,
@@ -1085,7 +1094,9 @@ impl DnsClient {
                     if matches!(decision, RouteDecision::Proxy) && !ips.is_empty() {
                         let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
                     }
-                    routing_state.record_dns(domain, query_type, ips, decision, true).await;
+                    routing_state
+                        .record_dns(source_ip, domain, query_type, ips, decision, true)
+                        .await;
                     return (Ok(cached), matches!(decision, RouteDecision::Proxy));
                 }
                 info!(
@@ -1114,7 +1125,9 @@ impl DnsClient {
                     if !ips.is_empty() {
                         let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
                     }
-                    routing_state.record_dns(domain, query_type, ips, decision, false).await;
+                    routing_state
+                        .record_dns(source_ip, domain, query_type, ips, decision, false)
+                        .await;
                     return (Ok(msg), matches!(decision, RouteDecision::Proxy));
                 }
                 return (response, matches!(decision, RouteDecision::Proxy));
@@ -1129,7 +1142,9 @@ impl DnsClient {
                     "dns route default local cache hit {} {:?}: resolver={:?}, results={:?}",
                     domain, query.query_type(), decision, ips
                 );
-                routing_state.record_dns(domain, query_type, ips, decision, true).await;
+                routing_state
+                    .record_dns(source_ip, domain, query_type, ips, decision, true)
+                    .await;
                 return (Ok(cached), matches!(decision, RouteDecision::Proxy));
             }
             info!(
@@ -1148,7 +1163,9 @@ impl DnsClient {
                 if !ips.is_empty() {
                     let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
                 }
-                routing_state.record_dns(domain, query_type, ips, decision, false).await;
+                routing_state
+                    .record_dns(source_ip, domain, query_type, ips, decision, false)
+                    .await;
                 return (Ok(msg), false);
             }
             return (response, false);
@@ -1157,14 +1174,14 @@ impl DnsClient {
         match should_forward_by_query(&self.context, &self.balancer, query) {
             Some(true) => {
                 let remote_response = self.lookup_remote(query, remote_addr).await;
-                self.record_web_dns_result(query, &remote_response, RouteDecision::Proxy)
+                self.record_web_dns_result(query, &remote_response, RouteDecision::Proxy, source_ip)
                     .await;
                 trace!("pick remote response (query): {:?}", remote_response);
                 return (remote_response, true);
             }
             Some(false) => {
                 let local_response = self.lookup_local(query, local_addr).await;
-                self.record_web_dns_result(query, &local_response, RouteDecision::Direct)
+                self.record_web_dns_result(query, &local_response, RouteDecision::Direct, source_ip)
                     .await;
                 trace!("pick local response (query): {:?}", local_response);
                 return (local_response, false);
@@ -1190,7 +1207,7 @@ impl DnsClient {
             tokio::select! {
                 response = &mut remote_response_fut, if remote_response.is_none() => {
                     if use_remote {
-                        self.record_web_dns_result(query, &response, RouteDecision::Proxy)
+                        self.record_web_dns_result(query, &response, RouteDecision::Proxy, source_ip)
                             .await;
                         trace!("pick remote response (response): {:?}", response);
                         return (response, true);
@@ -1200,12 +1217,12 @@ impl DnsClient {
                 }
                 decision = &mut decider, if !use_remote => {
                     if let Some(local_response) = decision {
-                        self.record_web_dns_result(query, &local_response, RouteDecision::Direct)
+                        self.record_web_dns_result(query, &local_response, RouteDecision::Direct, source_ip)
                             .await;
                         trace!("pick local response (response): {:?}", local_response);
                         return (local_response, false);
                     } else if let Some(remote_response) = remote_response {
-                        self.record_web_dns_result(query, &remote_response, RouteDecision::Proxy)
+                        self.record_web_dns_result(query, &remote_response, RouteDecision::Proxy, source_ip)
                             .await;
                         trace!("pick remote response (response): {:?}", remote_response);
                         return (remote_response, true);
@@ -1218,7 +1235,13 @@ impl DnsClient {
         }
     }
 
-    async fn record_web_dns_result(&self, query: &Query, response: &io::Result<Message>, decision: RouteDecision) {
+    async fn record_web_dns_result(
+        &self,
+        query: &Query,
+        response: &io::Result<Message>,
+        decision: RouteDecision,
+        source_ip: Option<IpAddr>,
+    ) {
         #[cfg(feature = "local-web-admin")]
         if let Some(routing_state) = self.context.routing_state()
             && query.query_class() == DNSClass::IN
@@ -1236,7 +1259,9 @@ impl DnsClient {
             if !ips.is_empty() {
                 let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
             }
-            routing_state.record_dns(domain, query_type, ips, decision, false).await;
+            routing_state
+                .record_dns(source_ip, domain, query_type, ips, decision, false)
+                .await;
         }
     }
 

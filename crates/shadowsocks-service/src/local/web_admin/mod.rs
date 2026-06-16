@@ -302,9 +302,13 @@ impl WebAdminHandler {
                 StatusCode::OK,
                 &self.routing_state.domain_conflicts().await,
             )),
+            (Method::GET, "/api/lan/dhcp-clients") => Ok(json_response(StatusCode::OK, &dhcp_clients())),
             (Method::GET, "/api/activity/connections") => Ok(json_response(
                 StatusCode::OK,
-                &self.routing_state.recent_connections(&self.server_filters).await,
+                &self
+                    .routing_state
+                    .recent_connections(&self.server_filters, source_ip_query(req.uri().query()))
+                    .await,
             )),
             (Method::POST, "/api/activity/record/start") => {
                 let status = self.routing_state.start_activity_recording().await?;
@@ -318,7 +322,10 @@ impl WebAdminHandler {
                 Ok(json_response(StatusCode::OK, &self.routing_state.activity_record_status().await))
             }
             (Method::GET, "/api/activity/dns") => {
-                Ok(json_response(StatusCode::OK, &self.routing_state.recent_dns().await))
+                Ok(json_response(
+                    StatusCode::OK,
+                    &self.routing_state.recent_dns(source_ip_query(req.uri().query())).await,
+                ))
             }
             (Method::GET, "/api/sys/status") => Ok(json_response(StatusCode::OK, &self.sys_status().await)),
             (Method::GET, "/api/sys/uptime") => Ok(json_response(StatusCode::OK, &self.process_uptime())),
@@ -447,7 +454,7 @@ impl WebAdminHandler {
         self.routing_state.flush_activity_recording().await?;
 
         let dns_events = if dns_relevant {
-            self.routing_state.recent_dns().await
+            self.routing_state.recent_dns(None).await
         } else {
             Vec::new()
         };
@@ -554,7 +561,10 @@ impl WebAdminHandler {
         started_at: u64,
     ) -> Option<ConnectionEvent> {
         for attempt in 0..10 {
-            let connections = self.routing_state.recent_connections(&self.server_filters).await;
+            let connections = self
+                .routing_state
+                .recent_connections(&self.server_filters, None)
+                .await;
             if let Some(event) = connections
                 .into_iter()
                 .find(|event| debug_connection_matches(event, mode, host, resolved_ips, started_at))
@@ -631,6 +641,15 @@ struct DebugIpPayload {
 #[derive(serde::Deserialize)]
 struct ClientConfigPayload {
     content: String,
+}
+
+#[derive(serde::Serialize)]
+struct DhcpClient {
+    ip: IpAddr,
+    mac: String,
+    hostname: String,
+    expires_at: Option<u64>,
+    source: &'static str,
 }
 
 struct DebugCurlResult {
@@ -847,6 +866,45 @@ fn is_lan_admin_peer(ip: IpAddr) -> bool {
                 || (ip.segments()[0] & 0xffc0) == 0xfe80
         }
     }
+}
+
+fn dhcp_clients() -> Vec<DhcpClient> {
+    read_dhcp_leases(Path::new("/tmp/dhcp.leases")).unwrap_or_default()
+}
+
+fn read_dhcp_leases(path: &Path) -> io::Result<Vec<DhcpClient>> {
+    let content = fs::read_to_string(path)?;
+    let mut seen = HashSet::new();
+    let mut clients = Vec::new();
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        let expires_at = parts
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0);
+        let Some(mac) = parts.next() else {
+            continue;
+        };
+        let Some(ip) = parts.next().and_then(|value| value.parse::<IpAddr>().ok()) else {
+            continue;
+        };
+        let hostname = parts
+            .next()
+            .filter(|value| *value != "*")
+            .unwrap_or("")
+            .to_owned();
+        if seen.insert(ip) {
+            clients.push(DhcpClient {
+                ip,
+                mac: mac.to_owned(),
+                hostname,
+                expires_at,
+                source: "dhcp",
+            });
+        }
+    }
+    clients.sort_by_key(|client| client.ip);
+    Ok(clients)
 }
 
 fn normalize_debug_url(url: &str) -> io::Result<String> {
@@ -1235,6 +1293,10 @@ fn query_param(query: Option<&str>, name: &str) -> Option<String> {
     })
 }
 
+fn source_ip_query(query: Option<&str>) -> Option<IpAddr> {
+    query_param(query, "source_ip").and_then(|value| value.parse::<IpAddr>().ok())
+}
+
 async fn read_json<T: serde::de::DeserializeOwned>(req: Request<Incoming>) -> io::Result<T> {
     let body = req
         .into_body()
@@ -1356,6 +1418,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .form-line{display:grid;grid-template-columns:150px 1fr;gap:10px;align-items:center;margin:4px 0}
     .form-line label{margin:0;font-size:13px}
     .form-line input[type=checkbox]{width:16px;height:16px;margin:0;justify-self:start}
+    .client-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:6px;min-height:32px}
+    .client-row{display:flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:7px;padding:6px 8px;background:#f8fbfe;min-width:0}
+    .client-row input{width:16px;height:16px;margin:0;flex:0 0 auto}
+    .client-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .filter-inline{display:flex;align-items:center;gap:6px;min-width:220px}
+    .filter-inline input{margin:0}
     #clientConfig{min-height:0;height:auto;max-height:none;overflow:auto;resize:vertical;font-size:13px}
     #routeConfig .route-config-column>.scroll-panel{height:auto}
     #routeConfig .route-rules-layout textarea{height:clamp(56px,8vh,96px);min-height:56px;resize:vertical}
@@ -1399,6 +1467,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="form-line"><label>Bind Address</label><select id="socksBind"><option>127.0.0.1</option><option>0.0.0.0</option></select></div>
           <div class="form-line"><label>Port</label><input id="socksPort" type="number" min="1" max="65535"></div>
         </fieldset>
+        <h3 class="card-title">Futu SOCKS Local</h3>
+        <fieldset>
+          <div class="form-line"><label>Bind Address</label><select id="futuSocksBind"><option>127.0.0.1</option><option>0.0.0.0</option></select></div>
+          <div class="form-line"><label>Port</label><input id="futuSocksPort" type="number" min="1" max="65535" value="1082"></div>
+        </fieldset>
         <h3 class="card-title">HTTP Local</h3>
         <fieldset>
           <div class="form-line"><label>Bind Address</label><select id="httpBind"><option>127.0.0.1</option><option>0.0.0.0</option></select></div>
@@ -1408,6 +1481,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <fieldset>
           <div class="form-line"><label>Enable Redir</label><input id="redirEnable" type="checkbox"></div>
           <div class="form-line"><label>Global Proxy</label><input id="globalProxy" type="checkbox"></div>
+          <div class="form-line"><label>Client Global Proxy</label><div id="clientGlobalProxyList" class="client-list"></div></div>
+          <div class="form-line"><label>Client Direct</label><div id="clientDirectList" class="client-list"></div></div>
           <div class="form-line"><label>Bind Address</label><select id="redirBind"><option>127.0.0.1</option><option>0.0.0.0</option></select></div>
           <div class="form-line"><label>Port</label><input id="redirPort" type="number" min="1" max="65535"></div>
           <div class="form-line"><label>Mode</label><select id="redirMode"><option>tcp_only</option><option>tcp_and_udp</option></select></div>
@@ -1462,8 +1537,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <div class="activity-toolbar">
         <label class="inline-check"><input id="activityRecord" type="checkbox" onchange="toggleActivityRecord(this.checked)"> Record <span id="activityRecordCountdown" class="record-countdown"></span></label>
         <button id="activityPause" type="button" onclick="toggleActivityPause()">Pause</button>
+        <label class="filter-inline hint">Source IP <input id="activitySourceFilter" list="dhcpClientIps" placeholder="all clients" oninput="refresh('connections')"></label>
         <span id="activityPauseState" class="hint"></span>
       </div>
+      <datalist id="dhcpClientIps"></datalist>
       <div class="activity-grid">
         <div class="activity-card">
           <div class="activity-card-head">
@@ -1581,7 +1658,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function api(path,opt={}){let timeoutMs=opt.timeoutMs||0;delete opt.timeoutMs;let timer=null,controller=null;if(timeoutMs){controller=new AbortController();opt.signal=controller.signal;timer=setTimeout(()=>controller.abort(),timeoutMs)}opt.headers=Object.assign({'x-admin-token':token()},opt.headers||{});try{let r=await fetch(path,opt);let j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}finally{if(timer)clearTimeout(timer)}}
     async function platform(){if(!servicePlatform)servicePlatform=await api('/api/sys/platform');return servicePlatform}
     function isWindowsService(){return servicePlatform&&servicePlatform.target_os==='windows'}
-    let activeTab='basic', activityTimer=null, activityPaused=false, recentDnsRows=[], restartInProgress=false;
+    let activeTab='basic', activityTimer=null, activityPaused=false, recentDnsRows=[], restartInProgress=false, dhcpClients=[];
     function updateNavIndicator(){
       let active=document.querySelector('nav button.active'), indicator=document.querySelector('.nav-indicator'), tabs=document.querySelector('.nav-tabs');
       if(!active||!indicator||!tabs)return;
@@ -1602,15 +1679,48 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function lines(v){return (v||'').split('\n').map(s=>s.trim()).filter(Boolean)}
     function setLines(id,arr){document.getElementById(id).value=(arr||[]).join('\n')}
     function num(v,d){let n=parseInt(v,10);return Number.isFinite(n)?n:d}
-    function firstLocal(protocol){return (currentRawConfig.locals||[]).find(l=>l.protocol===protocol)||{}}
+    function firstLocal(protocol){return (currentRawConfig.locals||[]).find(l=>l.protocol===protocol&&!l.record_proxy_ip)||{}}
+    function futuSocksLocal(){return (currentRawConfig.locals||[]).find(l=>l.protocol==='socks'&&l.record_proxy_ip)||{}}
     function firstServer(){return (currentRawConfig.servers||[])[0]||{}}
     function setSelect(id,value){let el=document.getElementById(id); if([...el.options].some(o=>o.value===value)){el.value=value}else{el.value=el.options[0].value}}
+    function routeIpArray(v){return Array.isArray(v)?v.map(String).filter(Boolean):[]}
+    function clientLabel(ip){
+      let c=dhcpClients.find(x=>String(x.ip)===String(ip));
+      if(!c)return ip+' offline';
+      return ip+(c.hostname?' '+c.hostname:'')+(c.mac?' '+c.mac:'');
+    }
+    function renderDhcpDatalist(){
+      let el=document.getElementById('dhcpClientIps');
+      if(!el)return;
+      el.innerHTML=dhcpClients.map(c=>`<option value="${esc(c.ip)}">${esc(clientLabel(c.ip))}</option>`).join('');
+    }
+    function renderClientPolicyLists(routeRules){
+      let selectedProxy=new Set(routeIpArray(routeRules.client_global_proxy_ips));
+      let selectedDirect=new Set(routeIpArray(routeRules.client_direct_ips));
+      let ips=[...dhcpClients.map(c=>String(c.ip)),...selectedProxy,...selectedDirect].filter(Boolean);
+      ips=[...new Set(ips)].sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+      renderClientPolicyList('clientGlobalProxyList',ips,selectedProxy,'client-global-proxy');
+      renderClientPolicyList('clientDirectList',ips,selectedDirect,'client-direct');
+      renderDhcpDatalist();
+    }
+    function renderClientPolicyList(id,ips,selected,cls){
+      let box=document.getElementById(id);
+      box.innerHTML=ips.length?ips.map(ip=>`<label class="client-row"><input class="${cls}" type="checkbox" value="${esc(ip)}" ${selected.has(ip)?'checked':''} onchange="onClientPolicyChange(this)"><span title="${esc(clientLabel(ip))}">${esc(clientLabel(ip))}</span></label>`).join(''):'<span class="hint">No DHCP clients</span>';
+    }
+    function onClientPolicyChange(input){
+      let other=input.classList.contains('client-global-proxy')?'client-direct':'client-global-proxy';
+      if(input.checked)document.querySelectorAll('input.'+other).forEach(el=>{if(el.value===input.value)el.checked=false});
+      updateClientJson();
+    }
+    function selectedClientIps(cls){return [...document.querySelectorAll('input.'+cls+':checked')].map(el=>el.value)}
     function renderBasic(){
-      let socks=firstLocal('socks'), http=firstLocal('http'), redir=firstLocal('redir'), tun=firstLocal('tun'), dns=firstLocal('dns'), server=firstServer();
+      let socks=firstLocal('socks'), futu=futuSocksLocal(), http=firstLocal('http'), redir=firstLocal('redir'), tun=firstLocal('tun'), dns=firstLocal('dns'), server=firstServer();
       let routeRules=currentRawConfig.route_rules||{};
       setSelect('socksBind',socks.local_address||'127.0.0.1'); socksPort.value=socks.local_port||1080;
+      setSelect('futuSocksBind',futu.local_address||socks.local_address||'0.0.0.0'); futuSocksPort.value=futu.local_port||1082;
       setSelect('httpBind',http.local_address||'127.0.0.1'); httpPort.value=http.local_port||1081;
       globalProxy.checked=!!routeRules.global_proxy;
+      renderClientPolicyLists(routeRules);
       redirEnable.checked=!!(redir.protocol||tun.protocol)&&(redir.disabled!==true&&tun.disabled!==true);
       setSelect('redirBind',redir.local_address||'0.0.0.0'); redirPort.value=redir.local_port||12345;
       setSelect('redirMode',redir.mode||tun.mode||'tcp_and_udp'); setSelect('tcpRedir',redir.tcp_redir||'redirect'); setSelect('udpRedir',redir.udp_redir||'tproxy');
@@ -1643,6 +1753,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const effectiveDnsInterceptMode=wantsRedir&&!isWindowsService()&&dnsInterceptMode.value==='off'?'both':dnsInterceptMode.value;
       let locals=[
         {local_address:socksBind.value,local_port:num(socksPort.value,1080),protocol:'socks'},
+        {local_address:futuSocksBind.value,local_port:num(futuSocksPort.value,1082),protocol:'socks',record_proxy_ip:true},
         {local_address:httpBind.value,local_port:num(httpPort.value,1081),protocol:'http'}
       ];
       if(isWindowsService()){
@@ -1659,6 +1770,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       routeRules.dns_cache_refresh_enabled=dnsCacheRefreshEnabled.checked;
       routeRules.dns_cache_refresh_batch_size=num(dnsCacheRefreshBatch.value,500);
       routeRules.global_proxy=wantsGlobalProxy;
+      routeRules.client_global_proxy_ips=selectedClientIps('client-global-proxy');
+      routeRules.client_direct_ips=selectedClientIps('client-direct');
       routeRules.dns_intercept_mode=windowsTun?'tun':(wantsRedir?(isWindowsService()&&effectiveDnsInterceptMode==='firewall'?'tun':effectiveDnsInterceptMode):'off');
       routeRules.dns_ipv4_only=(dnsIpv4Only.value!=='false');
       let domesticEntry=dnsDomestic.value.trim()||'223.5.5.5:53';
@@ -1691,6 +1804,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       currentRawConfig.locals=currentRawConfig.locals||[];
       currentRawConfig.servers=currentRawConfig.servers||[];
       currentRawConfig.route_rules=currentRawConfig.route_rules||{};
+      try{dhcpClients=await api('/api/lan/dhcp-clients?cache='+Date.now(),{cache:'no-store'})}catch(e){dhcpClients=[]}
       renderBasic();
     }
     function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms))}
@@ -1727,7 +1841,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function saveClientConfig(){if(restartInProgress)return;updateClientJson();setRestartControls(true);configPath.textContent='saving config...';try{await api('/api/client-config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:clientConfig.value})})}catch(e){configPath.textContent='save failed: '+e.message;setRestartControls(false);return}configPath.textContent='saved, restarting service...';await waitForRestartComplete(currentConfigPath+' saved and service restarted')}
     async function restartService(){if(restartInProgress)return;setRestartControls(true);configPath.textContent='restarting service...';try{await api('/api/restart',{method:'POST'})}catch(e){console.warn(e)}await waitForRestartComplete('service restarted')}
-    ['socksBind','socksPort','httpBind','httpPort','redirEnable','globalProxy','redirBind','redirPort','redirMode','tcpRedir','udpRedir','tunName','tunAddress','tunDestination','dnsEnable','dnsBind','dnsPort','dnsDomestic','dnsForeign','dnsCacheCapacity','dnsCacheTtl','dnsCacheRefreshEnabled','dnsCacheRefreshBatch','dnsInterceptMode','serverHost','serverPort','method','serverSecret','timeout','plugin','pluginOpts'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
+    ['socksBind','socksPort','futuSocksBind','futuSocksPort','httpBind','httpPort','redirEnable','globalProxy','redirBind','redirPort','redirMode','tcpRedir','udpRedir','tunName','tunAddress','tunDestination','dnsEnable','dnsBind','dnsPort','dnsDomestic','dnsForeign','dnsCacheCapacity','dnsCacheTtl','dnsCacheRefreshEnabled','dnsCacheRefreshBatch','dnsInterceptMode','dnsIpv4Only','serverHost','serverPort','method','serverSecret','timeout','plugin','pluginOpts'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
 
     async function loadRules(){
       let tmp=await api('/api/temp-rules');
@@ -1809,9 +1923,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function toggleActivityPause(){activityPaused=!activityPaused;updateActivityPauseButton();if(!activityPaused&&activeTab==='connections')await refresh('connections')}
     async function syncActivityRecordStatus(){let s=await api('/api/activity/record/status');activityRecord.checked=!!s.recording;activityRecordCountdown.textContent=s.recording?fmtCountdown(s.remaining_seconds):'';if(!s.recording&&!activityPaused){dnsOut.innerHTML='';connOut.innerHTML=''}return s}
     async function toggleActivityRecord(checked){await api(checked?'/api/activity/record/start':'/api/activity/record/stop',{method:'POST'});let s=await syncActivityRecordStatus();if(s.recording)refresh('connections')}
-    async function renderConnections(){let rows=await api('/api/activity/connections');connOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Source',r=>r.source_ip+':'+r.source_port],['Destination',r=>(r.destination_ip||r.destination_domain)+':'+r.destination_port],['Domain',r=>r.domain||'-'],['Protocol',r=>r.protocol],['Decision',r=>r.decision]],'copyable-table')}
-    function renderDnsTable(){let rows=recentDnsRows;if(!dnsShowAaaa.checked)rows=rows.filter(r=>r.query_type!=='AAAA');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>r.error?('Error: '+r.error):(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']],'copyable-table')}
-    async function renderDns(){recentDnsRows=await api('/api/activity/dns');renderDnsTable()}
+    function activitySourceParam(){let ip=(activitySourceFilter.value||'').trim();return ip?'?source_ip='+encodeURIComponent(ip):''}
+    async function renderConnections(){let rows=await api('/api/activity/connections'+activitySourceParam());connOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Source',r=>r.source_ip+':'+r.source_port],['Destination',r=>(r.destination_ip||r.destination_domain)+':'+r.destination_port],['Domain',r=>r.domain||'-'],['Protocol',r=>r.protocol],['Decision',r=>r.decision]],'copyable-table')}
+    function renderDnsTable(){let rows=recentDnsRows;if(!dnsShowAaaa.checked)rows=rows.filter(r=>r.query_type!=='AAAA');dnsOut.innerHTML=table(rows,[['Time',r=>fmtTime(r.timestamp)],['Source',r=>r.source_ip||'-'],['Domain',r=>cleanDomain(r.domain)],['Type',r=>r.query_type],['Results',r=>r.error?('Error: '+r.error):(r.results||[]).join('<br>')],['Resolver',r=>r.resolver],['Cache',r=>r.cache_hit?'hit':'miss']],'copyable-table')}
+    async function renderDns(){recentDnsRows=await api('/api/activity/dns'+activitySourceParam());renderDnsTable()}
     async function renderRouteConflicts(){await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip')}
     function nftCountsHtml(s){let c=s.nft_set_counts||{};if(!c.checked)return '';if(c.error)return `<p><strong>nft set entries:</strong> <span class="status-warn">unavailable</span> <span class="hint">${esc(c.error)}</span></p>`;let rows=[{set:'direct4',entries:c.direct4},{set:'direct6',entries:c.direct6},{set:'proxy4',entries:c.proxy4},{set:'proxy6',entries:c.proxy6}];return `<p><strong>nft set entries:</strong> ${c.total??0} total, ${c.proxy_total??0} proxy, ${c.direct_total??0} direct</p>`+table(rows,[['Set',r=>r.set],['Entries',r=>r.entries??0]])}
     async function renderSys(){let s=await api('/api/sys/status');let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);let uptime=`<p><strong>Process uptime:</strong> ${fmtDuration(s.process_uptime_seconds)}</p>`;let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=uptime+`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=uptime+`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p>${nftCountsHtml(s)}<p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body+`<h3 class="card-title">direct_ip.txt / proxy_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / proxy_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
