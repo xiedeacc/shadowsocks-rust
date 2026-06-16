@@ -794,6 +794,7 @@ impl Server {
                             &dns_intercept_exempt_ips,
                             &dns_intercept_proxy_exempt_endpoints,
                             global_proxy,
+                            config.route_rules.proxy_local_output,
                             &dns_intercept_client_ip_rules,
                         ) {
                             Ok(guard) => {

@@ -85,15 +85,30 @@ cleanup_remote_firewall() {
 				echo '[cleanup] no stale nft table inet ssrust_dns'
 			fi
 		fi
+		if command -v ip >/dev/null 2>&1; then
+			while ip rule del fwmark 0x5355 table 100 2>/dev/null; do
+				echo '[cleanup] deleted tproxy ip rule fwmark 0x5355 table 100'
+			done
+			ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
+			ip -6 route del local ::/0 dev lo table 100 2>/dev/null || true
+		fi
 		if command -v iptables >/dev/null 2>&1; then
-			for chain in OUTPUT PREROUTING; do
-				while iptables -t nat -L \$chain -n --line-numbers 2>/dev/null \
-					| awk '/dpt:53/ && (/REDIRECT|DNAT/) {print \$1; exit}' | grep -q .; do
-					line=\$(iptables -t nat -L \$chain -n --line-numbers 2>/dev/null \
-						| awk '/dpt:53/ && (/REDIRECT|DNAT/) {print \$1; exit}')
-					[ -z \"\$line\" ] && break
-					echo \"[cleanup] iptables -t nat -D \$chain \$line\"
-					iptables -t nat -D \$chain \$line || break
+			ports='1053'
+			if command -v jsonfilter >/dev/null 2>&1 && [ -s '$REMOTE_DIR/conf/shadowsocks-client.json' ]; then
+				for port in \$(jsonfilter -i '$REMOTE_DIR/conf/shadowsocks-client.json' -e '@.locals[@.protocol=\"dns\"].local_port' 2>/dev/null || true); do
+					case \"\$port\" in
+						''|*[!0-9]*) ;;
+						*) ports=\"\$ports \$port\" ;;
+					esac
+				done
+			fi
+			for port in \$ports; do
+				for chain in PREROUTING OUTPUT; do
+					for proto in udp tcp; do
+						while iptables -t nat -D \$chain -p \$proto --dport 53 -j REDIRECT --to-ports \$port 2>/dev/null; do
+							echo \"[cleanup] removed iptables \$chain \$proto dport 53 redirect to \$port\"
+						done
+					done
 				done
 			done
 		fi

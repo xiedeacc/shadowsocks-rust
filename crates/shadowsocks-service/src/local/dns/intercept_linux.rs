@@ -118,6 +118,7 @@ pub fn setup_firewall_redirect(
     dns_exempt_ips: &[IpAddr],
     proxy_exempt_endpoints: &[(IpAddr, u16)],
     global_proxy: bool,
+    proxy_local_output: bool,
     client_ip_rules: &ClientIpRules,
 ) -> io::Result<DnsInterceptGuard> {
     match setup_nft(
@@ -126,6 +127,7 @@ pub fn setup_firewall_redirect(
         dns_exempt_ips,
         proxy_exempt_endpoints,
         global_proxy,
+        proxy_local_output,
         client_ip_rules,
     ) {
         Ok(udp_tproxy) => {
@@ -534,6 +536,7 @@ fn setup_nft(
     dns_exempt_ips: &[IpAddr],
     proxy_exempt_endpoints: &[(IpAddr, u16)],
     global_proxy: bool,
+    proxy_local_output: bool,
     client_ip_rules: &ClientIpRules,
 ) -> io::Result<bool> {
     let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
@@ -629,6 +632,7 @@ fn setup_nft(
                 ],
             )?;
         }
+        add_output_local_dns_return_rule(proto)?;
         command(
             "nft",
             &[
@@ -645,7 +649,8 @@ fn setup_nft(
                 &format!(":{port}"),
             ],
         )?;
-        if proto == "tcp"
+        if proxy_local_output
+            && proto == "tcp"
             && let Some(redir_port) = redir_port
         {
             for (ip, exempt_port) in proxy_exempt_endpoints {
@@ -672,17 +677,23 @@ fn setup_nft(
                 )?;
             }
 
-            // OUTPUT is required for Ubuntu's local-machine transparent proxy:
-            // packets generated on the box itself never traverse PREROUTING.
-            // The ssserver endpoint exemptions above keep OpenWrt safe from
-            // redirecting sslocal/xray-plugin's own upstream TCP connection
-            // back into the local redir listener.
+            // OUTPUT is required for local-machine transparent proxy: packets
+            // generated on the box itself never traverse PREROUTING. Fixed
+            // direct ranges and server endpoint returns above must stay before
+            // redirect rules so router management/LAN traffic and the proxy
+            // transport itself cannot loop back into sslocal.
             add_nft_tcp_redir_rule("output", "ip", "@proxy4", "@direct4", redir_port, global_proxy, None)?;
             add_nft_tcp_redir_rule("output", "ip6", "@proxy6", "@direct6", redir_port, global_proxy, None)?;
         }
     }
     let udp_tproxy = if let Some(redir_port) = redir_port {
-        match setup_nft_udp_tproxy(redir_port, proxy_exempt_endpoints, global_proxy, client_ip_rules) {
+        match setup_nft_udp_tproxy(
+            redir_port,
+            proxy_exempt_endpoints,
+            global_proxy,
+            proxy_local_output,
+            client_ip_rules,
+        ) {
             Ok(()) => true,
             Err(err) => {
                 warn!(
@@ -744,6 +755,38 @@ fn add_nft_client_direct_return_rule(
         &[
             "add", "rule", "inet", NFT_TABLE, chain, family_expr, "saddr", set_name, proto, "dport", "!=", "53",
             "return",
+        ],
+    )
+}
+
+fn add_output_local_dns_return_rule(proto: &'static str) -> io::Result<()> {
+    command(
+        "nft",
+        &[
+            "add",
+            "rule",
+            "inet",
+            NFT_TABLE,
+            "output",
+            "ip",
+            "daddr",
+            "!=",
+            "127.0.0.0/8",
+            "fib",
+            "daddr",
+            "type",
+            "local",
+            proto,
+            "dport",
+            "53",
+            "return",
+        ],
+    )?;
+    command(
+        "nft",
+        &[
+            "add", "rule", "inet", NFT_TABLE, "output", "ip6", "daddr", "!=", "::1", "fib", "daddr", "type",
+            "local", proto, "dport", "53", "return",
         ],
     )
 }
@@ -820,6 +863,7 @@ fn setup_nft_udp_tproxy(
     redir_port: u16,
     proxy_exempt_endpoints: &[(IpAddr, u16)],
     global_proxy: bool,
+    proxy_local_output: bool,
     client_ip_rules: &ClientIpRules,
 ) -> io::Result<()> {
     setup_tproxy_policy_routing()?;
@@ -842,25 +886,27 @@ fn setup_nft_udp_tproxy(
             "}",
         ],
     )?;
-    command(
-        "nft",
-        &[
-            "add",
-            "chain",
-            "inet",
-            NFT_TABLE,
-            TPROXY_OUTPUT_CHAIN,
-            "{",
-            "type",
-            "route",
-            "hook",
-            "output",
-            "priority",
-            "mangle",
-            ";",
-            "}",
-        ],
-    )?;
+    if proxy_local_output {
+        command(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "inet",
+                NFT_TABLE,
+                TPROXY_OUTPUT_CHAIN,
+                "{",
+                "type",
+                "route",
+                "hook",
+                "output",
+                "priority",
+                "mangle",
+                ";",
+                "}",
+            ],
+        )?;
+    }
     add_nft_udp_tproxy_prerouting_rule(
         "ip",
         "@proxy4",
@@ -879,25 +925,7 @@ fn setup_nft_udp_tproxy(
         global_proxy,
         client_ip_rules,
     )?;
-    command(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "inet",
-            NFT_TABLE,
-            TPROXY_OUTPUT_CHAIN,
-            "meta",
-            "mark",
-            TPROXY_MARK,
-            "return",
-        ],
-    )?;
-    for (ip, exempt_port) in proxy_exempt_endpoints {
-        let family_expr = match ip {
-            IpAddr::V4(..) => "ip",
-            IpAddr::V6(..) => "ip6",
-        };
+    if proxy_local_output {
         command(
             "nft",
             &[
@@ -906,18 +934,38 @@ fn setup_nft_udp_tproxy(
                 "inet",
                 NFT_TABLE,
                 TPROXY_OUTPUT_CHAIN,
-                family_expr,
-                "daddr",
-                &ip.to_string(),
-                "udp",
-                "dport",
-                &exempt_port.to_string(),
+                "meta",
+                "mark",
+                TPROXY_MARK,
                 "return",
             ],
         )?;
+        for (ip, exempt_port) in proxy_exempt_endpoints {
+            let family_expr = match ip {
+                IpAddr::V4(..) => "ip",
+                IpAddr::V6(..) => "ip6",
+            };
+            command(
+                "nft",
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    NFT_TABLE,
+                    TPROXY_OUTPUT_CHAIN,
+                    family_expr,
+                    "daddr",
+                    &ip.to_string(),
+                    "udp",
+                    "dport",
+                    &exempt_port.to_string(),
+                    "return",
+                ],
+            )?;
+        }
+        add_nft_udp_tproxy_output_rule("ip", "@proxy4", "@direct4", global_proxy)?;
+        add_nft_udp_tproxy_output_rule("ip6", "@proxy6", "@direct6", global_proxy)?;
     }
-    add_nft_udp_tproxy_output_rule("ip", "@proxy4", "@direct4", global_proxy)?;
-    add_nft_udp_tproxy_output_rule("ip6", "@proxy6", "@direct6", global_proxy)?;
     Ok(())
 }
 

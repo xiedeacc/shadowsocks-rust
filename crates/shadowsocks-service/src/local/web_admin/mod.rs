@@ -1418,8 +1418,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .form-line{display:grid;grid-template-columns:150px 1fr;gap:10px;align-items:center;margin:4px 0}
     .form-line label{margin:0;font-size:13px}
     .form-line input[type=checkbox]{width:16px;height:16px;margin:0;justify-self:start}
-    .client-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:6px;min-height:32px}
-    .client-row{display:flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:7px;padding:6px 8px;background:#f8fbfe;min-width:0}
+    .client-select{position:relative;min-height:32px}
+    .client-select-button{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;margin:0;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:#f8fbfe;color:var(--ink);text-align:left}
+    .client-select-button:hover{background:#eef6fd;color:var(--ink)}
+    .client-select-button span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .client-select-caret{color:var(--muted);font-size:11px;flex:0 0 auto}
+    .client-select-panel{display:none;position:absolute;z-index:30;top:calc(100% + 4px);left:0;right:0;max-height:220px;overflow:auto;border:1px solid var(--line);border-radius:7px;background:#fff;box-shadow:0 8px 22px #10203324;padding:5px}
+    .client-select.open .client-select-panel{display:block}
+    .client-row{display:flex;align-items:center;gap:6px;border-radius:6px;padding:6px 7px;background:#fff;min-width:0;cursor:pointer}
+    .client-row:hover{background:#f4f9fd}
     .client-row input{width:16px;height:16px;margin:0;flex:0 0 auto}
     .client-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .filter-inline{display:flex;align-items:center;gap:6px;min-width:220px}
@@ -1705,11 +1712,34 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     function renderClientPolicyList(id,ips,selected,cls){
       let box=document.getElementById(id);
-      box.innerHTML=ips.length?ips.map(ip=>`<label class="client-row"><input class="${cls}" type="checkbox" value="${esc(ip)}" ${selected.has(ip)?'checked':''} onchange="onClientPolicyChange(this)"><span title="${esc(clientLabel(ip))}">${esc(clientLabel(ip))}</span></label>`).join(''):'<span class="hint">No DHCP clients</span>';
+      box.className='client-select';
+      let options=ips.length?ips.map(ip=>`<label class="client-row"><input class="${cls}" type="checkbox" value="${esc(ip)}" ${selected.has(ip)?'checked':''} onchange="onClientPolicyChange(this)"><span title="${esc(clientLabel(ip))}">${esc(clientLabel(ip))}</span></label>`).join(''):'<div class="hint" style="padding:6px 7px">No DHCP clients</div>';
+      box.innerHTML=`<button type="button" class="client-select-button" onclick="toggleClientSelect(event,'${id}')"><span class="client-select-summary"></span><span class="client-select-caret">v</span></button><div class="client-select-panel">${options}</div>`;
+      updateClientSelectSummary(id);
+    }
+    function toggleClientSelect(event,id){
+      event.preventDefault();
+      event.stopPropagation();
+      let box=document.getElementById(id), open=!box.classList.contains('open');
+      document.querySelectorAll('.client-select.open').forEach(el=>{if(el!==box)el.classList.remove('open')});
+      box.classList.toggle('open',open);
+    }
+    document.addEventListener('click',event=>{
+      if(!event.target.closest('.client-select'))document.querySelectorAll('.client-select.open').forEach(el=>el.classList.remove('open'));
+    });
+    function updateClientSelectSummary(id){
+      let box=document.getElementById(id), summary=box&&box.querySelector('.client-select-summary');
+      if(!summary)return;
+      let values=[...box.querySelectorAll('input[type=checkbox]:checked')].map(el=>el.value);
+      if(!values.length){summary.textContent='None';return}
+      let labels=values.map(clientLabel);
+      summary.textContent=labels.length===1?labels[0]:(labels.length+' selected: '+labels.slice(0,2).join(', ')+(labels.length>2?' ...':''));
     }
     function onClientPolicyChange(input){
       let other=input.classList.contains('client-global-proxy')?'client-direct':'client-global-proxy';
       if(input.checked)document.querySelectorAll('input.'+other).forEach(el=>{if(el.value===input.value)el.checked=false});
+      updateClientSelectSummary('clientGlobalProxyList');
+      updateClientSelectSummary('clientDirectList');
       updateClientJson();
     }
     function selectedClientIps(cls){return [...document.querySelectorAll('input.'+cls+':checked')].map(el=>el.value)}

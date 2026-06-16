@@ -91,6 +91,9 @@
 - `dns_cache_refresh_enabled`：是否刷新 Proxy DNS 缓存。默认 `true`。
 - `dns_cache_refresh_batch_size`：每批刷新 Proxy DNS 缓存条数。默认 `500`，解析配置时至少为 `1`。
 - `dns_intercept_mode`：`"off"`、`"firewall"`、`"tun"` 或 `"both"`。默认 `"off"`。
+- `proxy_local_output`：是否代理运行 sslocal 的机器本机发起的非 DNS TCP/UDP OUTPUT 流量。默认 `false`。
+  OpenWrt/router 如果需要路由器本机也透明翻墙，可以开启；开启后仍必须先放行固定内网网段和
+  Shadowsocks server 端点，避免内网通信受影响或代理出口回环。
 - `dns_ipv4_only`：是否过滤 AAAA 响应。默认 `true`。
 
 ## 规则生成模块
@@ -517,23 +520,32 @@ flowchart TD
     F --> G[创建 output nat chain]
     G --> H[PREROUTING UDP/TCP dport 53 redirect 到本地 DNS]
     H --> I[OUTPUT 对 DNS 上游 IP dport 53 return]
-    I --> J[OUTPUT UDP/TCP dport 53 redirect 到本地 DNS]
+    I --> I1[OUTPUT 对本机地址 dport 53 return]
+    I1 --> J[OUTPUT UDP/TCP dport 53 redirect 到本地 DNS]
     J --> K{存在 redir 端口?}
     K -- 是 --> L[PREROUTING 命中 Proxy set 的非 53 TCP redirect 到 redir]
-    L --> M[OUTPUT 放行 Shadowsocks 服务器 TCP 端点]
-    M --> N[OUTPUT 命中 Proxy set 的非 53 TCP redirect 到 redir]
-    N --> N1[安装 UDP tproxy policy routing]
-    N1 --> N2[创建 prerouting_tproxy/output_tproxy mangle chains]
+    L --> M{proxy_local_output?}
+    M -- 是 --> N[OUTPUT 放行 Shadowsocks 服务器 TCP 端点]
+    N --> O[OUTPUT 命中 Proxy set 的非 53 TCP redirect 到 redir]
+    M -- 否 --> Q[跳过本机非 DNS TCP OUTPUT 代理]
+    O --> R[安装 UDP tproxy policy routing]
+    Q --> R
+    R --> N2[创建 prerouting_tproxy；必要时创建 output_tproxy]
     N2 --> N3[PREROUTING 命中 Proxy set 的非 53 UDP tproxy 到 redir]
-    N3 --> N4[OUTPUT 标记命中 Proxy set 的非 53 UDP 并经 policy route 回环到 tproxy]
-    K -- 否 --> O[完成 DNS-only 拦截]
-    N4 --> P[返回 DnsInterceptGuard]
-    O --> P
+    N3 --> N4{proxy_local_output?}
+    N4 -- 是 --> N5[OUTPUT 标记命中 Proxy set 的非 53 UDP 并经 policy route 回环到 tproxy]
+    N4 -- 否 --> N6[跳过本机非 DNS UDP OUTPUT 代理]
+    K -- 否 --> S[完成 DNS-only 拦截]
+    N5 --> P[返回 DnsInterceptGuard]
+    N6 --> P
+    S --> P
 ```
 
 
 
 `DnsInterceptGuard` 在 drop 时会删除 `inet ssrust_dns` 表。非正常退出无法触发 drop，所以启动时如果当前配置不启用 firewall 模式，会主动清理遗留表。
+
+OUTPUT 侧的本机地址 DNS 例外使用 `fib daddr type local`，但排除 loopback：它只匹配 OpenWrt 自己当前持有的非 loopback 地址（例如 LAN IP、WAN IP 和本机 IPv6 地址），用于让路由器本机显式查询 `192.168.2.1:53` 这类 dnsmasq 地址时不被重定向。这不会匹配下一跳网关地址，因此 OpenWrt 的 WAN 下一跳即使是 `192.168.1.1` 也不会绕过 DNS 拦截；同时 LAN 客户端访问 `192.168.2.1:53` 仍在 PREROUTING 被重定向到本地 DNS 拦截端口。`127.0.0.1:53` 不在这个例外内，路由器本机默认公网 DNS 解析仍会进入本地 DNS 分流。
 
 ### iptables 回退
 

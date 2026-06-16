@@ -46,7 +46,8 @@
     "dns_cache_refresh_enabled": true,
     "dns_cache_refresh_batch_size": 500,
     "dns_intercept_mode": "both",
-    "dns_ipv4_only": true
+    "dns_ipv4_only": true,
+    "proxy_local_output": true
   },
   "servers": [
     {

@@ -7,8 +7,55 @@ USE_PROCD=1
 NAME=shadowsocks-rust
 PROG=/usr/local/shadowsocks/bin/sslocal
 CONF=/usr/local/shadowsocks/conf/shadowsocks-client.json
+NFT_TABLE=ssrust_dns
+TPROXY_MARK=0x5355
+TPROXY_TABLE=100
+
+dns_redirect_ports() {
+	local ports parsed port
+	ports="1053"
+	if command -v jsonfilter >/dev/null 2>&1 && [ -s "$CONF" ]; then
+		parsed="$(jsonfilter -i "$CONF" -e '@.locals[@.protocol="dns"].local_port' 2>/dev/null || true)"
+		for port in $parsed; do
+			case "$port" in
+				''|*[!0-9]*) ;;
+				*) ports="$ports $port" ;;
+			esac
+		done
+	fi
+	printf '%s\n' $ports | sort -n -u
+}
+
+cleanup_iptables_dns_redirect() {
+	local chain proto port
+	command -v iptables >/dev/null 2>&1 || return 0
+	for port in $(dns_redirect_ports); do
+		for chain in PREROUTING OUTPUT; do
+			for proto in udp tcp; do
+				while iptables -t nat -D "$chain" -p "$proto" --dport 53 -j REDIRECT --to-ports "$port" 2>/dev/null; do
+					:
+				done
+			done
+		done
+	done
+}
+
+cleanup_firewall() {
+	if command -v nft >/dev/null 2>&1; then
+		nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+	fi
+	if command -v ip >/dev/null 2>&1; then
+		while ip rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null; do
+			:
+		done
+		ip route del local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" 2>/dev/null || true
+		ip -6 route del local ::/0 dev lo table "$TPROXY_TABLE" 2>/dev/null || true
+	fi
+	cleanup_iptables_dns_redirect
+}
 
 start_service() {
+	cleanup_firewall
 	procd_open_instance
 	procd_set_param command "$PROG" -c "$CONF" --nofile 1048576
 	procd_set_param respawn 3600 5 5
@@ -20,10 +67,12 @@ start_service() {
 
 reload_service() {
 	stop
+	cleanup_firewall
 	start
 }
 
 restart_service() {
 	stop
+	cleanup_firewall
 	start
 }

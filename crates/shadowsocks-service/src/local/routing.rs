@@ -114,6 +114,8 @@ pub struct RoutingSources {
     #[serde(default)]
     pub global_proxy: bool,
     #[serde(default)]
+    pub proxy_local_output: bool,
+    #[serde(default)]
     pub client_global_proxy_ips: Vec<IpAddr>,
     #[serde(default)]
     pub client_direct_ips: Vec<IpAddr>,
@@ -180,6 +182,7 @@ impl From<&RouteRulesConfig> for RoutingSources {
             geoip_sources: config.geoip_sources.clone(),
             proxy_domain_sources: config.proxy_domain_sources.clone(),
             global_proxy: config.global_proxy,
+            proxy_local_output: config.proxy_local_output,
             client_global_proxy_ips: config.client_global_proxy_ips.clone(),
             client_direct_ips: config.client_direct_ips.clone(),
             dns_cache_capacity: config.dns_cache_capacity,
@@ -2186,6 +2189,7 @@ impl RoutingState {
         let flow_decisions = inner.flow_decisions.clone();
         let system_connection_baseline = inner.system_connection_baseline.clone();
         let global_proxy = inner.sources.global_proxy;
+        let proxy_local_output = inner.sources.proxy_local_output;
         let client_global_proxy_ips = inner
             .sources
             .client_global_proxy_ips
@@ -2259,7 +2263,8 @@ impl RoutingState {
                     event.decision = *decision;
                 } else if client_direct_ips.contains(&event.source_ip) {
                     event.decision = ConnectionDecision::Direct;
-                } else if (global_proxy || client_global_proxy_ips.contains(&event.source_ip))
+                } else if proxy_local_output
+                    && (global_proxy || client_global_proxy_ips.contains(&event.source_ip))
                     && system_connection_should_be_redir(&event)
                 {
                     event.decision = ConnectionDecision::Redir;
@@ -3897,6 +3902,15 @@ mod tests {
         event.destination_port = 443;
         event.destination_ip = Some("192.168.2.1".parse().unwrap());
         assert!(!system_connection_should_be_redir(&event));
+    }
+
+    #[test]
+    fn proxy_local_output_defaults_off() {
+        let mut config = RouteRulesConfig::default();
+        assert!(!RoutingSources::from(&config).proxy_local_output);
+
+        config.proxy_local_output = true;
+        assert!(RoutingSources::from(&config).proxy_local_output);
     }
 
     #[test]
