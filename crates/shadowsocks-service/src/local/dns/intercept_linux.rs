@@ -936,7 +936,8 @@ fn add_nft_sets() -> io::Result<()> {
         let _ = command(
             "nft",
             &[
-                "add", "set", "inet", NFT_TABLE, name, "{", "type", kind, ";", "flags", "interval", ";", "}",
+                "add", "set", "inet", NFT_TABLE, name, "{", "type", kind, ";", "flags", "interval", ";",
+                "auto-merge", ";", "}",
             ],
         );
     }
