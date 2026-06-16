@@ -3,10 +3,9 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
-    io::{self, Write},
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         Arc, RwLock as StdRwLock,
         atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
@@ -21,7 +20,7 @@ use hickory_resolver::proto::{
     serialize::binary::{BinDecodable, BinEncodable},
 };
 use ipnet::IpNet;
-use log::warn;
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use shadowsocks::relay::socks5::Address;
 use tokio::{
@@ -65,6 +64,16 @@ const SLOW_HOT_PATH_MS: u128 = 100;
 
 use crate::config::RouteRulesConfig;
 use crate::local::utils::is_fixed_direct_ip;
+
+// Pure helpers split into child modules; re-exported so existing call sites keep
+// working unqualified. `fileio` = file IO / source download / geoip parsing;
+// `rules` = rule compilation, IP/domain matching, conflict detection.
+mod fileio;
+mod rules;
+#[allow(unused_imports)]
+use fileio::*;
+#[allow(unused_imports)]
+use rules::*;
 
 const DIRECT_IP_FILE: &str = "direct_ip.txt";
 const DIRECT_DOMAIN_FILE: &str = "direct_domain.txt";
@@ -1017,39 +1026,61 @@ impl RoutingState {
             return Ok(false);
         }
 
-        {
+        // Phase 1 (under the write lock): O(1)/near-O(1) dedup against the
+        // compiled temporary proxy set, then extend the in-memory rules. The
+        // previous implementation did an O(n) raw-line rescan, a full
+        // rebuild_conflicts() (geoip-sized sweep) AND a replace_route_nets()
+        // (full flush+rebuild of the entire nft set) per learned IP — all on the
+        // Futu connection hot path (audit H-4/SI-3). None of that is needed: the
+        // file write is moved off the lock below, conflicts only change with the
+        // rule files, and the nft set is updated incrementally.
+        let (rules_dir, rules_to_write) = {
             let mut inner = self.inner.write().await;
-            if inner
-                .temporary_raw
-                .proxy_ip
-                .iter()
-                .any(|rule| proxy_ip_line_matches_ip(rule, &ip))
-            {
+            if compiled_rules_match_ip(&inner.temporary.proxy_ip_exact, &inner.temporary.proxy_ip, &ip) {
                 return Ok(false);
             }
             let mut rules = inner.temporary_raw.clone();
             rules.proxy_ip.push(ip.to_string());
             let rules = with_private_direct_rules(normalize_rule_lists(rules));
             validate_temporary_rules(&rules)?;
-            write_temporary_rule_lists(&inner.rules_dir, &rules)?;
-            inner.temporary_fingerprint = temporary_files_fingerprint(&inner.rules_dir)?;
-            inner.temporary_raw = rules;
+            inner.temporary_raw = rules.clone();
             inner.temporary = compile_rules(&inner.temporary_raw)?;
-            rebuild_conflicts(&mut inner);
+            (inner.rules_dir.clone(), rules)
+        };
+
+        // Persist the temp rule files off the async worker (blocking std::fs),
+        // then refresh the fingerprint so the 2s file-watcher does not redundantly
+        // reload them. Awaited, so the file is on disk when this call returns
+        // (preserves the "learned IP is immediately saved" contract).
+        let write_dir = rules_dir.clone();
+        let write_result = tokio::task::spawn_blocking(move || -> io::Result<Vec<Option<u64>>> {
+            write_temporary_rule_lists(&write_dir, &rules_to_write)?;
+            temporary_files_fingerprint(&write_dir)
+        })
+        .await;
+        match write_result {
+            Ok(Ok(fingerprint)) => self.inner.write().await.temporary_fingerprint = fingerprint,
+            Ok(Err(err)) => return Err(err),
+            Err(err) => return Err(io::Error::other(format!("temp proxy persist task failed: {err}"))),
         }
 
+        // Incrementally add just this IP to the nft proxy set (one batched
+        // `nft -f` add), off the async worker — no full set rebuild.
         #[cfg(all(target_os = "linux", feature = "local-dns"))]
         {
-            let (rules_dir, direct_nets, proxy_nets) = {
-                let inner = self.inner.read().await;
-                persistent_nft_route_nets(&inner)
-            };
-            if let Err(err) = crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct_nets, &proxy_nets) {
-                warn!("failed to refresh nft proxy set after learned SOCKS proxy IP: {}", err);
-            } else {
-                self.set_nft_route_index_from_nets(&direct_nets, &proxy_nets).await;
+            let add_result = tokio::task::spawn_blocking(move || -> io::Result<()> {
+                crate::local::dns::intercept_linux::add_route_ips(RouteDecision::Proxy, &[ip])?;
+                // Drop any conntrack entry pinned to the old (direct) verdict so
+                // the next packet to this IP is re-evaluated against proxy4.
+                crate::local::dns::intercept_linux::flush_conntrack_dst(&[ip]);
+                Ok(())
+            })
+            .await;
+            match add_result {
+                Ok(Ok(())) => self.add_nft_route_index_ips(RouteDecision::Proxy, &[ip]).await,
+                Ok(Err(err)) => warn!("failed to add learned SOCKS proxy IP {} to nft: {}", ip, err),
+                Err(err) => warn!("failed to join nft add task for learned SOCKS proxy IP {}: {}", ip, err),
             }
-            crate::local::dns::intercept_linux::flush_conntrack_dst(&[ip]);
         }
 
         Ok(true)
@@ -1102,6 +1133,34 @@ impl RoutingState {
         route_domain_inner(&inner, domain)
     }
 
+    /// Resolver decision for a DNS query, honoring per-source overrides (req 2.3).
+    ///
+    /// A forced-direct source IP must ALWAYS resolve via the DOMESTIC resolver
+    /// (`RouteDecision::Direct`), regardless of `proxy_domain` membership or
+    /// `global_proxy`: its data-plane traffic is forced direct at the firewall
+    /// (`saddr @client_direct … return`), so handing it foreign/proxy-only IPs
+    /// — which it would then try to reach directly — is exactly the geo-split
+    /// mismatch req 2.3 exists to prevent. The check is a tiny linear scan over
+    /// the (usually 0–3 entry) `client_direct_ips` list.
+    pub async fn route_domain_for_source(&self, domain: &str, source_ip: Option<IpAddr>) -> Option<RouteDecision> {
+        let inner = self.inner.read().await;
+        if let Some(ip) = source_ip
+            && inner.sources.client_direct_ips.contains(&ip)
+        {
+            return Some(RouteDecision::Direct);
+        }
+        route_domain_inner(&inner, domain)
+    }
+
+    /// Whether `source_ip` is configured as a forced-direct client (req 2.3).
+    /// Such a client's traffic must bypass the proxy even on the explicit
+    /// SOCKS/HTTP entry points (the transparent redir/tproxy path already
+    /// enforces this in the kernel via the `saddr @client_direct … return`
+    /// rule). Tiny linear scan over the (usually 0–3 entry) list.
+    pub async fn source_is_forced_direct(&self, source_ip: IpAddr) -> bool {
+        self.inner.read().await.sources.client_direct_ips.contains(&source_ip)
+    }
+
     pub async fn route_address(&self, addr: &Address) -> Option<RouteDecision> {
         match addr {
             Address::SocketAddress(saddr) => self.route_ip(&saddr.ip()).await,
@@ -1130,6 +1189,7 @@ impl RoutingState {
             let mut nft_ips = Vec::new();
             let mut lines = Vec::new();
             let mut proxy_changed = false;
+            let mut new_proxy_ips = Vec::new();
             for ip in results {
                 match decision {
                     RouteDecision::Direct => {
@@ -1171,6 +1231,7 @@ impl RoutingState {
                             lines.push(line);
                             proxy_changed = true;
                             inner.persistent.proxy_ip_exact.insert(*ip);
+                            new_proxy_ips.push(*ip);
                         }
                     }
                 }
@@ -1197,11 +1258,20 @@ impl RoutingState {
                     }
                 }
             }
-            rebuild_ip_conflicts(&mut inner);
+            // PERF: index conflicts only for the IPs newly learned in THIS call,
+            // instead of re-running the full O(proxy_set × geoip) sweep that
+            // rebuild_ip_conflicts performs. Pre-existing conflicts come from the
+            // rule files (computed on load / file change); add_dns_results only
+            // ever appends proxy IPs, so an incremental check stays correct and
+            // keeps the routing write lock off the geoip-sized sweep + file write
+            // on the DNS hot path (audit PERF-2 / H-4).
+            index_new_proxy_ip_conflicts(&mut inner, &new_proxy_ips);
             (nft_ips, global_proxy)
         };
         if !nft_ips.is_empty() {
-            warn!(
+            // Per-resolution diagnostic on the DNS hot path — debug, not warn,
+            // so normal learning does not spam the log (audit low).
+            debug!(
                 "dns processed {} {:?} nft candidate IPs for {}",
                 nft_ips.len(),
                 decision,
@@ -1518,6 +1588,10 @@ impl RoutingState {
         let state = self.clone();
         tokio::spawn(async move {
             let mut interval = time::interval(NFT_INDEX_SYNC_INTERVAL);
+            // If a reconcile (full `nft list table` dump + parse) ever takes
+            // longer than the 5s period, don't fire a burst of catch-up ticks —
+            // just resume on the next interval (audit info).
+            interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
             interval.tick().await;
             loop {
                 interval.tick().await;
@@ -1673,6 +1747,15 @@ impl RoutingState {
         inner.proxy_domain_modified = file_modified(&inner.rules_dir.join(PROXY_DOMAIN_FILE))?;
         rebuild_conflicts(&mut inner);
         drop(inner);
+        // Push the freshly-rebuilt persistent direct/proxy IP rules into the nft
+        // sets. update_from_sources() runs on the weekly timer (and ad-hoc) with
+        // NO service restart, so without this the kernel sets would keep serving
+        // the baseline captured at the last startup/web-admin restart — silently
+        // ignoring proxy_ip additions and direct_ip removals (req 1.2 / 1.7).
+        #[cfg(all(target_os = "linux", feature = "local-dns"))]
+        if let Err(err) = self.sync_persistent_ip_rules_to_firewall().await {
+            warn!("failed to re-sync nft sets after route source update: {}", err);
+        }
         self.set_update_progress(RuleUpdateProgress {
             status: RuleUpdateStatus::Completed,
             current_source: None,
@@ -2233,7 +2316,7 @@ impl RoutingState {
         mark_dns_cache_dirty(&mut inner);
     }
 
-    pub async fn dns_cache_proxy_refresh_candidates(&self) -> Vec<DnsCacheRefreshCandidate> {
+    pub async fn dns_cache_refresh_candidates(&self, resolver: RouteDecision) -> Vec<DnsCacheRefreshCandidate> {
         let inner = self.inner.read().await;
         if !inner.sources.dns_cache_refresh_enabled {
             return Vec::new();
@@ -2245,7 +2328,7 @@ impl RoutingState {
             .dns_cache
             .iter()
             .filter(|(key, entry)| {
-                key.resolver == RouteDecision::Proxy && entry.expires_at > now_ts && entry.refreshed_at <= cutoff
+                key.resolver == resolver && entry.expires_at > now_ts && entry.refreshed_at <= cutoff
             })
             .take(batch_size)
             .map(|(key, _)| DnsCacheRefreshCandidate {
@@ -2768,6 +2851,49 @@ fn rebuild_ip_conflicts(inner: &mut RoutingInner) {
     persist_conflict_events(&inner.rules_dir, TEMP_IP_CONFLICTS_FILE, &inner.ip_conflicts);
 }
 
+/// Incremental counterpart to [`rebuild_ip_conflicts`] for the DNS learning hot
+/// path: only tests the freshly learned proxy IPs against the direct and
+/// geoip-CN sets and appends any conflicts, rather than clearing and re-sweeping
+/// the entire proxy set (which on a populated gateway is thousands of CN CIDRs
+/// re-sorted under the routing write lock per result — audit PERF-2). Does NOT
+/// persist the conflict file here; it is rewritten on the next rule-file change.
+fn index_new_proxy_ip_conflicts(inner: &mut RoutingInner, new_proxy_ips: &[IpAddr]) {
+    for ip in new_proxy_ips {
+        let value = ip.to_string();
+        if compiled_rules_match_ip(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip, ip) {
+            push_ip_conflict_if_absent(
+                &mut inner.ip_conflicts,
+                &value,
+                vec!["direct".to_owned(), "proxy".to_owned()],
+                vec![DIRECT_IP_FILE.to_owned(), PROXY_IP_FILE.to_owned()],
+            );
+        }
+        if rules_match_ip(&inner.geoip_cn, ip) {
+            push_ip_conflict_if_absent(
+                &mut inner.ip_conflicts,
+                &value,
+                vec!["cn".to_owned(), "proxy".to_owned()],
+                vec!["geoip.dat".to_owned(), PROXY_IP_FILE.to_owned()],
+            );
+        }
+    }
+}
+
+fn push_ip_conflict_if_absent(
+    events: &mut VecDeque<ConflictEvent>,
+    value: &str,
+    regions: Vec<String>,
+    sources: Vec<String>,
+) {
+    if events.iter().any(|e| e.value == value && e.regions == regions) {
+        return;
+    }
+    push_event(
+        events,
+        new_conflict_event_with_metadata(ConflictKind::Ip, value.to_owned(), regions, sources),
+    );
+}
+
 fn rebuild_domain_conflicts(inner: &mut RoutingInner) {
     inner.domain_conflicts.clear();
     for rule in domain_rule_conflicts(&inner.persistent.direct_domain.raw, &inner.persistent.proxy_domain.raw) {
@@ -2810,417 +2936,6 @@ fn new_conflict_event_with_metadata(
         regions,
         sources,
     }
-}
-
-fn rules_match_ip(rules: &[IpNet], ip: &IpAddr) -> bool {
-    rules.iter().any(|net| net.contains(ip))
-}
-
-fn ip_nets_overlap(left: &IpNet, right: &IpNet) -> bool {
-    match (left, right) {
-        (IpNet::V4(left), IpNet::V4(right)) => left.contains(&right.network()) || right.contains(&left.network()),
-        (IpNet::V6(left), IpNet::V6(right)) => left.contains(&right.network()) || right.contains(&left.network()),
-        _ => false,
-    }
-}
-
-fn ip_net_conflicts(direct: &[IpNet], proxy: &[IpNet]) -> Vec<String> {
-    let mut direct_v4 = Vec::new();
-    let mut direct_v6 = Vec::new();
-    let mut proxy_v4 = Vec::new();
-    let mut proxy_v6 = Vec::new();
-    for net in direct {
-        let range = ip_net_range(net);
-        if range.is_v4 {
-            direct_v4.push(range);
-        } else {
-            direct_v6.push(range);
-        }
-    }
-    for net in proxy {
-        let range = ip_net_range(net);
-        if range.is_v4 {
-            proxy_v4.push(range);
-        } else {
-            proxy_v6.push(range);
-        }
-    }
-
-    let mut conflicts = ip_range_conflicts(direct_v4, proxy_v4);
-    conflicts.extend(ip_range_conflicts(direct_v6, proxy_v6));
-    conflicts.sort_unstable();
-    conflicts.dedup();
-    conflicts
-}
-
-#[derive(Clone, Debug)]
-struct IpRange {
-    start: u128,
-    end: u128,
-    label: String,
-    is_v4: bool,
-}
-
-fn ip_net_range(net: &IpNet) -> IpRange {
-    match net {
-        IpNet::V4(net) => {
-            let start = u32::from(net.network()) as u128;
-            IpRange {
-                start,
-                end: ip_range_end(start, 32, net.prefix_len()),
-                label: display_ip_net(&IpNet::V4(*net)),
-                is_v4: true,
-            }
-        }
-        IpNet::V6(net) => {
-            let start = u128::from(net.network());
-            IpRange {
-                start,
-                end: ip_range_end(start, 128, net.prefix_len()),
-                label: display_ip_net(&IpNet::V6(*net)),
-                is_v4: false,
-            }
-        }
-    }
-}
-
-fn ip_range_end(start: u128, bits: u8, prefix_len: u8) -> u128 {
-    let host_bits = bits.saturating_sub(prefix_len);
-    if host_bits == 0 {
-        start
-    } else if host_bits >= 128 {
-        u128::MAX
-    } else {
-        start | ((1u128 << host_bits) - 1)
-    }
-}
-
-fn ip_range_conflicts(mut direct: Vec<IpRange>, mut proxy: Vec<IpRange>) -> Vec<String> {
-    direct.sort_unstable_by_key(|range| (range.start, range.end));
-    proxy.sort_unstable_by_key(|range| (range.start, range.end));
-
-    let mut conflicts = Vec::new();
-    let mut first_possible = 0usize;
-    for direct in &direct {
-        while first_possible < proxy.len() && proxy[first_possible].end < direct.start {
-            first_possible += 1;
-        }
-        let mut idx = first_possible;
-        while idx < proxy.len() && proxy[idx].start <= direct.end {
-            if proxy[idx].end >= direct.start {
-                conflicts.push(format_ip_conflict(&direct.label, &proxy[idx].label));
-            }
-            idx += 1;
-        }
-    }
-    conflicts
-}
-
-fn format_ip_conflict(direct: &str, proxy: &str) -> String {
-    if direct == proxy {
-        direct.to_owned()
-    } else {
-        format!("{direct} <-> {proxy}")
-    }
-}
-
-fn display_ip_net(net: &IpNet) -> String {
-    match net {
-        IpNet::V4(net) if net.prefix_len() == 32 => net.addr().to_string(),
-        IpNet::V6(net) if net.prefix_len() == 128 => net.addr().to_string(),
-        _ => net.to_string(),
-    }
-}
-
-fn compiled_rules_match_ip(exact: &HashSet<IpAddr>, nets: &[IpNet], ip: &IpAddr) -> bool {
-    exact.contains(ip) || rules_match_ip(nets, ip)
-}
-
-fn rules_match_domain(rules: &CompiledDomainRules, domain: &str) -> bool {
-    if rules.match_all || rules.exact.contains(domain) {
-        return true;
-    }
-    let mut candidate = domain;
-    loop {
-        if candidate.contains('.') && rules.suffix.contains(candidate) {
-            return true;
-        }
-        let Some((_, suffix)) = candidate.split_once('.') else {
-            break;
-        };
-        candidate = suffix;
-    }
-    false
-}
-
-fn domain_rule_conflicts(direct: &HashSet<String>, proxy: &HashSet<String>) -> Vec<String> {
-    let mut conflicts = Vec::new();
-    let direct_wildcards = direct.iter().filter(|rule| rule.contains('*')).collect::<Vec<_>>();
-    let proxy_wildcards = proxy.iter().filter(|rule| rule.contains('*')).collect::<Vec<_>>();
-
-    for direct in direct {
-        if direct.contains('*') {
-            continue;
-        }
-        for proxy_candidate in domain_match_candidates(direct) {
-            if proxy.contains(&proxy_candidate) {
-                conflicts.push(format_domain_conflict(direct, &proxy_candidate));
-            }
-        }
-    }
-
-    for proxy in proxy {
-        if proxy.contains('*') {
-            continue;
-        }
-        for direct_candidate in domain_match_candidates(proxy) {
-            if direct.contains(&direct_candidate) {
-                conflicts.push(format_domain_conflict(&direct_candidate, proxy));
-            }
-        }
-    }
-
-    for direct in &direct_wildcards {
-        for proxy in proxy {
-            if domain_rules_overlap(direct, proxy) {
-                conflicts.push(format_domain_conflict(direct, proxy));
-            }
-        }
-    }
-
-    for proxy in &proxy_wildcards {
-        for direct in direct {
-            if direct.contains('*') {
-                continue;
-            }
-            if domain_rules_overlap(direct, proxy) {
-                conflicts.push(format_domain_conflict(direct, proxy));
-            }
-        }
-    }
-
-    conflicts.sort_unstable();
-    conflicts.dedup();
-    conflicts
-}
-
-fn domain_match_candidates(domain: &str) -> Vec<String> {
-    let mut candidates = vec![domain.to_owned()];
-    for (idx, _) in domain.match_indices('.') {
-        let suffix = &domain[idx + 1..];
-        if suffix.contains('.') {
-            candidates.push(suffix.to_owned());
-        }
-    }
-    candidates
-}
-
-fn format_domain_conflict(direct: &str, proxy: &str) -> String {
-    if direct == proxy {
-        direct.to_owned()
-    } else {
-        format!("{direct} <-> {proxy}")
-    }
-}
-
-fn domain_rules_overlap(left: &str, right: &str) -> bool {
-    domain_matches_rule(left, right) || domain_matches_rule(right, left)
-}
-
-fn domain_matches_rule(rule: &str, domain: &str) -> bool {
-    if let Some(suffix_rule) = rule.strip_prefix("*.") {
-        domain_matches_rule(suffix_rule, domain)
-    } else if rule.contains('*') {
-        false
-    } else if !rule.contains('.') {
-        domain == rule
-    } else {
-        domain == rule
-            || (domain.len() > rule.len()
-                && domain.ends_with(rule)
-                && domain.as_bytes()[domain.len() - rule.len() - 1] == b'.')
-    }
-}
-
-fn compile_rules(raw: &RuleLists) -> io::Result<CompiledRules> {
-    let (direct_ip, direct_ip_exact, _) = compile_ip_rules(&raw.direct_ip, false);
-    let (proxy_ip, proxy_ip_exact, proxy_ip_domainless_exact) = compile_ip_rules(&raw.proxy_ip, true);
-    Ok(CompiledRules {
-        direct_ip,
-        direct_ip_exact,
-        direct_domain: compile_domain_rules(&raw.direct_domain)?,
-        proxy_ip,
-        proxy_ip_exact,
-        proxy_ip_domainless_exact,
-        proxy_domain: compile_domain_rules(&raw.proxy_domain)?,
-    })
-}
-
-fn compile_ip_rules(lines: &[String], track_domainless_exact: bool) -> (Vec<IpNet>, HashSet<IpAddr>, HashSet<IpAddr>) {
-    let mut cidrs = Vec::new();
-    let mut exact = HashSet::new();
-    let mut domainless_exact = HashSet::new();
-    for line in lines {
-        let Some(value) = ip_rule_value(line) else {
-            continue;
-        };
-        let domainless = line.split_whitespace().nth(1).is_none();
-        if let Ok(ip) = value.parse::<IpAddr>() {
-            exact.insert(ip);
-            if track_domainless_exact && domainless {
-                domainless_exact.insert(ip);
-            }
-            continue;
-        }
-        let Ok(net) = value.parse::<IpNet>() else {
-            continue;
-        };
-        if let Some(ip) = host_net_ip(&net) {
-            exact.insert(ip);
-            if track_domainless_exact && domainless {
-                domainless_exact.insert(ip);
-            }
-        } else {
-            cidrs.push(net);
-        }
-    }
-    (cidrs, exact, domainless_exact)
-}
-
-fn host_net_ip(net: &IpNet) -> Option<IpAddr> {
-    match net {
-        IpNet::V4(net) if net.prefix_len() == 32 => Some(IpAddr::V4(net.addr())),
-        IpNet::V6(net) if net.prefix_len() == 128 => Some(IpAddr::V6(net.addr())),
-        _ => None,
-    }
-}
-
-fn compiled_rule_nets_for_nft(exact: &HashSet<IpAddr>, cidrs: &[IpNet]) -> Vec<IpNet> {
-    let mut nets = Vec::with_capacity(exact.len() + cidrs.len());
-    nets.extend(exact.iter().copied().map(IpNet::from));
-    nets.extend(cidrs.iter().copied());
-    nets
-}
-
-fn compiled_rule_net_count(exact: &HashSet<IpAddr>, cidrs: &[IpNet]) -> usize {
-    exact.len() + cidrs.len()
-}
-
-fn nft_route_index_from_nets(direct: &[IpNet], proxy: &[IpNet]) -> NftRouteIndex {
-    let (direct_ip, direct_ip_exact) = nft_route_index_split_nets(direct);
-    let (proxy_ip, proxy_ip_exact) = nft_route_index_split_nets(proxy);
-    NftRouteIndex {
-        direct_ip,
-        direct_ip_exact,
-        proxy_ip,
-        proxy_ip_exact,
-    }
-}
-
-fn nft_route_index_split_nets(nets: &[IpNet]) -> (Vec<IpNet>, HashSet<IpAddr>) {
-    let mut cidrs = Vec::new();
-    let mut exact = HashSet::new();
-    for net in nets {
-        if let Some(ip) = host_net_ip(net) {
-            exact.insert(ip);
-        } else {
-            cidrs.push(*net);
-        }
-    }
-    cidrs.sort_unstable();
-    (cidrs, exact)
-}
-
-fn nft_route_index_matches(index: &NftRouteIndex, decision: RouteDecision, ip: &IpAddr) -> bool {
-    match decision {
-        RouteDecision::Direct => compiled_rules_match_ip(&index.direct_ip_exact, &index.direct_ip, ip),
-        RouteDecision::Proxy => compiled_rules_match_ip(&index.proxy_ip_exact, &index.proxy_ip, ip),
-    }
-}
-
-fn compile_domain_rules(lines: &[String]) -> io::Result<CompiledDomainRules> {
-    let mut compiled = CompiledDomainRules::default();
-    for line in lines {
-        let rule = normalize_domain(line);
-        if rule.is_empty() {
-            continue;
-        }
-        compiled.raw.insert(rule.clone());
-        if rule == "*" {
-            compiled.match_all = true;
-        } else if let Some(suffix) = rule.strip_prefix("*.") {
-            if suffix.is_empty() || suffix.contains('*') || !suffix.contains('.') {
-                return Err(invalid_domain_wildcard(&rule));
-            }
-            compiled.suffix.insert(suffix.to_owned());
-        } else if rule.contains('*') {
-            return Err(invalid_domain_wildcard(&rule));
-        } else if rule.contains('.') {
-            compiled.suffix.insert(rule);
-        } else {
-            compiled.exact.insert(rule);
-        }
-    }
-    Ok(compiled)
-}
-
-fn invalid_domain_wildcard(rule: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("unsupported domain wildcard rule '{rule}'; only '*.domain.tld' wildcard form is supported"),
-    )
-}
-
-fn parse_ip_net(value: &str) -> Option<IpNet> {
-    let value = ip_rule_value(value)?;
-    if let Ok(net) = value.parse::<IpNet>() {
-        return Some(net);
-    }
-    value.parse::<IpAddr>().ok().map(IpNet::from)
-}
-
-#[cfg(test)]
-fn parse_ip_addr(value: &str) -> Option<IpAddr> {
-    ip_rule_value(value)?.parse::<IpAddr>().ok()
-}
-
-fn ip_rule_value(value: &str) -> Option<&str> {
-    value.split_whitespace().next().filter(|value| !value.is_empty())
-}
-
-fn format_proxy_ip_domain_line(ip: &IpAddr, domain: &str) -> String {
-    let domain = normalize_dns_domain(domain);
-    if domain.is_empty() {
-        ip.to_string()
-    } else {
-        format!("{ip} {domain}")
-    }
-}
-
-fn proxy_ip_line_matches_ip(rule: &str, ip: &IpAddr) -> bool {
-    let Some(rule_net) = parse_ip_net(rule) else {
-        return false;
-    };
-    rule_net.contains(ip)
-}
-
-fn proxy_ip_line_exact_matches_ip(rule: &str, ip: &IpAddr) -> bool {
-    let Some(value) = ip_rule_value(rule) else {
-        return false;
-    };
-    if let Ok(rule_ip) = value.parse::<IpAddr>() {
-        return rule_ip == *ip;
-    }
-    value
-        .parse::<IpNet>()
-        .ok()
-        .and_then(|net| host_net_ip(&net))
-        .is_some_and(|rule_ip| rule_ip == *ip)
-}
-
-fn proxy_ip_line_domain(rule: &str) -> Option<String> {
-    let domain = rule.split_whitespace().nth(1).map(normalize_dns_domain)?;
-    (!domain.is_empty()).then_some(domain)
 }
 
 #[derive(Clone, Debug)]
@@ -3930,402 +3645,6 @@ fn route_decision_sort_key(decision: RouteDecision) -> u8 {
     }
 }
 
-fn parse_text_rules(text: &str) -> Vec<String> {
-    text.lines()
-        .filter_map(|line| {
-            let line = line.split('#').next().unwrap_or_default().trim();
-            if line.is_empty() { None } else { Some(line.to_owned()) }
-        })
-        .collect()
-}
-
-fn read_rule_lists(dir: &Path) -> io::Result<RuleLists> {
-    Ok(RuleLists {
-        direct_ip: read_lines(dir.join(DIRECT_IP_FILE))?,
-        direct_domain: read_lines(dir.join(DIRECT_DOMAIN_FILE))?,
-        proxy_ip: read_lines(dir.join(PROXY_IP_FILE))?,
-        proxy_domain: read_lines(dir.join(PROXY_DOMAIN_FILE))?,
-    })
-}
-
-fn read_temporary_rule_lists(dir: &Path) -> io::Result<RuleLists> {
-    Ok(RuleLists {
-        direct_ip: read_temp_lines(dir, TEMP_DIRECT_IP_FILE)?,
-        direct_domain: read_temp_lines(dir, TEMP_DIRECT_DOMAIN_FILE)?,
-        proxy_ip: read_temp_lines(dir, TEMP_PROXY_IP_FILE)?,
-        proxy_domain: read_temp_lines(dir, TEMP_PROXY_DOMAIN_FILE)?,
-    })
-}
-
-fn write_temporary_rule_lists(dir: &Path, lists: &RuleLists) -> io::Result<()> {
-    fs::create_dir_all(dir.join(TEMP_DIR))?;
-    write_lines_atomic(temp_file_path(dir, TEMP_DIRECT_IP_FILE), &lists.direct_ip)?;
-    write_lines_atomic(temp_file_path(dir, TEMP_DIRECT_DOMAIN_FILE), &lists.direct_domain)?;
-    write_lines_atomic(temp_file_path(dir, TEMP_PROXY_IP_FILE), &lists.proxy_ip)?;
-    write_lines_atomic(temp_file_path(dir, TEMP_PROXY_DOMAIN_FILE), &lists.proxy_domain)?;
-    Ok(())
-}
-
-fn temporary_files_fingerprint(dir: &Path) -> io::Result<Vec<Option<u64>>> {
-    [
-        TEMP_DIRECT_IP_FILE,
-        TEMP_DIRECT_DOMAIN_FILE,
-        TEMP_PROXY_IP_FILE,
-        TEMP_PROXY_DOMAIN_FILE,
-    ]
-    .into_iter()
-    .map(|file_name| file_fingerprint(&temp_file_path(dir, file_name)))
-    .collect()
-}
-
-fn file_fingerprint(path: &Path) -> io::Result<Option<u64>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = fs::read(path)?;
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    Ok(Some(hash))
-}
-
-fn read_temp_lines(dir: &Path, file_name: &str) -> io::Result<Vec<String>> {
-    read_lines(temp_file_path(dir, file_name))
-}
-
-fn temp_file_path(dir: &Path, file_name: &str) -> PathBuf {
-    dir.join(TEMP_DIR).join(file_name)
-}
-
-fn sanitize_sources(sources: RoutingSources) -> RoutingSources {
-    let mut sources = sources;
-    dedup_ip_list(&mut sources.client_global_proxy_ips);
-    dedup_ip_list(&mut sources.client_direct_ips);
-    sources
-}
-
-fn dedup_ip_list(values: &mut Vec<IpAddr>) {
-    let mut seen = HashSet::new();
-    values.retain(|ip| seen.insert(*ip));
-}
-
-fn read_lines(path: impl AsRef<Path>) -> io::Result<Vec<String>> {
-    let path = path.as_ref();
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    Ok(parse_text_rules(&fs::read_to_string(path)?))
-}
-
-fn append_lines(path: &Path, lines: &[String]) -> io::Result<()> {
-    if lines.is_empty() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
-    for line in lines {
-        writeln!(file, "{line}")?;
-    }
-    Ok(())
-}
-
-fn write_lines_atomic(path: impl AsRef<Path>, lines: &[String]) -> io::Result<()> {
-    let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file = fs::File::create(&tmp)?;
-        for line in lines {
-            writeln!(file, "{line}")?;
-        }
-    }
-    fs::rename(tmp, path)
-}
-
-fn ensure_file(path: impl AsRef<Path>) -> io::Result<()> {
-    let path = path.as_ref();
-    if !path.exists() {
-        write_lines_atomic(path, &[])?;
-    }
-    Ok(())
-}
-
-fn file_modified(path: &Path) -> io::Result<Option<SystemTime>> {
-    match fs::metadata(path) {
-        Ok(metadata) => metadata.modified().map(Some),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-struct DownloadedSource {
-    bytes: Vec<u8>,
-    display_name: String,
-    status: DownloadedSourceStatus,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DownloadedSourceStatus {
-    Downloaded,
-    FallbackCache,
-    LocalFile,
-}
-
-async fn download_source(source: &str, cache_dir: &Path) -> io::Result<DownloadedSource> {
-    if source.starts_with("http://") || source.starts_with("https://") {
-        let source = source.to_owned();
-        let cache_dir = cache_dir.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let display_name = source_cache_name(&source);
-            let cache_path = cached_source_path(&source, &cache_dir);
-            fs::create_dir_all(&cache_dir)?;
-            let temp_dir = cache_dir.join(SOURCE_TEMP_DIR);
-            fs::create_dir_all(&temp_dir)?;
-            for (cmd, args) in [
-                ("uclient-fetch", vec!["-q", "-O", "-", &source]),
-                ("wget", vec!["-qO-", &source]),
-                ("curl", vec!["-fsSL", &source]),
-            ] {
-                match Command::new(cmd).args(args).output() {
-                    Ok(out) if out.status.success() && !out.stdout.is_empty() => {
-                        write_downloaded_source_atomic(&cache_path, &temp_dir, &out.stdout)?;
-                        return Ok(DownloadedSource {
-                            bytes: out.stdout,
-                            display_name,
-                            status: DownloadedSourceStatus::Downloaded,
-                        });
-                    }
-                    _ => continue,
-                }
-            }
-            if let Some(bytes) = read_non_empty_file(&cache_path)? {
-                return Ok(DownloadedSource {
-                    bytes,
-                    display_name,
-                    status: DownloadedSourceStatus::FallbackCache,
-                });
-            }
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "download failed or returned empty output, and no existing source file is available",
-            ))
-        })
-        .await
-        .map_err(|err| io::Error::other(err.to_string()))?
-    } else {
-        Ok(DownloadedSource {
-            bytes: fs::read(source)?,
-            display_name: source_progress_name(source),
-            status: DownloadedSourceStatus::LocalFile,
-        })
-    }
-}
-
-fn cached_source_path(source: &str, cache_dir: &Path) -> PathBuf {
-    cache_dir.join(source_cache_name(source))
-}
-
-fn write_downloaded_source_atomic(path: &Path, temp_dir: &Path, bytes: &[u8]) -> io::Result<()> {
-    fs::create_dir_all(temp_dir)?;
-    let file_name = path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("source.dat"));
-    let tmp = temp_dir.join(file_name);
-    fs::write(&tmp, bytes)?;
-    fs::rename(tmp, path)
-}
-
-fn source_progress_name(source: &str) -> String {
-    if source.starts_with("http://") || source.starts_with("https://") {
-        source_cache_name(source)
-    } else {
-        Path::new(source)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(source)
-            .to_owned()
-    }
-}
-
-fn source_cache_name(source: &str) -> String {
-    let source = source
-        .split('#')
-        .next()
-        .unwrap_or(source)
-        .split('?')
-        .next()
-        .unwrap_or(source)
-        .trim_end_matches('/');
-    let name = source
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("source.dat");
-    let name = name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if name.is_empty() { "source.dat".to_owned() } else { name }
-}
-
-fn read_non_empty_file(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.len() > 0 => fs::read(path).map(Some),
-        Ok(_) => Ok(None),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-fn read_geoip_cn_nets(path: &Path) -> io::Result<Vec<IpNet>> {
-    match fs::read(path) {
-        Ok(bytes) => parse_geoip_cn_nets(&bytes),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(err),
-    }
-}
-
-fn parse_geoip_cn_nets(bytes: &[u8]) -> io::Result<Vec<IpNet>> {
-    let entries = read_len_fields(bytes, 1)?;
-    if entries.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty geoip.dat"));
-    }
-    let mut nets = Vec::new();
-    for entry in entries {
-        let country = read_string_fields(entry, 1)
-            .into_iter()
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if country != "cn" {
-            continue;
-        }
-        for cidr in read_len_fields(entry, 2)? {
-            let ip = read_bytes_fields(cidr, 1).into_iter().next().unwrap_or_default();
-            let prefix = read_varint_fields(cidr, 2).into_iter().next().unwrap_or(0);
-            let ip = match ip.len() {
-                4 => IpAddr::from([ip[0], ip[1], ip[2], ip[3]]),
-                16 => {
-                    let mut b = [0u8; 16];
-                    b.copy_from_slice(&ip);
-                    IpAddr::from(b)
-                }
-                _ => continue,
-            };
-            if let Some(net) = parse_ip_net(&format!("{ip}/{prefix}")) {
-                nets.push(net);
-            }
-        }
-    }
-    nets.sort_unstable_by_key(ToString::to_string);
-    nets.dedup();
-    Ok(nets)
-}
-
-fn read_len_fields(mut bytes: &[u8], field: u64) -> io::Result<Vec<&[u8]>> {
-    let mut out = Vec::new();
-    while !bytes.is_empty() {
-        let key = read_varint(&mut bytes)?;
-        let number = key >> 3;
-        let wire = key & 0x07;
-        match wire {
-            0 => {
-                let _ = read_varint(&mut bytes)?;
-            }
-            2 => {
-                let len = read_varint(&mut bytes)? as usize;
-                if bytes.len() < len {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "protobuf field length"));
-                }
-                let (value, rest) = bytes.split_at(len);
-                if number == field {
-                    out.push(value);
-                }
-                bytes = rest;
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unsupported protobuf wire type",
-                ));
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn read_bytes_fields(bytes: &[u8], field: u64) -> Vec<Vec<u8>> {
-    read_len_fields(bytes, field)
-        .unwrap_or_default()
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn read_string_fields(bytes: &[u8], field: u64) -> Vec<String> {
-    read_bytes_fields(bytes, field)
-        .into_iter()
-        .filter_map(|v| String::from_utf8(v).ok())
-        .collect()
-}
-
-fn read_varint_fields(mut bytes: &[u8], field: u64) -> Vec<u64> {
-    let mut out = Vec::new();
-    while !bytes.is_empty() {
-        let Ok(key) = read_varint(&mut bytes) else {
-            break;
-        };
-        let number = key >> 3;
-        let wire = key & 0x07;
-        match wire {
-            0 => {
-                if let Ok(value) = read_varint(&mut bytes)
-                    && number == field
-                {
-                    out.push(value);
-                }
-            }
-            2 => {
-                let Ok(len) = read_varint(&mut bytes) else {
-                    break;
-                };
-                let len = len as usize;
-                if bytes.len() < len {
-                    break;
-                }
-                bytes = &bytes[len..];
-            }
-            _ => break,
-        }
-    }
-    out
-}
-
-fn read_varint(bytes: &mut &[u8]) -> io::Result<u64> {
-    let mut value = 0u64;
-    for shift in (0..64).step_by(7) {
-        let Some((&byte, rest)) = bytes.split_first() else {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "protobuf varint"));
-        };
-        *bytes = rest;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-    }
-    Err(io::Error::new(io::ErrorKind::InvalidData, "protobuf varint too long"))
-}
-
 fn push_event<T>(events: &mut VecDeque<T>, event: T) {
     events.push_back(event);
     while events.len() > MAX_EVENTS {
@@ -4383,7 +3702,12 @@ fn dns_cache_prune_is_due(last_prune_at: u64, now: u64) -> bool {
 }
 
 fn dns_cache_persist_is_due(last_persist_at: u64, now: u64) -> bool {
-    is_saturday_utc(now) && utc_day(last_persist_at) != utc_day(now)
+    // Persist roughly hourly whenever the cache is dirty (the caller already
+    // gates on the dirty flag), instead of only on Saturdays. The previous
+    // Saturday-only cadence lost every DNS mapping learned since the last
+    // Saturday on a reboot on any other day (audit DR-4). One small file write
+    // per hour is negligible for flash wear.
+    now.saturating_sub(last_persist_at) >= DNS_CACHE_PERSIST_CHECK_INTERVAL.as_secs()
 }
 
 fn is_saturday_utc(timestamp: u64) -> bool {
@@ -4495,1448 +3819,4 @@ fn system_time_unix_secs(time: SystemTime) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn temp_rules_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ss-rust-routing-{name}-{}", now()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    async fn wait_for_recorded_connection(
-        state: &RoutingState,
-        source: SocketAddr,
-        destination: IpAddr,
-        port: u16,
-    ) -> ConnectionEvent {
-        for _ in 0..50 {
-            if let Some(row) = state.recent_connections(&HashSet::new(), None).await.into_iter().find(|row| {
-                row.source_ip == source.ip()
-                    && row.source_port == source.port()
-                    && row.destination_ip == Some(destination)
-                    && row.destination_port == port
-            }) {
-                return row;
-            }
-            time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("recorded connection was not observed");
-    }
-
-    #[test]
-    fn flow_key_for_system_rows_ignores_display_domain() {
-        let mut event = ConnectionEvent {
-            timestamp: now(),
-            source_ip: "192.168.2.246".parse().unwrap(),
-            source_port: 54000,
-            destination_ip: Some("172.64.155.209".parse().unwrap()),
-            destination_domain: None,
-            domain: None,
-            destination_port: 443,
-            protocol: "tcp".to_owned(),
-            decision: ConnectionDecision::Direct,
-        };
-        let baseline_key = flow_key_for_event(&event).unwrap();
-
-        event.domain = Some("chatgpt.com".to_owned());
-        event.decision = ConnectionDecision::Redir;
-
-        assert_eq!(flow_key_for_event(&event), Some(baseline_key));
-    }
-
-    #[test]
-    fn system_connection_first_seen_timestamp_is_stable() {
-        let key: FlowKey = (
-            "192.168.2.246".parse().unwrap(),
-            54000,
-            "172.64.155.209".parse().unwrap(),
-            443,
-            "tcp",
-        );
-        let mut first_seen = HashMap::new();
-
-        assert_eq!(remember_system_connection_first_seen(&mut first_seen, key, 100), 100);
-        assert_eq!(remember_system_connection_first_seen(&mut first_seen, key, 200), 100);
-    }
-
-    #[test]
-    fn global_proxy_system_rows_only_assume_redir_for_public_non_dns() {
-        let mut event = ConnectionEvent {
-            timestamp: now(),
-            source_ip: "192.168.2.246".parse().unwrap(),
-            source_port: 54000,
-            destination_ip: Some("172.64.155.209".parse().unwrap()),
-            destination_domain: None,
-            domain: None,
-            destination_port: 443,
-            protocol: "tcp".to_owned(),
-            decision: ConnectionDecision::Direct,
-        };
-        assert!(system_connection_should_be_redir(&event));
-
-        event.destination_port = 53;
-        assert!(!system_connection_should_be_redir(&event));
-
-        event.destination_port = 443;
-        event.destination_ip = Some("192.168.2.1".parse().unwrap());
-        assert!(!system_connection_should_be_redir(&event));
-    }
-
-    #[test]
-    fn proxy_local_output_defaults_off() {
-        let mut config = RouteRulesConfig::default();
-        assert!(!RoutingSources::from(&config).proxy_local_output);
-
-        config.proxy_local_output = true;
-        assert!(RoutingSources::from(&config).proxy_local_output);
-    }
-
-    #[test]
-    fn fixed_direct_ip_matches_documented_ranges() {
-        for ip in [
-            "0.1.2.3",
-            "10.1.2.3",
-            "100.64.0.1",
-            "100.127.255.255",
-            "127.0.0.1",
-            "169.254.1.1",
-            "172.16.0.1",
-            "172.31.255.255",
-            "192.168.1.1",
-            "198.18.0.1",
-            "198.19.255.255",
-            "224.0.0.1",
-            "239.255.255.250",
-            "240.0.0.1",
-            "255.255.255.255",
-            "::",
-            "::1",
-            "fc00::1",
-            "fdff::1",
-            "fe80::1",
-            "ff02::1",
-        ] {
-            assert!(is_fixed_direct_ip(&ip.parse().unwrap()), "{ip}");
-        }
-
-        for ip in [
-            "1.1.1.1",
-            "100.128.0.1",
-            "172.32.0.1",
-            "198.20.0.1",
-            "223.5.5.5",
-            "2001:db8::1",
-        ] {
-            assert!(!is_fixed_direct_ip(&ip.parse().unwrap()), "{ip}");
-        }
-    }
-
-    #[tokio::test]
-    async fn activity_recording_keeps_fixed_direct_application_events() {
-        let dir = temp_rules_dir("record-fixed-direct");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-
-        assert!(state.recent_connections(&HashSet::new(), None).await.is_empty());
-        state.start_activity_recording().await.unwrap();
-
-        let source = "127.0.0.1:40000".parse::<SocketAddr>().unwrap();
-        let destination = "10.1.2.3".parse::<IpAddr>().unwrap();
-        let target = Address::SocketAddress(SocketAddr::new(destination, 443));
-        state
-            .record_connection(source, &target, "tcp", ConnectionDecision::Direct)
-            .await;
-
-        let row = wait_for_recorded_connection(&state, source, destination, 443).await;
-        assert_eq!(row.decision, ConnectionDecision::Direct);
-
-        state.stop_activity_recording().await.unwrap();
-        assert!(state.recent_connections(&HashSet::new(), None).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn activity_recording_records_socks5_proxy_decision() {
-        let dir = temp_rules_dir("record-socks5-proxy");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-        state.start_activity_recording().await.unwrap();
-
-        let source = "127.0.0.1:40001".parse::<SocketAddr>().unwrap();
-        let destination = "203.0.113.10".parse::<IpAddr>().unwrap();
-        let target = Address::SocketAddress(SocketAddr::new(destination, 443));
-        state
-            .record_connection(source, &target, "tcp", ConnectionDecision::Socks5Proxy)
-            .await;
-
-        let row = wait_for_recorded_connection(&state, source, destination, 443).await;
-        assert_eq!(row.decision, ConnectionDecision::Socks5Proxy);
-    }
-
-    #[tokio::test]
-    async fn recent_activity_filters_by_source_ip() {
-        let dir = temp_rules_dir("record-source-filter");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-        state.start_activity_recording().await.unwrap();
-
-        let source_a = "192.168.2.166:40001".parse::<SocketAddr>().unwrap();
-        let source_b = "192.168.2.188:40002".parse::<SocketAddr>().unwrap();
-        let destination_a = "203.0.113.10".parse::<IpAddr>().unwrap();
-        let destination_b = "203.0.113.11".parse::<IpAddr>().unwrap();
-        state
-            .record_connection(
-                source_a,
-                &Address::SocketAddress(SocketAddr::new(destination_a, 443)),
-                "tcp",
-                ConnectionDecision::Socks5Proxy,
-            )
-            .await;
-        state
-            .record_connection(
-                source_b,
-                &Address::SocketAddress(SocketAddr::new(destination_b, 443)),
-                "tcp",
-                ConnectionDecision::Direct,
-            )
-            .await;
-        state
-            .record_dns(
-                Some(source_a.ip()),
-                "api-a.example".to_owned(),
-                "A".to_owned(),
-                vec![destination_a],
-                RouteDecision::Proxy,
-                false,
-            )
-            .await;
-        state
-            .record_dns(
-                Some(source_b.ip()),
-                "api-b.example".to_owned(),
-                "A".to_owned(),
-                vec![destination_b],
-                RouteDecision::Direct,
-                false,
-            )
-            .await;
-
-        let _ = wait_for_recorded_connection(&state, source_a, destination_a, 443).await;
-        let _ = wait_for_recorded_connection(&state, source_b, destination_b, 443).await;
-        for _ in 0..50 {
-            if state.recent_dns(Some(source_a.ip())).await.len() == 1 {
-                break;
-            }
-            time::sleep(Duration::from_millis(10)).await;
-        }
-
-        let connections = state.recent_connections(&HashSet::new(), Some(source_a.ip())).await;
-        assert_eq!(connections.len(), 1);
-        assert_eq!(connections[0].source_ip, source_a.ip());
-
-        let dns = state.recent_dns(Some(source_a.ip())).await;
-        assert_eq!(dns.len(), 1);
-        assert_eq!(dns[0].domain, "api-a.example");
-    }
-
-    #[tokio::test]
-    async fn learned_socks_proxy_ip_is_saved_to_temporary_proxy_list() {
-        let dir = temp_rules_dir("socks-learn-temp-proxy-ip");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-        let ip = "203.0.113.77".parse::<IpAddr>().unwrap();
-
-        assert!(state.add_temporary_proxy_ip(ip).await.unwrap());
-        assert!(!state.add_temporary_proxy_ip(ip).await.unwrap());
-
-        let snapshot = state.snapshot().await;
-        assert!(snapshot.temporary.proxy_ip.iter().any(|rule| rule == "203.0.113.77"));
-        let proxy_temp = read_lines(temp_file_path(&dir, TEMP_PROXY_IP_FILE)).unwrap();
-        assert!(proxy_temp.iter().any(|rule| rule == "203.0.113.77"));
-    }
-
-    #[tokio::test]
-    async fn recent_connections_backfills_domain_from_dns_cache() {
-        let dir = temp_rules_dir("record-domain-backfill");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        config.dns_cache_ttl_seconds = 60;
-        let state = RoutingState::load(config).await.unwrap();
-        state.start_activity_recording().await.unwrap();
-
-        let source = "127.0.0.1:40002".parse::<SocketAddr>().unwrap();
-        let destination = "203.0.113.20".parse::<IpAddr>().unwrap();
-        let target = Address::SocketAddress(SocketAddr::new(destination, 443));
-        state
-            .record_connection(source, &target, "tcp", ConnectionDecision::Direct)
-            .await;
-
-        let row = wait_for_recorded_connection(&state, source, destination, 443).await;
-        assert_eq!(row.domain, None);
-
-        state
-            .dns_cache_insert(
-                "api.example.",
-                "A",
-                RouteDecision::Direct,
-                Message::query(),
-                vec![destination],
-            )
-            .await;
-
-        let row = wait_for_recorded_connection(&state, source, destination, 443).await;
-        assert_eq!(row.domain.as_deref(), Some("api.example"));
-    }
-
-    #[tokio::test]
-    async fn temporary_rules_override_persistent_rules() {
-        let dir = temp_rules_dir("override");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &["1.1.1.1".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &[]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        let state = RoutingState::load(config).await.unwrap();
-        assert_eq!(
-            state.route_ip(&"1.1.1.1".parse().unwrap()).await,
-            Some(RouteDecision::Direct)
-        );
-        assert_eq!(state.route_domain("example.com").await, Some(RouteDecision::Direct));
-
-        state
-            .set_temporary_rules(RuleLists {
-                proxy_ip: vec!["1.1.1.1".to_owned()],
-                proxy_domain: vec!["example.com".to_owned()],
-                ..RuleLists::default()
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            state.route_ip(&"1.1.1.1".parse().unwrap()).await,
-            Some(RouteDecision::Proxy)
-        );
-        assert_eq!(state.route_domain("example.com").await, Some(RouteDecision::Proxy));
-    }
-
-    #[tokio::test]
-    async fn global_proxy_routes_unknown_public_targets_through_proxy() {
-        let dir = temp_rules_dir("global-proxy");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &["1.1.1.1".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["direct.example".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &[]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.global_proxy = true;
-        let state = RoutingState::load(config).await.unwrap();
-
-        assert_eq!(
-            state.route_ip(&"8.8.8.8".parse().unwrap()).await,
-            Some(RouteDecision::Proxy)
-        );
-        assert_eq!(state.route_domain("unknown.example").await, Some(RouteDecision::Proxy));
-        assert_eq!(
-            state.route_ip(&"1.1.1.1".parse().unwrap()).await,
-            Some(RouteDecision::Proxy)
-        );
-        assert_eq!(
-            state.route_ip(&"192.168.1.1".parse().unwrap()).await,
-            Some(RouteDecision::Direct)
-        );
-        assert_eq!(
-            state.route_domain("direct.example").await,
-            Some(RouteDecision::Proxy)
-        );
-    }
-
-    #[tokio::test]
-    async fn global_proxy_does_not_learn_proxy_dns_result_ips() {
-        let dir = temp_rules_dir("global-proxy-no-proxy-ip-learning");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &[]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        config.global_proxy = true;
-        let state = RoutingState::load(config).await.unwrap();
-        let ip = "203.0.113.10".parse().unwrap();
-
-        state
-            .add_dns_results(RouteDecision::Proxy, "www.example.com", &[ip])
-            .await
-            .unwrap();
-        state.persist_proxy_ip_if_dirty().await;
-
-        assert!(read_lines(dir.join(PROXY_IP_FILE)).unwrap().is_empty());
-        let inner = state.inner.read().await;
-        assert!(inner.persistent_raw.proxy_ip.is_empty());
-        assert!(!inner.proxy_ip_dirty);
-        assert!(!inner.proxy_ip_persist_scheduled);
-    }
-
-    #[tokio::test]
-    async fn temporary_proxy_domain_matches_aws_console_subdomain_immediately() {
-        let dir = temp_rules_dir("temporary-aws-domain");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-
-        state
-            .set_temporary_rules(RuleLists {
-                proxy_domain: vec!["aws.amazon.com".to_owned()],
-                ..RuleLists::default()
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(state.route_domain("aws.amazon.com").await, Some(RouteDecision::Proxy));
-        assert_eq!(
-            state.route_domain("ap-southeast-1.console.aws.amazon.com")
-                .await,
-            Some(RouteDecision::Proxy)
-        );
-    }
-
-    #[tokio::test]
-    async fn source_update_writes_four_rule_files() {
-        let dir = temp_rules_dir("sources");
-        let geoip_source = dir.join("geoip.txt");
-        let proxy_source = dir.join("proxy.txt");
-        fs::write(dir.join(DIRECT_IP_FILE), "192.0.2.0/24\n").unwrap();
-        write_temporary_rule_lists(
-            &dir,
-            &RuleLists {
-                direct_ip: vec!["203.0.113.0/24".to_owned()],
-                direct_domain: vec!["temp-direct.example".to_owned()],
-                proxy_ip: vec!["203.0.113.10".to_owned()],
-                proxy_domain: vec!["temp-proxy.example".to_owned()],
-            },
-        )
-        .unwrap();
-        fs::write(
-            dir.join(DIRECT_DOMAIN_FILE),
-            "direct.example\n# comment\nchina.example\n",
-        )
-        .unwrap();
-        fs::write(&geoip_source, "198.51.100.0/24\n").unwrap();
-        fs::write(&proxy_source, "proxy.example\ngfw.example\n").unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-        config.geoip_sources = vec![geoip_source.display().to_string()];
-        config.proxy_domain_sources = vec![proxy_source.display().to_string()];
-
-        let state = RoutingState::load(config).await.unwrap();
-        state.update_from_sources().await.unwrap();
-
-        let direct_domain = read_lines(dir.join(DIRECT_DOMAIN_FILE)).unwrap();
-        let direct_ip = read_lines(dir.join(DIRECT_IP_FILE)).unwrap();
-        let proxy_ip = read_lines(dir.join(PROXY_IP_FILE)).unwrap();
-        let proxy_domain = read_lines(dir.join(PROXY_DOMAIN_FILE)).unwrap();
-        assert!(direct_ip.contains(&"192.0.2.0/24".to_owned()));
-        assert!(!direct_ip.contains(&"203.0.113.0/24".to_owned()));
-        assert!(!direct_ip.contains(&"198.51.100.0/24".to_owned()));
-        assert!(direct_domain.contains(&"direct.example".to_owned()));
-        assert!(direct_domain.contains(&"china.example".to_owned()));
-        assert!(!direct_domain.contains(&"temp-direct.example".to_owned()));
-        assert!(!proxy_ip.contains(&"203.0.113.10".to_owned()));
-        assert!(proxy_domain.contains(&"proxy.example".to_owned()));
-        assert!(proxy_domain.contains(&"gfw.example".to_owned()));
-        assert!(!proxy_domain.contains(&"temp-proxy.example".to_owned()));
-        assert!(dir.join(DIRECT_IP_FILE).exists());
-        assert!(dir.join(PROXY_IP_FILE).exists());
-    }
-
-    #[tokio::test]
-    async fn http_source_download_failure_keeps_existing_cache() {
-        let dir = temp_rules_dir("source-fallback");
-        let source = "http://127.0.0.1:9/gfw.txt";
-        let cache_dir = dir.join(SOURCE_DIR);
-        fs::create_dir_all(&cache_dir).unwrap();
-        let cache_path = cached_source_path(source, &cache_dir);
-        fs::write(&cache_path, "cached.example\n").unwrap();
-
-        let downloaded = download_source(source, &cache_dir).await.unwrap();
-
-        assert_eq!(downloaded.bytes, b"cached.example\n");
-        assert_eq!(downloaded.status, DownloadedSourceStatus::FallbackCache);
-        assert_eq!(fs::read(&cache_path).unwrap(), b"cached.example\n");
-    }
-
-    #[tokio::test]
-    async fn source_update_and_download_jobs_are_mutually_exclusive() {
-        let dir = temp_rules_dir("source-job-lock");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-
-        let state = RoutingState::load(config).await.unwrap();
-
-        assert!(state.try_begin_update().await);
-        assert!(!state.try_begin_update().await);
-        assert!(!state.try_begin_download().await);
-
-        state.mark_rule_job_failed_sync("release update lock".to_owned());
-
-        assert!(state.try_begin_download().await);
-        assert!(!state.try_begin_update().await);
-        assert!(!state.try_begin_download().await);
-    }
-
-    #[tokio::test]
-    async fn wildcard_suffix_domain_rules_route_and_conflict() {
-        let dir = temp_rules_dir("wildcard-domain");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["*.example.com".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-
-        assert_eq!(state.route_domain("www.example.com").await, Some(RouteDecision::Direct));
-        assert_eq!(state.route_domain("example.com").await, Some(RouteDecision::Direct));
-        assert_eq!(state.route_domain("api.example.com").await, Some(RouteDecision::Direct));
-        let conflicts = state.domain_conflicts().await;
-        assert!(conflicts.iter().any(|conflict| {
-            conflict.value == "*.example.com <-> example.com"
-                && conflict.sources == [DIRECT_DOMAIN_FILE.to_owned(), PROXY_DOMAIN_FILE.to_owned()]
-        }));
-    }
-
-    #[tokio::test]
-    async fn complex_domain_wildcards_are_rejected() {
-        let dir = temp_rules_dir("complex-wildcard-domain");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["api.*".to_owned()]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let err = match RoutingState::load(config).await {
-            Ok(_) => panic!("complex wildcard should be rejected"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string()
-                .contains("only '*.domain.tld' wildcard form is supported")
-        );
-    }
-
-    #[tokio::test]
-    async fn direct_domain_overrides_proxy_suffix_after_reload() {
-        let dir = temp_rules_dir("domain-priority-reload");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["a.baidu.com".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["baidu.com".to_owned()]).unwrap();
-        write_temporary_rule_lists(
-            &dir,
-            &RuleLists {
-                direct_ip: Vec::new(),
-                direct_domain: vec!["b.baidu.com".to_owned()],
-                proxy_ip: Vec::new(),
-                proxy_domain: vec!["temp.baidu.com".to_owned()],
-            },
-        )
-        .unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-
-        assert_eq!(state.route_domain("baidu.com").await, Some(RouteDecision::Proxy));
-        assert_eq!(state.route_domain("c.baidu.com").await, Some(RouteDecision::Proxy));
-        assert_eq!(state.route_domain("a.baidu.com").await, Some(RouteDecision::Direct));
-        assert_eq!(state.route_domain("b.baidu.com").await, Some(RouteDecision::Direct));
-        assert_eq!(state.route_domain("temp.baidu.com").await, Some(RouteDecision::Proxy));
-    }
-
-    #[tokio::test]
-    async fn apex_and_wildcard_domain_rules_are_suffix_equivalent() {
-        let dir = temp_rules_dir("domain-suffix-equivalence");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["*.direct.baidu.com".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["baidu.com".to_owned()]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-
-        assert_eq!(state.route_domain("baidu.com").await, Some(RouteDecision::Proxy));
-        assert_eq!(state.route_domain("a.baidu.com").await, Some(RouteDecision::Proxy));
-        assert_eq!(
-            state.route_domain("direct.baidu.com").await,
-            Some(RouteDecision::Direct)
-        );
-        assert_eq!(
-            state.route_domain("a.direct.baidu.com").await,
-            Some(RouteDecision::Direct)
-        );
-    }
-
-    #[tokio::test]
-    async fn single_label_domain_rules_do_not_match_tlds() {
-        let dir = temp_rules_dir("single-label-domain");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["cn".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["google.cn".to_owned()]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-
-        assert_eq!(state.route_domain("cn").await, Some(RouteDecision::Direct));
-        assert_eq!(state.route_domain("google.cn").await, Some(RouteDecision::Proxy));
-        assert!(state.domain_conflicts().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn multi_label_domain_rules_match_subdomains() {
-        let dir = temp_rules_dir("suffix-domain");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["c.pki.goog".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["pki.goog".to_owned()]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-
-        assert_eq!(state.route_domain("pki.goog").await, Some(RouteDecision::Proxy));
-        assert_eq!(state.route_domain("c.pki.goog").await, Some(RouteDecision::Direct));
-        assert!(!state.domain_conflicts().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn dns_learned_proxy_ip_keeps_direct_priority_and_indexes_conflict() {
-        let dir = temp_rules_dir("dns-learned-conflict");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &["203.0.113.10".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-
-        state
-            .add_dns_results(
-                RouteDecision::Proxy,
-                "www.example.com",
-                &["203.0.113.10".parse().unwrap()],
-            )
-            .await
-            .unwrap();
-
-        state.persist_proxy_ip_if_dirty().await;
-
-        assert!(
-            read_lines(dir.join(PROXY_IP_FILE))
-                .unwrap()
-                .contains(&"203.0.113.10 www.example.com".to_owned())
-        );
-        assert_eq!(
-            state.route_ip(&"203.0.113.10".parse().unwrap()).await,
-            Some(RouteDecision::Direct)
-        );
-        let conflicts = state.ip_conflicts().await;
-        assert!(conflicts.iter().any(|conflict| {
-            conflict.value == "203.0.113.10"
-                && conflict.regions == ["direct".to_owned(), "proxy".to_owned()]
-                && conflict.sources == [DIRECT_IP_FILE.to_owned(), PROXY_IP_FILE.to_owned()]
-        }));
-    }
-
-    #[tokio::test]
-    async fn dns_learned_proxy_ip_keeps_temporary_direct_priority() {
-        let dir = temp_rules_dir("dns-learned-temp-direct-conflict");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
-        write_temporary_rule_lists(
-            &dir,
-            &RuleLists {
-                direct_ip: vec!["203.0.113.10".to_owned()],
-                direct_domain: Vec::new(),
-                proxy_ip: Vec::new(),
-                proxy_domain: Vec::new(),
-            },
-        )
-        .unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-
-        state
-            .add_dns_results(
-                RouteDecision::Proxy,
-                "www.example.com",
-                &["203.0.113.10".parse().unwrap()],
-            )
-            .await
-            .unwrap();
-
-        state.persist_proxy_ip_if_dirty().await;
-
-        assert!(
-            read_lines(dir.join(PROXY_IP_FILE))
-                .unwrap()
-                .contains(&"203.0.113.10 www.example.com".to_owned())
-        );
-        assert_eq!(
-            state.route_ip(&"203.0.113.10".parse().unwrap()).await,
-            Some(RouteDecision::Direct)
-        );
-    }
-
-    #[tokio::test]
-    async fn direct_dns_results_do_not_become_direct_ip_rules() {
-        let dir = temp_rules_dir("dns-direct-not-persistent");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["direct.example".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &[]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-        let ip = "203.0.113.20".parse().unwrap();
-
-        state
-            .add_dns_results(RouteDecision::Direct, "direct.example", &[ip])
-            .await
-            .unwrap();
-
-        assert!(read_lines(dir.join(DIRECT_IP_FILE)).unwrap().is_empty());
-        assert_eq!(state.route_ip(&ip).await, None);
-    }
-
-    #[tokio::test]
-    async fn direct_dns_results_sync_nft_only_for_global_proxy_exceptions() {
-        let dir = temp_rules_dir("dns-direct-nft-sync-needed");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &["203.0.113.10 a.example.com".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["direct.example".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &[]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-        let unrelated = "203.0.113.20".parse().unwrap();
-        let proxy_conflict = "203.0.113.10".parse().unwrap();
-        let inner = state.inner.read().await;
-
-        assert!(!direct_dns_result_needs_nft_sync(&inner, &unrelated, false));
-        assert!(!direct_dns_result_needs_nft_sync(&inner, &proxy_conflict, false));
-        assert!(direct_dns_result_needs_nft_sync(&inner, &unrelated, true));
-    }
-
-    #[tokio::test]
-    async fn dns_learned_proxy_ip_records_once_for_same_ip() {
-        let dir = temp_rules_dir("dns-learned-domain-column");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-        let ip = "203.0.113.10".parse().unwrap();
-
-        state
-            .add_dns_results(RouteDecision::Proxy, "a.example.com.", &[ip])
-            .await
-            .unwrap();
-        state
-            .add_dns_results(RouteDecision::Proxy, "b.example.com.", &[ip])
-            .await
-            .unwrap();
-        state.persist_proxy_ip_if_dirty().await;
-
-        let lines = read_lines(dir.join(PROXY_IP_FILE)).unwrap();
-        assert!(lines.contains(&"203.0.113.10 a.example.com".to_owned()));
-        assert!(!lines.contains(&"203.0.113.10 b.example.com".to_owned()));
-        assert_eq!(lines.iter().filter(|line| parse_ip_addr(line) == Some(ip)).count(), 1);
-        assert_eq!(state.route_ip(&ip).await, Some(RouteDecision::Proxy));
-    }
-
-    #[tokio::test]
-    async fn known_proxy_dns_result_does_not_dirty_proxy_file() {
-        let dir = temp_rules_dir("dns-known-proxy-not-dirty");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &["203.0.113.10 a.example.com".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-        let ip = "203.0.113.10".parse().unwrap();
-
-        state
-            .add_dns_results(RouteDecision::Proxy, "b.example.com.", &[ip])
-            .await
-            .unwrap();
-
-        let inner = state.inner.read().await;
-        assert!(!inner.proxy_ip_dirty);
-        assert!(!inner.proxy_ip_persist_scheduled);
-        drop(inner);
-
-        let lines = read_lines(dir.join(PROXY_IP_FILE)).unwrap();
-        assert_eq!(lines, vec!["203.0.113.10 a.example.com".to_owned()]);
-    }
-
-    #[test]
-    fn nft_route_index_matches_exact_and_cidr_entries() {
-        let index = nft_route_index_from_nets(
-            &[IpNet::from("198.51.100.10".parse::<IpAddr>().unwrap())],
-            &[
-                "203.0.113.0/24".parse().unwrap(),
-                "2001:db8::/32".parse().unwrap(),
-            ],
-        );
-
-        assert!(nft_route_index_matches(
-            &index,
-            RouteDecision::Direct,
-            &"198.51.100.10".parse().unwrap()
-        ));
-        assert!(nft_route_index_matches(
-            &index,
-            RouteDecision::Proxy,
-            &"203.0.113.55".parse().unwrap()
-        ));
-        assert!(nft_route_index_matches(
-            &index,
-            RouteDecision::Proxy,
-            &"2001:db8::1234".parse().unwrap()
-        ));
-        assert!(!nft_route_index_matches(
-            &index,
-            RouteDecision::Proxy,
-            &"198.51.100.10".parse().unwrap()
-        ));
-    }
-
-    #[tokio::test]
-    async fn known_proxy_ip_remains_eligible_for_nft_dns_sync() {
-        let dir = temp_rules_dir("dns-known-proxy-nft-sync");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &["203.0.113.10 a.example.com".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-        let ip = "203.0.113.10".parse().unwrap();
-        let inner = state.inner.read().await;
-
-        assert!(compiled_rules_match_ip(
-            &inner.persistent.proxy_ip_exact,
-            &inner.persistent.proxy_ip,
-            &ip
-        ));
-        assert!(!dns_proxy_ip_blocked_from_nft_by_direct_rule(&inner, &ip));
-        assert!(proxy_dns_result_needs_nft_sync(&inner, &ip));
-    }
-
-    #[cfg(all(target_os = "linux", feature = "local-dns"))]
-    #[tokio::test]
-    async fn proxy_conntrack_flush_ips_include_only_active_public_proxy_exact_ips() {
-        let dir = temp_rules_dir("proxy-conntrack-flush-ips");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &["198.51.100.20/32".to_owned()]).unwrap();
-        write_lines_atomic(
-            dir.join(PROXY_IP_FILE),
-            &[
-                "160.79.104.10 claude.com".to_owned(),
-                "198.51.100.20 direct-conflict.example".to_owned(),
-                "192.168.2.50 private.example".to_owned(),
-            ],
-        )
-        .unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &[]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-        let inner = state.inner.read().await;
-
-        assert_eq!(
-            proxy_conntrack_flush_ips(&inner),
-            vec!["160.79.104.10".parse::<IpAddr>().unwrap()]
-        );
-    }
-
-    #[tokio::test]
-    async fn dns_learned_proxy_ip_upgrades_legacy_one_column_row() {
-        let dir = temp_rules_dir("dns-learned-upgrade");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &["203.0.113.10".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-        let ip = "203.0.113.10".parse().unwrap();
-
-        state
-            .add_dns_results(RouteDecision::Proxy, "a.example.com.", &[ip])
-            .await
-            .unwrap();
-        state.persist_proxy_ip_if_dirty().await;
-
-        let lines = read_lines(dir.join(PROXY_IP_FILE)).unwrap();
-        assert_eq!(lines, vec!["203.0.113.10 a.example.com".to_owned()]);
-        assert_eq!(state.route_ip(&ip).await, Some(RouteDecision::Proxy));
-    }
-
-    #[test]
-    fn ip_conflicts_handle_exact_and_cidr_overlaps() {
-        let direct = vec![
-            parse_ip_net("203.0.113.10").unwrap(),
-            parse_ip_net("2001:db8:1::/48").unwrap(),
-        ];
-        let proxy = vec![
-            parse_ip_net("203.0.113.0/24").unwrap(),
-            parse_ip_net("2001:db8:1:1::1").unwrap(),
-            parse_ip_net("198.51.100.0/24").unwrap(),
-        ];
-
-        let conflicts = ip_net_conflicts(&direct, &proxy);
-        assert!(conflicts.contains(&"203.0.113.10 <-> 203.0.113.0/24".to_owned()));
-        assert!(conflicts.contains(&"2001:db8:1::/48 <-> 2001:db8:1:1::1".to_owned()));
-        assert_eq!(conflicts.len(), 2);
-    }
-
-    #[test]
-    fn compile_ip_rules_separates_exact_from_cidr() {
-        let lines = vec![
-            "203.0.113.10".to_owned(),
-            "203.0.113.11/32".to_owned(),
-            "203.0.113.0/24".to_owned(),
-            "2001:db8::1/128 api.example".to_owned(),
-            "2001:db8:1::/48".to_owned(),
-        ];
-
-        let (cidrs, exact, domainless_exact) = compile_ip_rules(&lines, true);
-
-        assert!(exact.contains(&"203.0.113.10".parse().unwrap()));
-        assert!(exact.contains(&"203.0.113.11".parse().unwrap()));
-        assert!(exact.contains(&"2001:db8::1".parse().unwrap()));
-        assert!(domainless_exact.contains(&"203.0.113.10".parse().unwrap()));
-        assert!(domainless_exact.contains(&"203.0.113.11".parse().unwrap()));
-        assert!(!domainless_exact.contains(&"2001:db8::1".parse().unwrap()));
-        assert_eq!(
-            cidrs,
-            vec![
-                parse_ip_net("203.0.113.0/24").unwrap(),
-                parse_ip_net("2001:db8:1::/48").unwrap(),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn temporary_rules_persist_to_temp_files() {
-        let dir = temp_rules_dir("temporary-persist");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-
-        let state = RoutingState::load(config.clone()).await.unwrap();
-        state
-            .set_temporary_rules(RuleLists {
-                direct_ip: vec!["203.0.113.0/24".to_owned()],
-                direct_domain: vec!["direct.temp.example".to_owned()],
-                proxy_ip: vec!["198.51.100.10".to_owned()],
-                proxy_domain: vec!["*.temp.example".to_owned()],
-            })
-            .await
-            .unwrap();
-
-        assert!(
-            read_lines(temp_file_path(&dir, TEMP_DIRECT_IP_FILE))
-                .unwrap()
-                .contains(&"203.0.113.0/24".to_owned())
-        );
-        assert!(
-            read_lines(temp_file_path(&dir, TEMP_PROXY_DOMAIN_FILE))
-                .unwrap()
-                .contains(&"*.temp.example".to_owned())
-        );
-
-        let reloaded = RoutingState::load(config).await.unwrap();
-        assert_eq!(
-            reloaded.route_ip(&"198.51.100.10".parse().unwrap()).await,
-            Some(RouteDecision::Proxy)
-        );
-        assert_eq!(
-            reloaded.route_domain("direct.temp.example").await,
-            Some(RouteDecision::Direct)
-        );
-    }
-
-    #[tokio::test]
-    async fn temporary_rules_reload_from_temp_files() {
-        let dir = temp_rules_dir("temporary-reload");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-
-        let state = RoutingState::load(config).await.unwrap();
-        assert_eq!(state.route_domain("file.temp.example").await, None);
-
-        write_lines_atomic(
-            temp_file_path(&dir, TEMP_PROXY_DOMAIN_FILE),
-            &["file.temp.example".to_owned()],
-        )
-        .unwrap();
-
-        let reloaded = state.reload_temporary_rules_from_files().await.unwrap();
-        assert!(reloaded.proxy_domain.contains(&"file.temp.example".to_owned()));
-        assert_eq!(
-            state.route_domain("file.temp.example").await,
-            Some(RouteDecision::Proxy)
-        );
-    }
-
-    #[tokio::test]
-    async fn saved_temporary_rules_are_loaded_by_file_watcher() {
-        let dir = temp_rules_dir("temporary-watch");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-
-        let state = RoutingState::load(config).await.unwrap();
-        state
-            .save_temporary_rules_to_files(RuleLists {
-                proxy_domain: vec!["watched.temp.example".to_owned()],
-                ..RuleLists::default()
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(state.route_domain("watched.temp.example").await, None);
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        assert_eq!(
-            state.route_domain("watched.temp.example").await,
-            Some(RouteDecision::Proxy)
-        );
-    }
-
-    #[tokio::test]
-    async fn conflict_results_persist_to_temp_dir() {
-        let dir = temp_rules_dir("conflict-persist");
-        write_lines_atomic(dir.join(DIRECT_IP_FILE), &["203.0.113.10".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(PROXY_IP_FILE), &["203.0.113.0/24 example.com".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["direct.example.com".to_owned()]).unwrap();
-        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-        config.geoip_sources.clear();
-        config.proxy_domain_sources.clear();
-        let state = RoutingState::load(config).await.unwrap();
-
-        assert!(!state.ip_conflicts().await.is_empty());
-        assert!(!state.domain_conflicts().await.is_empty());
-        assert!(
-            !read_lines(temp_file_path(&dir, TEMP_IP_CONFLICTS_FILE))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            !read_lines(temp_file_path(&dir, TEMP_DOMAIN_CONFLICTS_FILE))
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn dns_cache_insert_query_and_clear() {
-        let dir = temp_rules_dir("dns-cache");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.dns_cache_capacity = 1;
-        config.dns_cache_ttl_seconds = 60;
-
-        let state = RoutingState::load(config).await.unwrap();
-        state
-            .dns_cache_insert(
-                "Example.COM.",
-                "A",
-                RouteDecision::Direct,
-                Message::query(),
-                vec!["1.2.3.4".parse().unwrap()],
-            )
-            .await;
-
-        let ip = "1.2.3.4".parse().unwrap();
-        assert_eq!(state.dns_cache_stats().await.size, 1);
-        assert_eq!(
-            state.inner.read().await.reverse_domains.get(&ip).map(String::as_str),
-            Some("example.com")
-        );
-        assert!(
-            state
-                .dns_cache_lookup("example.com", "a", RouteDecision::Direct)
-                .await
-                .is_some()
-        );
-        assert_eq!(
-            state.dns_cache_query("example.com").await[0].results[0].to_string(),
-            "1.2.3.4"
-        );
-
-        let cleared = state.dns_cache_clear(Some("example.com")).await;
-        assert_eq!(cleared, 1);
-        assert_eq!(state.dns_cache_stats().await.size, 0);
-        assert!(!state.inner.read().await.reverse_domains.contains_key(&ip));
-    }
-
-    #[tokio::test]
-    async fn dns_cache_lookup_ignores_expired_without_prune() {
-        let dir = temp_rules_dir("dns-cache-expired-no-prune");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.dns_cache_capacity = 1024;
-        config.dns_cache_ttl_seconds = 60;
-
-        let state = RoutingState::load(config).await.unwrap();
-        state
-            .dns_cache_insert(
-                "expired.example",
-                "A",
-                RouteDecision::Direct,
-                Message::query(),
-                vec!["1.1.1.1".parse().unwrap()],
-            )
-            .await;
-
-        let key = dns_cache_key("expired.example", "A", RouteDecision::Direct);
-        let expired_at = now().saturating_sub(1);
-        {
-            let mut inner = state.inner.write().await;
-            let old_expires_at = inner.dns_cache.get(&key).unwrap().expires_at;
-            remove_dns_cache_expiration(&mut inner, &key, old_expires_at);
-            inner.dns_cache.get_mut(&key).unwrap().expires_at = expired_at;
-            insert_dns_cache_expiration(&mut inner, key, expired_at);
-        }
-
-        assert!(
-            state
-                .dns_cache_lookup("expired.example", "A", RouteDecision::Direct)
-                .await
-                .is_none()
-        );
-        assert_eq!(state.dns_cache_stats().await.size, 1);
-    }
-
-    #[tokio::test]
-    async fn dns_cache_skips_empty_and_error_responses() {
-        let dir = temp_rules_dir("dns-cache-skip-empty-error");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-
-        let state = RoutingState::load(config).await.unwrap();
-        state
-            .dns_cache_insert(
-                "empty.example",
-                "A",
-                RouteDecision::Direct,
-                Message::query(),
-                Vec::new(),
-            )
-            .await;
-        assert_eq!(state.dns_cache_stats().await.size, 0);
-        assert!(
-            state
-                .dns_cache_lookup("empty.example", "A", RouteDecision::Direct)
-                .await
-                .is_none()
-        );
-
-        let mut servfail = Message::query();
-        servfail.metadata.response_code = ResponseCode::ServFail;
-        state
-            .dns_cache_insert(
-                "error.example",
-                "A",
-                RouteDecision::Direct,
-                servfail,
-                vec!["1.1.1.1".parse().unwrap()],
-            )
-            .await;
-        assert_eq!(state.dns_cache_stats().await.size, 0);
-        assert!(
-            state
-                .dns_cache_lookup("error.example", "A", RouteDecision::Direct)
-                .await
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn dns_cache_accepts_real_service_binding_responses() {
-        let mut message = Message::response(1, hickory_resolver::proto::op::OpCode::Query);
-        let name = hickory_resolver::proto::rr::Name::from_ascii("example.com.").unwrap();
-        let svcb = hickory_resolver::proto::rr::rdata::SVCB::new(
-            1,
-            hickory_resolver::proto::rr::Name::root(),
-            Vec::new(),
-        );
-        message.answers.push(hickory_resolver::proto::rr::Record::from_rdata(
-            name,
-            60,
-            RData::HTTPS(hickory_resolver::proto::rr::rdata::HTTPS(svcb)),
-        ));
-
-        assert!(dns_cache_message_is_cacheable("HTTPS", &message, &[]));
-        assert!(!dns_cache_message_is_cacheable("A", &message, &[]));
-        assert!(!dns_cache_message_is_cacheable(
-            "HTTPS",
-            &Message::response(1, hickory_resolver::proto::op::OpCode::Query),
-            &[]
-        ));
-    }
-
-    #[tokio::test]
-    async fn dns_cache_persists_and_loads_from_disk() {
-        let dir = temp_rules_dir("dns-cache-persist");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-        config.dns_cache_ttl_seconds = 60;
-
-        let state = RoutingState::load(config).await.unwrap();
-        state
-            .dns_cache_insert(
-                "Persist.EXAMPLE.",
-                "A",
-                RouteDecision::Proxy,
-                Message::query(),
-                vec!["8.8.8.8".parse().unwrap()],
-            )
-            .await;
-        state.persist_dns_cache_now().await.unwrap();
-        assert!(!fs::read_to_string(dns_cache_file_path(&dir)).unwrap().is_empty());
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        let reloaded = RoutingState::load(config).await.unwrap();
-        let rows = reloaded.dns_cache_query("persist.example").await;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].resolver, RouteDecision::Proxy);
-        assert_eq!(rows[0].results[0].to_string(), "8.8.8.8");
-        assert!(
-            reloaded
-                .dns_cache_lookup("persist.example", "A", RouteDecision::Proxy)
-                .await
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn dns_cache_persistence_keeps_resolver_separate() {
-        let dir = temp_rules_dir("dns-cache-persist-resolver");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-
-        let state = RoutingState::load(config).await.unwrap();
-        state
-            .dns_cache_insert(
-                "resolver.example",
-                "A",
-                RouteDecision::Proxy,
-                Message::query(),
-                vec!["8.8.8.8".parse().unwrap()],
-            )
-            .await;
-        state
-            .dns_cache_insert(
-                "resolver.example",
-                "A",
-                RouteDecision::Direct,
-                Message::query(),
-                vec!["223.5.5.5".parse().unwrap()],
-            )
-            .await;
-        state.persist_dns_cache_now().await.unwrap();
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        let reloaded = RoutingState::load(config).await.unwrap();
-
-        let rows = reloaded.dns_cache_query("resolver.example").await;
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().any(|row| {
-            row.resolver == RouteDecision::Proxy && row.results == vec!["8.8.8.8".parse::<IpAddr>().unwrap()]
-        }));
-        assert!(rows.iter().any(|row| {
-            row.resolver == RouteDecision::Direct && row.results == vec!["223.5.5.5".parse::<IpAddr>().unwrap()]
-        }));
-    }
-
-    #[tokio::test]
-    async fn dns_cache_clear_all_truncates_persistent_file() {
-        let dir = temp_rules_dir("dns-cache-clear-persist");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir.clone();
-
-        let state = RoutingState::load(config).await.unwrap();
-        state
-            .dns_cache_insert(
-                "clear.example",
-                "A",
-                RouteDecision::Direct,
-                Message::query(),
-                vec!["9.9.9.9".parse().unwrap()],
-            )
-            .await;
-        state.persist_dns_cache_now().await.unwrap();
-        assert!(!fs::read_to_string(dns_cache_file_path(&dir)).unwrap().is_empty());
-
-        assert_eq!(state.dns_cache_clear(None).await, 1);
-        assert_eq!(fs::read_to_string(dns_cache_file_path(&dir)).unwrap(), "");
-
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        let reloaded = RoutingState::load(config).await.unwrap();
-        assert_eq!(reloaded.dns_cache_stats().await.size, 0);
-    }
-
-    #[test]
-    fn dns_cache_prune_requires_saturday_and_monthly_interval() {
-        let saturday = 1_704_499_200; // 2024-01-06 00:00:00 UTC.
-        let friday = saturday - SECONDS_PER_DAY;
-
-        assert!(is_saturday_utc(saturday));
-        assert!(!is_saturday_utc(friday));
-        assert!(dns_cache_prune_is_due(0, saturday));
-        assert!(!dns_cache_prune_is_due(0, friday));
-        assert!(!dns_cache_prune_is_due(
-            saturday - DNS_CACHE_PRUNE_INTERVAL_SECONDS + 1,
-            saturday
-        ));
-        assert!(dns_cache_prune_is_due(
-            saturday - DNS_CACHE_PRUNE_INTERVAL_SECONDS,
-            saturday
-        ));
-    }
-
-    #[test]
-    fn dns_cache_persist_due_only_once_per_saturday() {
-        let saturday = 1_704_499_200; // 2024-01-06 00:00:00 UTC.
-        let friday = saturday - SECONDS_PER_DAY;
-        let next_saturday = saturday + 7 * SECONDS_PER_DAY;
-
-        assert!(dns_cache_persist_is_due(0, saturday));
-        assert!(!dns_cache_persist_is_due(0, friday));
-        assert!(!dns_cache_persist_is_due(saturday, saturday + 60 * 60));
-        assert!(dns_cache_persist_is_due(saturday, next_saturday));
-    }
-
-    #[tokio::test]
-    async fn dns_cache_enforces_capacity() {
-        let dir = temp_rules_dir("dns-cache-capacity");
-        let mut config = RouteRulesConfig::default();
-        config.rules_dir = dir;
-        config.dns_cache_capacity = 1;
-
-        let state = RoutingState::load(config).await.unwrap();
-        state
-            .dns_cache_insert(
-                "first.example",
-                "A",
-                RouteDecision::Direct,
-                Message::query(),
-                vec!["1.1.1.1".parse().unwrap()],
-            )
-            .await;
-        state
-            .dns_cache_insert(
-                "second.example",
-                "A",
-                RouteDecision::Direct,
-                Message::query(),
-                vec!["2.2.2.2".parse().unwrap()],
-            )
-            .await;
-
-        assert_eq!(state.dns_cache_stats().await.size, 1);
-        assert!(state.dns_cache_query("first.example").await.is_empty());
-        assert_eq!(
-            state.dns_cache_query("second.example").await[0].results[0].to_string(),
-            "2.2.2.2"
-        );
-    }
-}
+mod tests;

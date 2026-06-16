@@ -153,7 +153,7 @@ impl DnsBuilder {
         let local_addr = Arc::new(self.local_addr);
         let remote_addr = Arc::new(self.remote_addr);
         #[cfg(feature = "local-web-admin")]
-        client.spawn_proxy_dns_cache_refresh(remote_addr.clone());
+        client.spawn_proxy_dns_cache_refresh(local_addr.clone(), remote_addr.clone());
         #[cfg(feature = "local-web-admin")]
         client.spawn_proxy_domain_warmup(remote_addr.clone());
 
@@ -915,14 +915,18 @@ impl DnsClient {
     }
 
     #[cfg(feature = "local-web-admin")]
-    fn spawn_proxy_dns_cache_refresh(self: &Arc<Self>, remote_addr: Arc<Address>) {
+    fn spawn_proxy_dns_cache_refresh(self: &Arc<Self>, local_addr: Arc<NameServerAddr>, remote_addr: Arc<Address>) {
         let client = self.clone();
         tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(24 * 60 * 60));
             interval.tick().await;
             loop {
                 interval.tick().await;
+                // Refresh proxy (foreign-resolved) entries AND direct
+                // (domestic-resolved) entries; the latter were previously left
+                // to go stale for the full cache lifetime (audit DR-3).
                 client.refresh_proxy_dns_cache(&remote_addr).await;
+                client.refresh_direct_dns_cache(&local_addr).await;
             }
         });
     }
@@ -932,7 +936,7 @@ impl DnsClient {
         let Some(routing_state) = self.context.routing_state() else {
             return;
         };
-        let candidates = routing_state.dns_cache_proxy_refresh_candidates().await;
+        let candidates = routing_state.dns_cache_refresh_candidates(RouteDecision::Proxy).await;
         for candidate in candidates {
             let query = match dns_cache_refresh_query(&candidate.domain, &candidate.query_type) {
                 Ok(query) => query,
@@ -965,6 +969,46 @@ impl DnsClient {
                 }
                 Err(err) => warn!(
                     "failed to refresh proxy dns cache for {} {}: {}",
+                    candidate.domain, candidate.query_type, err
+                ),
+            }
+        }
+    }
+
+    #[cfg(feature = "local-web-admin")]
+    async fn refresh_direct_dns_cache(&self, local_addr: &NameServerAddr) {
+        let Some(routing_state) = self.context.routing_state() else {
+            return;
+        };
+        let candidates = routing_state.dns_cache_refresh_candidates(RouteDecision::Direct).await;
+        for candidate in candidates {
+            let query = match dns_cache_refresh_query(&candidate.domain, &candidate.query_type) {
+                Ok(query) => query,
+                Err(err) => {
+                    warn!(
+                        "failed to build dns cache refresh query for {} {}: {}",
+                        candidate.domain, candidate.query_type, err
+                    );
+                    continue;
+                }
+            };
+            match self.lookup_local(&query, local_addr).await {
+                Ok(msg) => {
+                    let ips = collect_answer_ips(&msg);
+                    // Domestic entries do not feed the proxy nft set; just keep
+                    // the cached answer warm so it never silently goes stale.
+                    routing_state
+                        .dns_cache_refresh_preserve_ttl(
+                            &candidate.domain,
+                            &candidate.query_type,
+                            RouteDecision::Direct,
+                            msg,
+                            ips,
+                        )
+                        .await;
+                }
+                Err(err) => warn!(
+                    "failed to refresh direct dns cache for {} {}: {}",
                     candidate.domain, candidate.query_type, err
                 ),
             }
@@ -1051,7 +1095,7 @@ impl DnsClient {
 
         let domain = query.name().to_ascii();
         let query_type = query.query_type().to_string();
-        let decision = self.service_binding_route_decision(&domain).await;
+        let decision = self.service_binding_route_decision(&domain, source_ip).await;
 
         #[cfg(feature = "local-web-admin")]
         if let Some(routing_state) = self.context.routing_state()
@@ -1088,10 +1132,10 @@ impl DnsClient {
     }
 
     #[cfg(feature = "local-web-admin")]
-    async fn service_binding_route_decision(&self, domain: &str) -> RouteDecision {
+    async fn service_binding_route_decision(&self, domain: &str, source_ip: Option<IpAddr>) -> RouteDecision {
         if let Some(routing_state) = self.context.routing_state() {
             routing_state
-                .route_domain(domain)
+                .route_domain_for_source(domain, source_ip)
                 .await
                 .unwrap_or(RouteDecision::Direct)
         } else {
@@ -1100,7 +1144,7 @@ impl DnsClient {
     }
 
     #[cfg(not(feature = "local-web-admin"))]
-    async fn service_binding_route_decision(&self, _domain: &str) -> RouteDecision {
+    async fn service_binding_route_decision(&self, _domain: &str, _source_ip: Option<IpAddr>) -> RouteDecision {
         RouteDecision::Direct
     }
 
@@ -1318,7 +1362,7 @@ impl DnsClient {
             && query.query_type() != RecordType::PTR
         {
             let domain = query.name().to_ascii();
-            if let Some(decision) = routing_state.route_domain(&domain).await {
+            if let Some(decision) = routing_state.route_domain_for_source(&domain, source_ip).await {
                 let query_type = query.query_type().to_string();
                 if let Some(cached) = routing_state.dns_cache_lookup(&domain, &query_type, decision).await {
                     let mut cached = cached;

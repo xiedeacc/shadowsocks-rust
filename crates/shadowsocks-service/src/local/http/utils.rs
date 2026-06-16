@@ -117,7 +117,22 @@ pub async fn connect_host(
     context: Arc<ServiceContext>,
     host: &Address,
     balancer: Option<&PingBalancer>,
+    source_ip: Option<IpAddr>,
 ) -> io::Result<(AutoProxyClientStream, Option<Arc<ServerIdent>>)> {
+    // req 2.3 / CW-3: a forced-direct source bypasses the proxy even on the
+    // explicit HTTP proxy. The Futu learner instance (record_proxy_ip) is exempt
+    // so it keeps capturing every destination it proxies (req 4).
+    #[cfg(feature = "local-web-admin")]
+    let force_source_direct = match (source_ip, context.routing_state()) {
+        (Some(ip), Some(rs)) if !context.record_proxy_ip() => rs.source_is_forced_direct(ip).await,
+        _ => false,
+    };
+    #[cfg(not(feature = "local-web-admin"))]
+    let force_source_direct = {
+        let _ = source_ip;
+        false
+    };
+
     match balancer {
         None => match AutoProxyClientStream::connect_bypassed(context, host).await {
             Ok(s) => Ok((s, None)),
@@ -130,6 +145,13 @@ pub async fn connect_host(
             Ok(s) => Ok((s, None)),
             Err(err) => {
                 error!("failed to connect host {} Direct, err: {}", host, err);
+                Err(err)
+            }
+        },
+        Some(_) if force_source_direct => match AutoProxyClientStream::connect_bypassed(context, host).await {
+            Ok(s) => Ok((s, None)),
+            Err(err) => {
+                error!("failed to connect host {} Direct (forced-direct source), err: {}", host, err);
                 Err(err)
             }
         },

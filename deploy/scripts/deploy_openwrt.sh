@@ -278,6 +278,9 @@ fi
 
 ssh_cmd "rm -rf '$REMOTE_TMP' && mkdir -p '$REMOTE_TMP' '$REMOTE_DIR/bin' '$REMOTE_DIR/conf' '$REMOTE_DIR/data' '$REMOTE_DIR/logs'"
 scp_cmd "$OPENWRT_DIR/bin/sslocal" "$HOST:$REMOTE_TMP/sslocal"
+if [[ -f "$OPENWRT_DIR/bin/ssrust-watchdog.sh" ]]; then
+	scp_cmd "$OPENWRT_DIR/bin/ssrust-watchdog.sh" "$HOST:$REMOTE_TMP/ssrust-watchdog.sh"
+fi
 REMOTE_HAS_XRAY_PLUGIN="$(ssh_cmd "test -x '$REMOTE_DIR/bin/xray-plugin' && printf yes || printf no")"
 if [[ "$REMOTE_HAS_XRAY_PLUGIN" = yes ]]; then
 	printf 'Remote xray-plugin already exists at %s/bin/xray-plugin; skipping copy.\n' "$REMOTE_DIR"
@@ -305,12 +308,17 @@ if [ -x \"\$REMOTE_TMP/xray-plugin\" ]; then
 	cp -f \"\$REMOTE_TMP/xray-plugin\" \"\$REMOTE_DIR/bin/xray-plugin\"
 	chmod 755 \"\$REMOTE_DIR/bin/xray-plugin\"
 fi
+if [ -f \"\$REMOTE_TMP/ssrust-watchdog.sh\" ]; then
+	cp -f \"\$REMOTE_TMP/ssrust-watchdog.sh\" \"\$REMOTE_DIR/bin/ssrust-watchdog.sh\"
+	chmod 755 \"\$REMOTE_DIR/bin/ssrust-watchdog.sh\"
+fi
 if [ ! -s \"\$REMOTE_DIR/conf/shadowsocks-client.json\" ]; then
 	cp -f \"\$REMOTE_TMP/shadowsocks-client.json\" \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
 fi
 chmod 644 \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
 find \"\$REMOTE_TMP\" -maxdepth 1 -type f \\
 	! -name sslocal \\
+	! -name ssrust-watchdog.sh \\
 	! -name shadowsocks-client.json \\
 	! -name \"\$SERVICE_NAME.init\" \\
 	! -name install.sh \\

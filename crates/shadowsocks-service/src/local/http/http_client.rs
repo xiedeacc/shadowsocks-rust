@@ -321,7 +321,9 @@ where
             return Err(io::Error::new(ErrorKind::InvalidInput, "invalid scheme"));
         }
 
-        let (stream, _) = connect_host(context, &host, balancer).await?;
+        // Internal HTTP client (no inbound peer to attribute) — pass None so the
+        // per-source force-direct check is a no-op here.
+        let (stream, _) = connect_host(context, &host, balancer, None).await?;
 
         if *scheme == Scheme::HTTP {
             Self::connect_http_http1(scheme, host, stream).await

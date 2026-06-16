@@ -177,6 +177,27 @@ impl Server {
         #[cfg(not(all(windows, feature = "local-tun")))]
         let outbound_bind_addr = config.outbound_bind_addr;
 
+        // H-5: when firewall transparent proxy also captures the router's OWN
+        // output (proxy_local_output), tag sslocal's outbound sockets with a
+        // dedicated fwmark so the output redirect/tproxy chains can exempt them
+        // by identity (`meta mark <mark> return`) — a loop guard that, unlike the
+        // SS-server-IP `return` rule, cannot go stale for a domain-name server.
+        // Prefer a user-configured outbound_fwmark if present.
+        #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
+        let local_output_exempt_mark: Option<u32> = if matches!(
+            config.route_rules.dns_intercept_mode.as_str(),
+            "firewall" | "both"
+        ) && config.route_rules.proxy_local_output
+        {
+            Some(
+                config
+                    .outbound_fwmark
+                    .unwrap_or(self::dns::intercept_linux::LOCAL_OUTPUT_EXEMPT_MARK_DEFAULT),
+            )
+        } else {
+            None
+        };
+
         let mut connect_opts = ConnectOpts {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             fwmark: config.outbound_fwmark,
@@ -199,6 +220,10 @@ impl Server {
         connect_opts.tcp.mptcp = config.mptcp;
         connect_opts.udp.mtu = config.udp_mtu;
         connect_opts.udp.allow_fragmentation = config.outbound_udp_allow_fragmentation;
+        #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
+        if let Some(mark) = local_output_exempt_mark {
+            connect_opts.fwmark = Some(mark);
+        }
         context.set_connect_opts(connect_opts);
 
         let mut accept_opts = AcceptOpts {
@@ -582,18 +607,30 @@ impl Server {
         #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
         let dns_intercept_mode = config.route_rules.dns_intercept_mode.clone();
 
-        // If the active config does NOT request firewall-mode DNS
-        // interception, scrub any leftover `inet ssrust_dns` nft table
-        // from a previous run. Drop-based cleanup only fires on graceful
-        // shutdown; procd SIGKILL-on-timeout, panics, and power loss all
-        // skip it and would otherwise leave every DNS query redirected
-        // to a port nothing is listening on (= no internet at all).
+        // Always scrub any firewall state left behind by a previous run BEFORE
+        // we (maybe) reinstall it. Doing this UNCONDITIONALLY — not only when
+        // interception is disabled — also covers the dangerous firewall-mode
+        // cases the old guard missed: a prior run SIGKILL'd/panicked in firewall
+        // mode whose `setup_nft` rebuild never happens this run because there is
+        // no enabled DNS listener (or it falls back to a different backend).
+        // Without this, the orphan `inet ssrust_dns` redirect table keeps
+        // black-holing DNS. `setup_nft` also deletes+recreates the table, so the
+        // extra delete here is harmless. Drop-based cleanup only fires on a
+        // graceful shutdown; SIGKILL / panic=abort / power loss skip it, so this
+        // startup scrub plus the init `cleanup_firewall`/watchdog are the safety
+        // net for those paths.
         #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
         {
-            let mode = config.route_rules.dns_intercept_mode.as_str();
-            if mode != "firewall" && mode != "both" {
-                self::dns::intercept_linux::cleanup_stale_nft_table();
+            let mut dns_scrub_ports: Vec<u16> = config
+                .local
+                .iter()
+                .filter(|local| !local.config.disabled && matches!(local.config.protocol, ProtocolType::Dns))
+                .filter_map(|local| local.config.addr.as_ref().map(|addr| addr.port()))
+                .collect();
+            if !dns_scrub_ports.contains(&1053) {
+                dns_scrub_ports.push(1053);
             }
+            self::dns::intercept_linux::cleanup_stale_nft_table(&dns_scrub_ports);
         }
 
         // Derive runtime DNS endpoints (domestic / foreign upstreams +
@@ -784,28 +821,11 @@ impl Server {
                         Some(a) => a,
                         None => return Err(io::Error::other("dns requires local address")),
                     };
-
+                    // Capture the listen port before `client_addr` is moved into
+                    // the DnsBuilder; the firewall redirect (installed after the
+                    // listener binds, below) needs it.
                     #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
-                    if matches!(dns_intercept_mode.as_str(), "firewall" | "both") {
-                        let global_proxy = config.route_rules.global_proxy;
-                        match self::dns::intercept_linux::setup_firewall_redirect(
-                            client_addr.port(),
-                            dns_intercept_redir_port,
-                            &dns_intercept_exempt_ips,
-                            &dns_intercept_proxy_exempt_endpoints,
-                            global_proxy,
-                            config.route_rules.proxy_local_output,
-                            &dns_intercept_client_ip_rules,
-                        ) {
-                            Ok(guard) => {
-                                if let Err(err) = routing_state.sync_persistent_ip_rules_to_firewall().await {
-                                    log::warn!("failed to load persistent IP rules into nft sets: {}", err);
-                                }
-                                local_server.dns_intercept_guards.push(guard);
-                            }
-                            Err(err) => log::warn!("failed to setup DNS firewall interception: {}", err),
-                        }
-                    }
+                    let dns_listen_port = client_addr.port();
 
                     let mut server_builder = {
                         let local_addr = local_config.local_dns_addr.expect("missing local_dns_addr");
@@ -833,6 +853,35 @@ impl Server {
                     }
 
                     let server = server_builder.build().await?;
+
+                    // Install the firewall redirect ONLY AFTER the DNS listener
+                    // has bound (build() above binds :client_addr). Installing it
+                    // earlier opened a startup window where `dport 53 redirect`
+                    // pointed at an unbound port, briefly black-holing DNS.
+                    #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
+                    if matches!(dns_intercept_mode.as_str(), "firewall" | "both") {
+                        let global_proxy = config.route_rules.global_proxy;
+                        match self::dns::intercept_linux::setup_firewall_redirect(
+                            dns_listen_port,
+                            dns_intercept_redir_port,
+                            &dns_intercept_exempt_ips,
+                            &dns_intercept_proxy_exempt_endpoints,
+                            global_proxy,
+                            config.route_rules.proxy_local_output,
+                            &dns_intercept_client_ip_rules,
+                            local_output_exempt_mark,
+                            config.route_rules.dns_ipv4_only,
+                        ) {
+                            Ok(guard) => {
+                                if let Err(err) = routing_state.sync_persistent_ip_rules_to_firewall().await {
+                                    log::warn!("failed to load persistent IP rules into nft sets: {}", err);
+                                }
+                                local_server.dns_intercept_guards.push(guard);
+                            }
+                            Err(err) => log::warn!("failed to setup DNS firewall interception: {}", err),
+                        }
+                    }
+
                     local_server.dns_servers.push(server);
                 }
                 #[cfg(feature = "local-tun")]

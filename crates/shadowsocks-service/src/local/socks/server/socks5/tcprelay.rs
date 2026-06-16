@@ -235,7 +235,21 @@ impl Socks5TcpHandler {
 
         let context = self.context.clone();
         let mut server_opt = None;
-        let remote_result = if self.balancer.is_empty() {
+
+        // req 2.3 / CW-3: honor per-source force-direct on the explicit SOCKS
+        // entry too, so a forced-direct client is direct regardless of how it
+        // reaches us. The Futu learner instance (record_proxy_ip) is exempt so it
+        // keeps capturing every destination it proxies (req 4).
+        #[cfg(feature = "local-web-admin")]
+        let force_source_direct = !context.record_proxy_ip()
+            && match context.routing_state() {
+                Some(rs) => rs.source_is_forced_direct(peer_addr.ip()).await,
+                None => false,
+            };
+        #[cfg(not(feature = "local-web-admin"))]
+        let force_source_direct = false;
+
+        let remote_result = if self.balancer.is_empty() || force_source_direct {
             AutoProxyClientStream::connect_bypassed(context.clone(), &target_addr).await
         } else {
             let server = self.balancer.best_tcp_server();

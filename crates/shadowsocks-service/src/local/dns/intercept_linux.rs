@@ -11,7 +11,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex, Once,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use ipnet::{IpNet, Ipv4Subnets, Ipv6Subnets};
@@ -40,6 +43,12 @@ const TPROXY_PREROUTING_CHAIN: &str = "prerouting_tproxy";
 const TPROXY_OUTPUT_CHAIN: &str = "output_tproxy";
 const TPROXY_MARK: &str = "0x5355";
 const TPROXY_TABLE: &str = "100";
+/// Dedicated fwmark applied to sslocal's OWN outbound sockets so the output
+/// redirect/tproxy chains can exempt them by identity (`meta mark <mark> return`)
+/// instead of by the SS server IP — which goes stale for a domain-name server
+/// whose address rotates (audit H-5). Distinct from `TPROXY_MARK` so no
+/// policy-routing `ip rule` matches it.
+pub const LOCAL_OUTPUT_EXEMPT_MARK_DEFAULT: u32 = 0x5356;
 const FIXED_DIRECT4_RULES: [&str; 10] = [
     "0.0.0.0/8",
     "10.0.0.0/8",
@@ -55,6 +64,65 @@ const FIXED_DIRECT4_RULES: [&str; 10] = [
 const FIXED_DIRECT6_RULES: [&str; 5] = ["::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"];
 
 static NFT_SETS_READY: AtomicBool = AtomicBool::new(false);
+
+/// Describes the host firewall state this process installed, so it can be torn
+/// down even on an abnormal exit. `DnsInterceptGuard::drop` only runs on a
+/// graceful shutdown; the release profile builds with `panic = "abort"`, so a
+/// panic SIGABRTs the process *without* unwinding and Drop never fires. Left
+/// alone, the `inet ssrust_dns` table would survive with its `dport 53 redirect`
+/// / tproxy rules pointing at a now-dead listener — black-holing the whole LAN's
+/// DNS. The panic hook below restores the pristine firewall before the abort.
+#[derive(Clone)]
+enum EmergencyTeardown {
+    Nft { udp_tproxy: bool },
+    Iptables { port: u16, exempt_ips: Vec<IpAddr> },
+}
+
+static EMERGENCY_TEARDOWN: Mutex<Option<EmergencyTeardown>> = Mutex::new(None);
+static PANIC_HOOK_INSTALLED: Once = Once::new();
+
+/// Record the firewall state to tear down on a panic, and install the panic
+/// hook (once) that performs that teardown. Called whenever a guard is created.
+fn arm_emergency_teardown(state: EmergencyTeardown) {
+    if let Ok(mut guard) = EMERGENCY_TEARDOWN.lock() {
+        *guard = Some(state);
+    }
+    PANIC_HOOK_INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            run_emergency_teardown();
+            previous(info);
+        }));
+    });
+}
+
+/// Forget the recorded firewall state after a clean teardown so a subsequent
+/// panic hook invocation becomes a no-op.
+fn disarm_emergency_teardown() {
+    if let Ok(mut guard) = EMERGENCY_TEARDOWN.lock() {
+        *guard = None;
+    }
+}
+
+/// Best-effort, panic-safe firewall teardown. Clones the descriptor out and
+/// drops the lock before shelling out so it can never deadlock from a panic
+/// that happened while the lock was held elsewhere. Never panics, never logs.
+fn run_emergency_teardown() {
+    let state = EMERGENCY_TEARDOWN.lock().ok().and_then(|guard| guard.clone());
+    match state {
+        Some(EmergencyTeardown::Nft { udp_tproxy }) => {
+            NFT_SETS_READY.store(false, Ordering::Relaxed);
+            let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
+            if udp_tproxy {
+                cleanup_tproxy_policy_routing();
+            }
+        }
+        Some(EmergencyTeardown::Iptables { port, exempt_ips }) => {
+            cleanup_iptables(port, &exempt_ips);
+        }
+        None => {}
+    }
+}
 
 pub struct DnsInterceptGuard {
     backend: Backend,
@@ -73,6 +141,8 @@ enum Backend {
 
 impl Drop for DnsInterceptGuard {
     fn drop(&mut self) {
+        // Graceful teardown is happening now; neutralise the panic-hook fallback.
+        disarm_emergency_teardown();
         match self.backend {
             Backend::Nft { udp_tproxy } => {
                 NFT_SETS_READY.store(false, Ordering::Relaxed);
@@ -95,7 +165,7 @@ impl Drop for DnsInterceptGuard {
 /// query is steered at a port nothing is listening on.
 ///
 /// Silent if the table doesn't exist or `nft` isn't installed.
-pub fn cleanup_stale_nft_table() {
+pub fn cleanup_stale_nft_table(iptables_dns_ports: &[u16]) {
     // Probe first so the common "nothing to clean" case logs nothing.
     let status = Command::new("nft")
         .args(["list", "table", "inet", NFT_TABLE])
@@ -114,6 +184,12 @@ pub fn cleanup_stale_nft_table() {
         _ => {}
     }
     cleanup_tproxy_policy_routing();
+    // Also drop any DNS-redirect rules left by a previous run that used the
+    // iptables fallback backend; otherwise a stale `dport 53 REDIRECT` could
+    // coexist with the freshly installed nft redirect and double-steer DNS.
+    for &port in iptables_dns_ports {
+        cleanup_iptables(port, &[]);
+    }
 }
 
 pub fn setup_firewall_redirect(
@@ -124,6 +200,8 @@ pub fn setup_firewall_redirect(
     global_proxy: bool,
     proxy_local_output: bool,
     client_ip_rules: &ClientIpRules,
+    local_output_exempt_mark: Option<u32>,
+    dns_ipv4_only: bool,
 ) -> io::Result<DnsInterceptGuard> {
     match setup_nft(
         port,
@@ -133,12 +211,15 @@ pub fn setup_firewall_redirect(
         global_proxy,
         proxy_local_output,
         client_ip_rules,
+        local_output_exempt_mark,
+        dns_ipv4_only,
     ) {
         Ok(udp_tproxy) => {
             info!("installed nftables DNS interception rules on local port {}", port);
             if udp_tproxy && let Some(redir_port) = redir_port {
                 info!("installed nftables UDP tproxy rules on local redir port {}", redir_port);
             }
+            arm_emergency_teardown(EmergencyTeardown::Nft { udp_tproxy });
             Ok(DnsInterceptGuard {
                 backend: Backend::Nft { udp_tproxy },
             })
@@ -151,6 +232,10 @@ pub fn setup_firewall_redirect(
             let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
             setup_iptables(port, dns_exempt_ips)?;
             info!("installed iptables DNS interception rules on local port {}", port);
+            arm_emergency_teardown(EmergencyTeardown::Iptables {
+                port,
+                exempt_ips: dns_exempt_ips.to_vec(),
+            });
             Ok(DnsInterceptGuard {
                 backend: Backend::Iptables {
                     port,
@@ -665,6 +750,8 @@ fn setup_nft(
     global_proxy: bool,
     proxy_local_output: bool,
     client_ip_rules: &ClientIpRules,
+    local_output_exempt_mark: Option<u32>,
+    dns_ipv4_only: bool,
 ) -> io::Result<bool> {
     NFT_SETS_READY.store(false, Ordering::Relaxed);
     let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
@@ -699,6 +786,19 @@ fn setup_nft(
             ";", "}",
         ],
     )?;
+    // H-5: exempt sslocal's OWN outbound (carrying `local_output_exempt_mark`)
+    // from the output redirect chain by identity, BEFORE any redirect rule.
+    // This prevents the proxy transport to the SS server from being re-captured
+    // into sslocal's own redir listener (an infinite loop) even when the server
+    // is a domain whose IP rotated — the per-IP `return` exemption can go stale,
+    // an identity mark cannot.
+    if let Some(mark) = local_output_exempt_mark {
+        let mark_arg = format!("{mark:#x}");
+        command(
+            "nft",
+            &["add", "rule", "inet", NFT_TABLE, "output", "meta", "mark", &mark_arg, "return"],
+        )?;
+    }
     for proto in ["udp", "tcp"] {
         command(
             "nft",
@@ -729,15 +829,21 @@ fn setup_nft(
                 global_proxy,
                 Some(client_ip_rules),
             )?;
-            add_nft_tcp_redir_rule(
-                "prerouting",
-                "ip6",
-                "@proxy6",
-                "@direct6",
-                redir_port,
-                global_proxy,
-                Some(client_ip_rules),
-            )?;
+            // SI-2: only steer IPv6 into the proxy when IPv6 is actually in use.
+            // Under dns_ipv4_only the local DNS suppresses AAAA, and the redir
+            // listener may be IPv4-only, so an IPv6 redirect/tproxy rule would
+            // black-hole LAN IPv6 to a dead socket. Skip the v6 proxy rule then.
+            if !dns_ipv4_only {
+                add_nft_tcp_redir_rule(
+                    "prerouting",
+                    "ip6",
+                    "@proxy6",
+                    "@direct6",
+                    redir_port,
+                    global_proxy,
+                    Some(client_ip_rules),
+                )?;
+            }
         }
         for ip in dns_exempt_ips {
             let family_expr = match ip {
@@ -791,7 +897,9 @@ fn setup_nft(
             // redirect rules so router management/LAN traffic and the proxy
             // transport itself cannot loop back into sslocal.
             add_nft_tcp_redir_rule("output", "ip", "@proxy4", "@direct4", redir_port, global_proxy, None)?;
-            add_nft_tcp_redir_rule("output", "ip6", "@proxy6", "@direct6", redir_port, global_proxy, None)?;
+            if !dns_ipv4_only {
+                add_nft_tcp_redir_rule("output", "ip6", "@proxy6", "@direct6", redir_port, global_proxy, None)?;
+            }
         }
     }
     let udp_tproxy = if let Some(redir_port) = redir_port {
@@ -801,6 +909,8 @@ fn setup_nft(
             global_proxy,
             proxy_local_output,
             client_ip_rules,
+            local_output_exempt_mark,
+            dns_ipv4_only,
         ) {
             Ok(()) => true,
             Err(err) => {
@@ -1004,6 +1114,8 @@ fn setup_nft_udp_tproxy(
     global_proxy: bool,
     proxy_local_output: bool,
     client_ip_rules: &ClientIpRules,
+    local_output_exempt_mark: Option<u32>,
+    dns_ipv4_only: bool,
 ) -> io::Result<()> {
     setup_tproxy_policy_routing()?;
     command(
@@ -1056,15 +1168,18 @@ fn setup_nft_udp_tproxy(
         global_proxy,
         client_ip_rules,
     )?;
-    add_nft_udp_tproxy_prerouting_rule(
-        "ip6",
-        "@proxy6",
-        "@direct6",
-        "ip6",
-        redir_port,
-        global_proxy,
-        client_ip_rules,
-    )?;
+    // SI-2: skip the IPv6 tproxy rule under dns_ipv4_only (see the TCP path).
+    if !dns_ipv4_only {
+        add_nft_udp_tproxy_prerouting_rule(
+            "ip6",
+            "@proxy6",
+            "@direct6",
+            "ip6",
+            redir_port,
+            global_proxy,
+            client_ip_rules,
+        )?;
+    }
     if proxy_local_output {
         command(
             "nft",
@@ -1080,9 +1195,20 @@ fn setup_nft_udp_tproxy(
                 "return",
             ],
         )?;
+        // H-5: also exempt sslocal's own marked outbound UDP from the output
+        // tproxy chain by identity, so the proxy transport can never self-loop.
+        if let Some(mark) = local_output_exempt_mark {
+            let mark_arg = format!("{mark:#x}");
+            command(
+                "nft",
+                &["add", "rule", "inet", NFT_TABLE, TPROXY_OUTPUT_CHAIN, "meta", "mark", &mark_arg, "return"],
+            )?;
+        }
         add_proxy_endpoint_return_rules(TPROXY_OUTPUT_CHAIN, "udp", proxy_exempt_endpoints)?;
         add_nft_udp_tproxy_output_rule("ip", "@proxy4", "@direct4", global_proxy)?;
-        add_nft_udp_tproxy_output_rule("ip6", "@proxy6", "@direct6", global_proxy)?;
+        if !dns_ipv4_only {
+            add_nft_udp_tproxy_output_rule("ip6", "@proxy6", "@direct6", global_proxy)?;
+        }
     }
     Ok(())
 }

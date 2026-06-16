@@ -118,7 +118,8 @@ impl HttpService {
             // Connect to Shadowsocks' remote
             //
             // FIXME: What STATUS should I return for connection error?
-            let (mut stream, server_opt) = match connect_host(self.context.clone(), &host, Some(&self.balancer)).await {
+            let (mut stream, server_opt) =
+                match connect_host(self.context.clone(), &host, Some(&self.balancer), Some(self.peer_addr.ip())).await {
                 Ok(s) => s,
                 Err(err) => {
                     error!("failed to CONNECT host: {}, error: {}", host, err);
