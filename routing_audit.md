@@ -329,6 +329,8 @@ router$ curl https://www.baidu.com    → 200 / 0.14s
 **重构**：
 - #1（nft 生命周期/信号安全拆除）、#2（决策层接入 source_ip）、#3（学习写入去抖+增量+锁外）已随上述修复落地。
 - #4（拆分 `routing.rs`）：已将单文件拆为 `routing.rs` + `routing/{tests,fileio,rules}.rs`，从 6060 行降到 **3822 行（−37%）**，行为保持不变（纯搬移），`cargo test` 59/59 通过 + aarch64-musl 交叉编译通过。`fileio`=文件 IO/源下载/geoip 解析，`rules`=规则编译/IP+域名匹配/冲突检测，`tests`=单测。剩余约 3800 行（`impl RoutingState` 主体 + 决策/学习/dns-cache 状态函数）与 RoutingInner 耦合更紧，建议作为后续增量步骤继续拆（decision/learn/index/persist）。
-- #6（CIDR LPM 索引）为行为相邻的性能改造，按约定**推迟到路由器实地验证（A）之后**再做。
+- #6（CIDR LPM 索引）：已完成（commit 7009c825）。定位到唯一真正大的 CIDR 集合 `geoip_cn`（数千条，DNS 学习路径每个新 IP 都线性扫一遍），用 `CidrRanges`（排序+合并区间的二分查找）替换该线性扫描；`proxy_ip`/`direct_ip` 只有几十条，保持原 O(1) 精确匹配 + 小 Vec。行为与 `nets.iter().any(|n| n.contains(ip))` 完全等价——property test 对 v4+v6 随机 CIDR 集合与线性扫描逐一比对，并经 3 视角对抗式复核（等价性/geoip_cn 写点覆盖/行为保持，含外部 ~275k 断言模糊测试）全部通过。cargo test 60/60 + aarch64-musl 交叉编译通过。
+- 已部署到路由器并实地回归（efd03524 那批）：facebook 走代理 / baidu 直连国内、路由器自身翻墙均 200、H-5 `meta mark 0x5356 return` 与 SI-2（无 v6 代理规则）与 req 2.3（client_direct 仅 dport!=53 return）规则均在线确认；SSH 全程可达。**注**：#6 是纯性能改动（行为不变），尚未重新部署；下次部署时随源码重建生效。
+- 仍未做（按你的范围）：H-2/UF-2 增长 GC、admin 鉴权/CSRF；以及破坏性 kill-loop 看门狗实地测试（被 harness 拦截，需逐次显式授权 + 会造成 LAN 短时中断）。`routing.rs` 更深拆分（impl 主体）评估为纯 churn/低值高险，建议保持现状。
 
 *（第 0–10 节为原始审计；以上为实施记录。本次仅在分支 `config_dns_refactor` 改代码，未部署。）*
