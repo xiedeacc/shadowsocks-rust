@@ -276,9 +276,12 @@ if [[ -d "$UBUNTU_DATA_FALLBACK" ]] && ! find "$DATA_SOURCE_DIR" -type f -print 
 	DATA_SOURCE_DIR="$UBUNTU_DATA_FALLBACK"
 fi
 
-ssh_cmd "mkdir -p '$REMOTE_TMP' '$REMOTE_DIR/bin' '$REMOTE_DIR/conf' '$REMOTE_DIR/data' '$REMOTE_DIR/logs'"
+ssh_cmd "rm -rf '$REMOTE_TMP' && mkdir -p '$REMOTE_TMP' '$REMOTE_DIR/bin' '$REMOTE_DIR/conf' '$REMOTE_DIR/data' '$REMOTE_DIR/logs'"
 scp_cmd "$OPENWRT_DIR/bin/sslocal" "$HOST:$REMOTE_TMP/sslocal"
-if [[ -x "$OPENWRT_DIR/bin/xray-plugin" ]]; then
+REMOTE_HAS_XRAY_PLUGIN="$(ssh_cmd "test -x '$REMOTE_DIR/bin/xray-plugin' && printf yes || printf no")"
+if [[ "$REMOTE_HAS_XRAY_PLUGIN" = yes ]]; then
+	printf 'Remote xray-plugin already exists at %s/bin/xray-plugin; skipping copy.\n' "$REMOTE_DIR"
+elif [[ -x "$OPENWRT_DIR/bin/xray-plugin" ]]; then
 	scp_cmd "$OPENWRT_DIR/bin/xray-plugin" "$HOST:$REMOTE_TMP/xray-plugin"
 fi
 scp_cmd "$OPENWRT_DIR/conf/shadowsocks-client.json" "$HOST:$REMOTE_TMP/shadowsocks-client.json"

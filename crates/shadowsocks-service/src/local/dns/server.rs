@@ -185,6 +185,19 @@ impl DnsBuilder {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_binding_queries_are_short_circuited() {
+        assert!(dns_query_type_should_short_circuit_empty(RecordType::HTTPS));
+        assert!(dns_query_type_should_short_circuit_empty(RecordType::SVCB));
+        assert!(!dns_query_type_should_short_circuit_empty(RecordType::A));
+        assert!(!dns_query_type_should_short_circuit_empty(RecordType::AAAA));
+    }
+}
+
 struct DnsTcpServerBuilder {
     context: Arc<ServiceContext>,
     bind_addr: ServerAddr,
@@ -639,6 +652,9 @@ fn check_name_in_proxy_list(acl: &AccessControl, name: &Name) -> Option<bool> {
     }
 }
 
+fn dns_query_type_should_short_circuit_empty(query_type: RecordType) -> bool {
+    matches!(query_type, RecordType::HTTPS | RecordType::SVCB)
+}
 
 #[cfg(feature = "local-web-admin")]
 fn collect_answer_ips(message: &Message) -> Vec<IpAddr> {
@@ -1003,6 +1019,30 @@ impl DnsClient {
                         "AAAA query suppressed because dns_ipv4_only is enabled".to_owned(),
                     )
                     .await;
+                message.queries = request.queries.clone();
+                return Ok(message);
+            }
+
+            if dns_query_type_should_short_circuit_empty(request.queries[0].query_type()) {
+                #[cfg(feature = "local-web-admin")]
+                if let Some(routing_state) = self.context.routing_state() {
+                    let query = &request.queries[0];
+                    let domain = query.name().to_ascii();
+                    let decision = routing_state
+                        .route_domain(&domain)
+                        .await
+                        .unwrap_or(RouteDecision::Direct);
+                    routing_state
+                        .record_dns(
+                            source_ip,
+                            domain,
+                            query.query_type().to_string(),
+                            Vec::new(),
+                            decision,
+                            false,
+                        )
+                        .await;
+                }
                 message.queries = request.queries.clone();
                 return Ok(message);
             }
