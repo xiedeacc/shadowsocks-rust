@@ -1,7 +1,7 @@
 //! Runtime routing state for the embedded web admin.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     io::{self, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -81,6 +81,8 @@ const RECORD_MAX_DURATION: Duration = Duration::from_secs(300);
 const RECORD_QUEUE_CAPACITY: usize = 8192;
 const PROXY_IP_PERSIST_DELAY: Duration = Duration::from_secs(30);
 const DNS_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const DNS_CACHE_PRUNE_INTERVAL_SECONDS: u64 = 30 * 24 * 60 * 60;
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 const SOURCE_REFRESH_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const PRIVATE_DIRECT_IP_RULES: [&str; 15] = [
     "0.0.0.0/8",
@@ -328,6 +330,7 @@ struct DnsCacheEntry {
     expires_at: u64,
     inserted_at: u64,
     refreshed_at: u64,
+    order: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -345,8 +348,8 @@ pub struct DnsCacheStats {
 #[derive(Clone, Debug)]
 pub struct RuntimeDiagnostics {
     pub dns_cache_size: usize,
-    /// Length of the FIFO order queue used to enforce capacity. A growing
-    /// gap between this and `dns_cache_size` indicates duplicate-key leaks.
+    /// Number of keys indexed in the expiration buckets used for capacity
+    /// eviction. A gap versus `dns_cache_size` would indicate index drift.
     pub dns_cache_order_len: usize,
     pub dns_cache_capacity: usize,
     pub dns_cache_ttl_seconds: u64,
@@ -482,6 +485,7 @@ struct CompiledRules {
     direct_domain: CompiledDomainRules,
     proxy_ip: Vec<IpNet>,
     proxy_ip_exact: HashSet<IpAddr>,
+    proxy_ip_domainless_exact: HashSet<IpAddr>,
     proxy_domain: CompiledDomainRules,
 }
 
@@ -525,7 +529,9 @@ struct RoutingInner {
     dns: VecDeque<DnsEvent>,
     reverse_domains: HashMap<IpAddr, String>,
     dns_cache: HashMap<DnsCacheKey, DnsCacheEntry>,
-    dns_cache_order: VecDeque<DnsCacheKey>,
+    dns_cache_expirations: BTreeMap<u64, HashSet<DnsCacheKey>>,
+    dns_cache_next_order: u64,
+    last_dns_cache_prune_at: u64,
     proxy_ip_dirty: bool,
     proxy_ip_persist_scheduled: bool,
 }
@@ -741,7 +747,9 @@ impl RoutingState {
             dns: VecDeque::new(),
             reverse_domains: HashMap::new(),
             dns_cache: HashMap::new(),
-            dns_cache_order: VecDeque::new(),
+            dns_cache_expirations: BTreeMap::new(),
+            dns_cache_next_order: 0,
+            last_dns_cache_prune_at: 0,
             proxy_ip_dirty: false,
             proxy_ip_persist_scheduled: false,
         };
@@ -1016,13 +1024,13 @@ impl RoutingState {
     }
 
     pub async fn route_ip(&self, ip: &IpAddr) -> Option<RouteDecision> {
-        let mut inner = self.inner.write().await;
-        route_ip_inner(&mut inner, ip)
+        let inner = self.inner.read().await;
+        route_ip_inner(&inner, ip)
     }
 
     pub async fn route_domain(&self, domain: &str) -> Option<RouteDecision> {
-        let mut inner = self.inner.write().await;
-        route_domain_inner(&mut inner, domain)
+        let inner = self.inner.read().await;
+        route_domain_inner(&inner, domain)
     }
 
     pub async fn route_address(&self, addr: &Address) -> Option<RouteDecision> {
@@ -1066,31 +1074,29 @@ impl RoutingState {
                         let direct_exists =
                             dns_proxy_ip_blocked_from_nft_by_direct_rule(&inner, ip);
                         let line = format_proxy_ip_domain_line(ip, domain);
-                        match inner
-                            .persistent_raw
-                            .proxy_ip
-                            .iter()
-                            .position(|rule| proxy_ip_line_matches_ip(rule, ip))
-                        {
-                            Some(idx) => {
+                        if target_exists {
+                            if inner.persistent.proxy_ip_domainless_exact.contains(ip)
+                                && let Some(idx) = inner
+                                    .persistent_raw
+                                    .proxy_ip
+                                    .iter()
+                                    .position(|rule| proxy_ip_line_exact_matches_ip(rule, ip))
+                            {
                                 if proxy_ip_line_domain(&inner.persistent_raw.proxy_ip[idx]).is_none() {
                                     inner.persistent_raw.proxy_ip[idx] = line;
                                     proxy_changed = true;
                                     inner.proxy_ip_dirty = true;
+                                    inner.persistent.proxy_ip_domainless_exact.remove(ip);
                                     if !inner.proxy_ip_persist_scheduled {
                                         inner.proxy_ip_persist_scheduled = true;
                                         schedule_proxy_persist = true;
                                     }
                                 }
                             }
-                            None => {
-                                lines.push(line);
-                                proxy_changed = true;
-                            }
-                        }
-                        if !target_exists {
+                        } else {
+                            lines.push(line);
+                            proxy_changed = true;
                             inner.persistent.proxy_ip_exact.insert(*ip);
-                            inner.persistent.proxy_ip.push(IpNet::from(*ip));
                             if !direct_exists {
                                 nft_ips.push(*ip);
                             }
@@ -1264,11 +1270,11 @@ impl RoutingState {
     pub async fn materialize_proxy_dns_cache_to_proxy_ip(&self) -> io::Result<usize> {
         let (path, lines, added) = {
             let mut inner = self.inner.write().await;
-            prune_dns_cache(&mut inner);
+            let now = now();
 
             let mut candidates = Vec::new();
             for (key, entry) in &inner.dns_cache {
-                if key.resolver != RouteDecision::Proxy || key.domain.is_empty() {
+                if key.resolver != RouteDecision::Proxy || key.domain.is_empty() || entry.expires_at <= now {
                     continue;
                 }
                 for ip in &entry.results {
@@ -1285,30 +1291,35 @@ impl RoutingState {
                 }
 
                 let line = format_proxy_ip_domain_line(&ip, &domain);
-                match inner
-                    .persistent_raw
-                    .proxy_ip
-                    .iter()
-                    .position(|rule| proxy_ip_line_matches_ip(rule, &ip))
-                {
-                    Some(idx) => {
+                let mut changed = false;
+                let target_exists = compiled_rules_match_ip(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip, &ip);
+                if target_exists {
+                    if inner.persistent.proxy_ip_domainless_exact.contains(&ip)
+                        && let Some(idx) = inner
+                            .persistent_raw
+                            .proxy_ip
+                            .iter()
+                            .position(|rule| proxy_ip_line_exact_matches_ip(rule, &ip))
+                    {
                         if proxy_ip_line_domain(&inner.persistent_raw.proxy_ip[idx]).is_none() {
                             inner.persistent_raw.proxy_ip[idx] = line;
+                            inner.persistent.proxy_ip_domainless_exact.remove(&ip);
+                            changed = true;
                         }
                     }
-                    None => {
-                        inner.persistent_raw.proxy_ip.push(line);
-                        added += 1;
-                    }
+                } else {
+                    inner.persistent_raw.proxy_ip.push(line);
+                    inner.persistent.proxy_ip_exact.insert(ip);
+                    added += 1;
+                    changed = true;
                 }
 
-                if !compiled_rules_match_ip(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip, &ip) {
-                    inner.persistent.proxy_ip_exact.insert(ip);
-                    inner.persistent.proxy_ip.push(IpNet::from(ip));
+                if changed {
+                    inner.proxy_ip_dirty = true;
                 }
             }
 
-            if added == 0 {
+            if !inner.proxy_ip_dirty {
                 inner.proxy_ip_dirty = false;
                 inner.proxy_ip_persist_scheduled = false;
                 return Ok(0);
@@ -1953,18 +1964,24 @@ impl RoutingState {
     }
 
     pub async fn dns_cache_lookup(&self, domain: &str, query_type: &str, resolver: RouteDecision) -> Option<Message> {
-        let mut inner = self.inner.write().await;
-        prune_dns_cache(&mut inner);
+        let inner = self.inner.read().await;
         let key = dns_cache_key(domain, query_type, resolver);
-        inner.dns_cache.get(&key).map(|entry| entry.message.clone())
+        let now = now();
+        inner
+            .dns_cache
+            .get(&key)
+            .filter(|entry| entry.expires_at > now)
+            .map(|entry| entry.message.clone())
     }
 
     pub async fn dns_cache_lookup_any(&self, domain: &str, query_type: &str) -> Option<(Message, RouteDecision)> {
-        let mut inner = self.inner.write().await;
-        prune_dns_cache(&mut inner);
+        let inner = self.inner.read().await;
+        let now = now();
         for resolver in [RouteDecision::Proxy, RouteDecision::Direct] {
             let key = dns_cache_key(domain, query_type, resolver);
-            if let Some(entry) = inner.dns_cache.get(&key) {
+            if let Some(entry) = inner.dns_cache.get(&key)
+                && entry.expires_at > now
+            {
                 return Some((entry.message.clone(), resolver));
             }
         }
@@ -1980,7 +1997,6 @@ impl RoutingState {
         results: Vec<IpAddr>,
     ) {
         let mut inner = self.inner.write().await;
-        prune_dns_cache(&mut inner);
         let key = dns_cache_key(domain, query_type, resolver);
         let now = now();
         let ttl = inner.sources.dns_cache_ttl_seconds.max(1);
@@ -1989,32 +2005,49 @@ impl RoutingState {
                 inner.reverse_domains.insert(*ip, key.domain.clone());
             }
         }
+        if let Some(expires_at) = inner.dns_cache.get(&key).map(|entry| entry.expires_at) {
+            remove_dns_cache_expiration(&mut inner, &key, expires_at);
+        }
+        let order = inner
+            .dns_cache
+            .get(&key)
+            .map(|entry| entry.order)
+            .unwrap_or_else(|| {
+                let order = inner.dns_cache_next_order;
+                inner.dns_cache_next_order = inner.dns_cache_next_order.wrapping_add(1);
+                order
+            });
+        let expires_at = now.saturating_add(ttl);
         inner.dns_cache.insert(
             key.clone(),
             DnsCacheEntry {
                 message,
                 results,
-                expires_at: now.saturating_add(ttl),
+                expires_at,
                 inserted_at: now,
                 refreshed_at: now,
+                order,
             },
         );
-        inner.dns_cache_order.push_back(key);
+        insert_dns_cache_expiration(&mut inner, key, expires_at);
+        maybe_prune_dns_cache_for_capacity(&mut inner);
         enforce_dns_cache_capacity(&mut inner);
     }
 
     pub async fn dns_cache_proxy_refresh_candidates(&self) -> Vec<DnsCacheRefreshCandidate> {
-        let mut inner = self.inner.write().await;
-        prune_dns_cache(&mut inner);
+        let inner = self.inner.read().await;
         if !inner.sources.dns_cache_refresh_enabled {
             return Vec::new();
         }
-        let cutoff = now().saturating_sub(DNS_CACHE_REFRESH_INTERVAL.as_secs());
+        let now_ts = now();
+        let cutoff = now_ts.saturating_sub(DNS_CACHE_REFRESH_INTERVAL.as_secs());
         let batch_size = inner.sources.dns_cache_refresh_batch_size.max(1);
         inner
             .dns_cache
             .iter()
-            .filter(|(key, entry)| key.resolver == RouteDecision::Proxy && entry.refreshed_at <= cutoff)
+            .filter(|(key, entry)| {
+                key.resolver == RouteDecision::Proxy && entry.expires_at > now_ts && entry.refreshed_at <= cutoff
+            })
             .take(batch_size)
             .map(|(key, _)| DnsCacheRefreshCandidate {
                 domain: key.domain.clone(),
@@ -2032,9 +2065,11 @@ impl RoutingState {
         results: Vec<IpAddr>,
     ) -> bool {
         let mut inner = self.inner.write().await;
-        prune_dns_cache(&mut inner);
         let key = dns_cache_key(domain, query_type, resolver);
         if let Some(entry) = inner.dns_cache.get_mut(&key) {
+            if entry.expires_at <= now() {
+                return false;
+            }
             entry.message = message;
             entry.results = results;
             entry.refreshed_at = now();
@@ -2045,8 +2080,7 @@ impl RoutingState {
     }
 
     pub async fn dns_cache_stats(&self) -> DnsCacheStats {
-        let mut inner = self.inner.write().await;
-        prune_dns_cache(&mut inner);
+        let inner = self.inner.read().await;
         DnsCacheStats {
             size: inner.dns_cache.len(),
             capacity: inner.sources.dns_cache_capacity,
@@ -2060,26 +2094,25 @@ impl RoutingState {
     /// logger. Takes a *read* lock and intentionally skips `prune_dns_cache`
     /// so it does not add to the write-lock contention that already shows up
     /// on hot DNS paths when the cache grows large. Reports raw container
-    /// sizes only — including `dns_cache_order` so a runaway append (a known
-    /// failure mode if duplicate keys ever leak in) is visible directly in
-    /// the log.
+    /// sizes only — including the expiration-bucket entry count so index drift
+    /// is visible directly in the log.
     pub async fn runtime_diagnostics(&self) -> RuntimeDiagnostics {
         let inner = self.inner.read().await;
         let (prune_calls, prune_ns, nft_calls, nft_ns, append_calls, append_ns, add_calls, add_ns) =
             hot_path_counters();
         RuntimeDiagnostics {
             dns_cache_size: inner.dns_cache.len(),
-            dns_cache_order_len: inner.dns_cache_order.len(),
+            dns_cache_order_len: dns_cache_expiration_entries(&inner),
             dns_cache_capacity: inner.sources.dns_cache_capacity,
             dns_cache_ttl_seconds: inner.sources.dns_cache_ttl_seconds,
             dns_events: inner.dns.len(),
             connections: inner.connections.len(),
             flow_decisions: inner.flow_decisions.len(),
             reverse_domains: inner.reverse_domains.len(),
-            persistent_direct_ip: inner.persistent.direct_ip.len(),
-            persistent_proxy_ip: inner.persistent.proxy_ip.len(),
-            temporary_direct_ip: inner.temporary.direct_ip.len(),
-            temporary_proxy_ip: inner.temporary.proxy_ip.len(),
+            persistent_direct_ip: compiled_rule_net_count(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip),
+            persistent_proxy_ip: compiled_rule_net_count(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip),
+            temporary_direct_ip: compiled_rule_net_count(&inner.temporary.direct_ip_exact, &inner.temporary.direct_ip),
+            temporary_proxy_ip: compiled_rule_net_count(&inner.temporary.proxy_ip_exact, &inner.temporary.proxy_ip),
             prune_dns_cache_calls: prune_calls,
             prune_dns_cache_total_ns: prune_ns,
             nft_invocations: nft_calls,
@@ -2092,13 +2125,13 @@ impl RoutingState {
     }
 
     pub async fn dns_cache_query(&self, domain: &str) -> Vec<DnsCacheView> {
-        let mut inner = self.inner.write().await;
-        prune_dns_cache(&mut inner);
+        let inner = self.inner.read().await;
         let domain = normalize_dns_domain(domain);
+        let now = now();
         let mut rows = inner
             .dns_cache
             .iter()
-            .filter(|(key, _)| key.domain == domain)
+            .filter(|(key, entry)| key.domain == domain && entry.expires_at > now)
             .map(|(key, entry)| DnsCacheView {
                 domain: key.domain.clone(),
                 query_type: key.query_type.clone(),
@@ -2121,12 +2154,12 @@ impl RoutingState {
         let Ok(ip) = ip.trim().parse::<IpAddr>() else {
             return Vec::new();
         };
-        let mut inner = self.inner.write().await;
-        prune_dns_cache(&mut inner);
+        let inner = self.inner.read().await;
+        let now = now();
         let mut rows = inner
             .dns_cache
             .iter()
-            .filter(|(_, entry)| entry.results.iter().any(|result| *result == ip))
+            .filter(|(_, entry)| entry.expires_at > now && entry.results.iter().any(|result| *result == ip))
             .map(|(key, entry)| DnsCacheIpView {
                 ip,
                 domain: key.domain.clone(),
@@ -2145,10 +2178,10 @@ impl RoutingState {
         if let Some(domain) = domain {
             let domain = normalize_dns_domain(domain);
             inner.dns_cache.retain(|key, _| key.domain != domain);
-            inner.dns_cache_order.retain(|key| key.domain != domain);
+            rebuild_dns_cache_expirations(&mut inner);
         } else {
             inner.dns_cache.clear();
-            inner.dns_cache_order.clear();
+            inner.dns_cache_expirations.clear();
         }
         rebuild_reverse_domains_from_dns_cache(&mut inner);
         before.saturating_sub(inner.dns_cache.len())
@@ -2388,7 +2421,7 @@ impl RoutingState {
     }
 }
 
-fn route_ip_inner(inner: &mut RoutingInner, ip: &IpAddr) -> Option<RouteDecision> {
+fn route_ip_inner(inner: &RoutingInner, ip: &IpAddr) -> Option<RouteDecision> {
     if inner.sources.global_proxy {
         return Some(if is_fixed_direct_ip(ip) {
             RouteDecision::Direct
@@ -2423,7 +2456,7 @@ fn route_ip_inner(inner: &mut RoutingInner, ip: &IpAddr) -> Option<RouteDecision
     }
 }
 
-fn route_domain_inner(inner: &mut RoutingInner, domain: &str) -> Option<RouteDecision> {
+fn route_domain_inner(inner: &RoutingInner, domain: &str) -> Option<RouteDecision> {
     let domain = normalize_domain(domain);
     if inner.sources.global_proxy {
         return Some(RouteDecision::Proxy);
@@ -2493,7 +2526,9 @@ fn rebuild_conflicts(inner: &mut RoutingInner) {
 
 fn rebuild_ip_conflicts(inner: &mut RoutingInner) {
     inner.ip_conflicts.clear();
-    for rule in ip_net_conflicts(&inner.persistent.direct_ip, &inner.persistent.proxy_ip) {
+    let direct_ip = compiled_rule_nets_for_nft(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip);
+    let proxy_ip = compiled_rule_nets_for_nft(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip);
+    for rule in ip_net_conflicts(&direct_ip, &proxy_ip) {
         push_event(
             &mut inner.ip_conflicts,
             new_conflict_event_with_metadata(
@@ -2505,7 +2540,7 @@ fn rebuild_ip_conflicts(inner: &mut RoutingInner) {
         );
     }
 
-    for rule in ip_net_conflicts(&inner.geoip_cn, &inner.persistent.proxy_ip) {
+    for rule in ip_net_conflicts(&inner.geoip_cn, &proxy_ip) {
         push_event(
             &mut inner.ip_conflicts,
             new_conflict_event_with_metadata(
@@ -2691,10 +2726,15 @@ fn rules_match_domain(rules: &CompiledDomainRules, domain: &str) -> bool {
     if rules.match_all || rules.exact.contains(domain) {
         return true;
     }
-    for candidate in domain_match_candidates(domain) {
-        if rules.suffix.contains(&candidate) {
+    let mut candidate = domain;
+    loop {
+        if candidate.contains('.') && rules.suffix.contains(candidate) {
             return true;
         }
+        let Some((_, suffix)) = candidate.split_once('.') else {
+            break;
+        };
+        candidate = suffix;
     }
     false
 }
@@ -2789,14 +2829,67 @@ fn domain_matches_rule(rule: &str, domain: &str) -> bool {
 }
 
 fn compile_rules(raw: &RuleLists) -> io::Result<CompiledRules> {
+    let (direct_ip, direct_ip_exact, _) = compile_ip_rules(&raw.direct_ip, false);
+    let (proxy_ip, proxy_ip_exact, proxy_ip_domainless_exact) = compile_ip_rules(&raw.proxy_ip, true);
     Ok(CompiledRules {
-        direct_ip: raw.direct_ip.iter().filter_map(|s| parse_ip_net(s)).collect(),
-        direct_ip_exact: raw.direct_ip.iter().filter_map(|s| parse_ip_addr(s)).collect(),
+        direct_ip,
+        direct_ip_exact,
         direct_domain: compile_domain_rules(&raw.direct_domain)?,
-        proxy_ip: raw.proxy_ip.iter().filter_map(|s| parse_ip_net(s)).collect(),
-        proxy_ip_exact: raw.proxy_ip.iter().filter_map(|s| parse_ip_addr(s)).collect(),
+        proxy_ip,
+        proxy_ip_exact,
+        proxy_ip_domainless_exact,
         proxy_domain: compile_domain_rules(&raw.proxy_domain)?,
     })
+}
+
+fn compile_ip_rules(lines: &[String], track_domainless_exact: bool) -> (Vec<IpNet>, HashSet<IpAddr>, HashSet<IpAddr>) {
+    let mut cidrs = Vec::new();
+    let mut exact = HashSet::new();
+    let mut domainless_exact = HashSet::new();
+    for line in lines {
+        let Some(value) = ip_rule_value(line) else {
+            continue;
+        };
+        let domainless = line.split_whitespace().nth(1).is_none();
+        if let Ok(ip) = value.parse::<IpAddr>() {
+            exact.insert(ip);
+            if track_domainless_exact && domainless {
+                domainless_exact.insert(ip);
+            }
+            continue;
+        }
+        let Ok(net) = value.parse::<IpNet>() else {
+            continue;
+        };
+        if let Some(ip) = host_net_ip(&net) {
+            exact.insert(ip);
+            if track_domainless_exact && domainless {
+                domainless_exact.insert(ip);
+            }
+        } else {
+            cidrs.push(net);
+        }
+    }
+    (cidrs, exact, domainless_exact)
+}
+
+fn host_net_ip(net: &IpNet) -> Option<IpAddr> {
+    match net {
+        IpNet::V4(net) if net.prefix_len() == 32 => Some(IpAddr::V4(net.addr())),
+        IpNet::V6(net) if net.prefix_len() == 128 => Some(IpAddr::V6(net.addr())),
+        _ => None,
+    }
+}
+
+fn compiled_rule_nets_for_nft(exact: &HashSet<IpAddr>, cidrs: &[IpNet]) -> Vec<IpNet> {
+    let mut nets = Vec::with_capacity(exact.len() + cidrs.len());
+    nets.extend(exact.iter().copied().map(IpNet::from));
+    nets.extend(cidrs.iter().copied());
+    nets
+}
+
+fn compiled_rule_net_count(exact: &HashSet<IpAddr>, cidrs: &[IpNet]) -> usize {
+    exact.len() + cidrs.len()
 }
 
 fn compile_domain_rules(lines: &[String]) -> io::Result<CompiledDomainRules> {
@@ -2840,6 +2933,7 @@ fn parse_ip_net(value: &str) -> Option<IpNet> {
     value.parse::<IpAddr>().ok().map(IpNet::from)
 }
 
+#[cfg(test)]
 fn parse_ip_addr(value: &str) -> Option<IpAddr> {
     ip_rule_value(value)?.parse::<IpAddr>().ok()
 }
@@ -2862,6 +2956,20 @@ fn proxy_ip_line_matches_ip(rule: &str, ip: &IpAddr) -> bool {
         return false;
     };
     rule_net.contains(ip)
+}
+
+fn proxy_ip_line_exact_matches_ip(rule: &str, ip: &IpAddr) -> bool {
+    let Some(value) = ip_rule_value(rule) else {
+        return false;
+    };
+    if let Ok(rule_ip) = value.parse::<IpAddr>() {
+        return rule_ip == *ip;
+    }
+    value
+        .parse::<IpNet>()
+        .ok()
+        .and_then(|net| host_net_ip(&net))
+        .is_some_and(|rule_ip| rule_ip == *ip)
 }
 
 fn proxy_ip_line_domain(rule: &str) -> Option<String> {
@@ -3268,13 +3376,19 @@ fn persistent_nft_route_nets(inner: &RoutingInner) -> (PathBuf, Vec<IpNet>, Vec<
     let mut direct = if inner.sources.global_proxy {
         fixed_direct_nets()
     } else {
-        inner.persistent.direct_ip.clone()
+        compiled_rule_nets_for_nft(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip)
     };
     if !inner.sources.global_proxy {
-        direct.extend(inner.temporary.direct_ip.iter().copied());
+        direct.extend(compiled_rule_nets_for_nft(
+            &inner.temporary.direct_ip_exact,
+            &inner.temporary.direct_ip,
+        ));
     }
-    let mut proxy = inner.persistent.proxy_ip.clone();
-    proxy.extend(inner.temporary.proxy_ip.iter().copied());
+    let mut proxy = compiled_rule_nets_for_nft(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip);
+    proxy.extend(compiled_rule_nets_for_nft(
+        &inner.temporary.proxy_ip_exact,
+        &inner.temporary.proxy_ip,
+    ));
     proxy.retain(|net| !direct.iter().any(|direct| ip_nets_overlap(direct, net)));
     (inner.rules_dir.clone(), direct, proxy)
 }
@@ -3297,13 +3411,15 @@ fn temporary_nft_route_nets(inner: &RoutingInner, rules: &RuleLists) -> (PathBuf
     let mut direct = if inner.sources.global_proxy {
         fixed_direct_nets()
     } else {
-        inner.persistent.direct_ip.clone()
+        compiled_rule_nets_for_nft(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip)
     };
     if !inner.sources.global_proxy {
-        direct.extend(rules.direct_ip.iter().filter_map(|rule| parse_ip_net(rule)));
+        let (direct_cidrs, direct_exact, _) = compile_ip_rules(&rules.direct_ip, false);
+        direct.extend(compiled_rule_nets_for_nft(&direct_exact, &direct_cidrs));
     }
-    let mut proxy = inner.persistent.proxy_ip.clone();
-    proxy.extend(rules.proxy_ip.iter().filter_map(|rule| parse_ip_net(rule)));
+    let mut proxy = compiled_rule_nets_for_nft(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip);
+    let (proxy_cidrs, proxy_exact, _) = compile_ip_rules(&rules.proxy_ip, false);
+    proxy.extend(compiled_rule_nets_for_nft(&proxy_exact, &proxy_cidrs));
     proxy.retain(|net| !direct.iter().any(|direct| ip_nets_overlap(direct, net)));
 
     (inner.rules_dir.clone(), direct, proxy)
@@ -3767,28 +3883,82 @@ fn push_event<T>(events: &mut VecDeque<T>, event: T) {
     }
 }
 
-fn prune_dns_cache(inner: &mut RoutingInner) {
-    // Instrumentation rationale: this function is called on every
-    // DNS lookup *under the routing write lock*. If it's the actual
-    // hot-path bottleneck we suspect, the cumulative time spent here
-    // — divided by elapsed wall clock — gives the duty cycle of the
-    // routing lock spent on pruning alone. The periodic logger reports
-    // both call count and total ns, so we can divide and read off
-    // average duration too.
+fn insert_dns_cache_expiration(inner: &mut RoutingInner, key: DnsCacheKey, expires_at: u64) {
+    inner
+        .dns_cache_expirations
+        .entry(expires_at)
+        .or_default()
+        .insert(key);
+}
+
+fn remove_dns_cache_expiration(inner: &mut RoutingInner, key: &DnsCacheKey, expires_at: u64) {
+    let remove_bucket = if let Some(keys) = inner.dns_cache_expirations.get_mut(&expires_at) {
+        keys.remove(key);
+        keys.is_empty()
+    } else {
+        false
+    };
+    if remove_bucket {
+        inner.dns_cache_expirations.remove(&expires_at);
+    }
+}
+
+fn rebuild_dns_cache_expirations(inner: &mut RoutingInner) {
+    let mut expirations = BTreeMap::<u64, HashSet<DnsCacheKey>>::new();
+    for (key, entry) in &inner.dns_cache {
+        expirations.entry(entry.expires_at).or_default().insert(key.clone());
+    }
+    inner.dns_cache_expirations = expirations;
+}
+
+fn dns_cache_expiration_entries(inner: &RoutingInner) -> usize {
+    inner.dns_cache_expirations.values().map(HashSet::len).sum()
+}
+
+fn maybe_prune_dns_cache_for_capacity(inner: &mut RoutingInner) {
+    let capacity = inner.sources.dns_cache_capacity.max(1);
+    if inner.dns_cache.len() < capacity {
+        return;
+    }
+    let now = now();
+    if !dns_cache_prune_is_due(inner.last_dns_cache_prune_at, now) {
+        return;
+    }
+    prune_dns_cache(inner, now);
+    inner.last_dns_cache_prune_at = now;
+}
+
+fn dns_cache_prune_is_due(last_prune_at: u64, now: u64) -> bool {
+    is_saturday_utc(now) && now.saturating_sub(last_prune_at) >= DNS_CACHE_PRUNE_INTERVAL_SECONDS
+}
+
+fn is_saturday_utc(timestamp: u64) -> bool {
+    // 1970-01-01 was Thursday. With Sunday=0, Saturday=6.
+    ((timestamp / SECONDS_PER_DAY) + 4) % 7 == 6
+}
+
+fn prune_dns_cache(inner: &mut RoutingInner, now: u64) {
     let started = Instant::now();
     let cache_before = inner.dns_cache.len();
-    let order_before = inner.dns_cache_order.len();
+    let order_before = dns_cache_expiration_entries(inner);
 
-    let now = now();
-    let expired = inner
-        .dns_cache
-        .iter()
-        .filter_map(|(key, entry)| (entry.expires_at <= now).then_some(key.clone()))
-        .collect::<Vec<_>>();
-    for key in expired {
-        inner.dns_cache.remove(&key);
+    while let Some(expires_at) = inner.dns_cache_expirations.keys().next().copied() {
+        if expires_at > now {
+            break;
+        }
+        let Some(keys) = inner.dns_cache_expirations.remove(&expires_at) else {
+            break;
+        };
+        for key in keys {
+            if inner
+                .dns_cache
+                .get(&key)
+                .is_some_and(|entry| entry.expires_at <= now)
+            {
+                inner.dns_cache.remove(&key);
+            }
+        }
     }
-    inner.dns_cache_order.retain(|key| inner.dns_cache.contains_key(key));
 
     let elapsed = started.elapsed();
     PRUNE_DNS_CACHE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -3800,7 +3970,7 @@ fn prune_dns_cache(inner: &mut RoutingInner) {
             cache_before,
             inner.dns_cache.len(),
             order_before,
-            inner.dns_cache_order.len(),
+            dns_cache_expiration_entries(inner),
         );
     }
 }
@@ -3808,11 +3978,50 @@ fn prune_dns_cache(inner: &mut RoutingInner) {
 fn enforce_dns_cache_capacity(inner: &mut RoutingInner) {
     let capacity = inner.sources.dns_cache_capacity.max(1);
     while inner.dns_cache.len() > capacity {
-        if let Some(key) = inner.dns_cache_order.pop_front() {
-            inner.dns_cache.remove(&key);
-        } else {
+        let Some(expires_at) = inner.dns_cache_expirations.keys().next().copied() else {
             break;
+        };
+        let Some(key) = oldest_dns_cache_key_in_bucket(inner, expires_at) else {
+            inner.dns_cache_expirations.remove(&expires_at);
+            continue;
+        };
+        remove_dns_cache_expiration(inner, &key, expires_at);
+        if inner
+            .dns_cache
+            .get(&key)
+            .is_some_and(|entry| entry.expires_at == expires_at)
+        {
+            inner.dns_cache.remove(&key);
         }
+    }
+}
+
+fn oldest_dns_cache_key_in_bucket(inner: &RoutingInner, expires_at: u64) -> Option<DnsCacheKey> {
+    inner
+        .dns_cache_expirations
+        .get(&expires_at)?
+        .iter()
+        .filter_map(|key| {
+            inner
+                .dns_cache
+                .get(key)
+                .filter(|entry| entry.expires_at == expires_at)
+                .map(|entry| (key, entry.order))
+        })
+        .min_by(|(left_key, left_order), (right_key, right_order)| {
+            left_order
+                .cmp(right_order)
+                .then_with(|| left_key.domain.cmp(&right_key.domain))
+                .then_with(|| left_key.query_type.cmp(&right_key.query_type))
+                .then_with(|| route_decision_rank(left_key.resolver).cmp(&route_decision_rank(right_key.resolver)))
+        })
+        .map(|(key, _)| key.clone())
+}
+
+fn route_decision_rank(decision: RouteDecision) -> u8 {
+    match decision {
+        RouteDecision::Direct => 0,
+        RouteDecision::Proxy => 1,
     }
 }
 
@@ -4742,6 +4951,33 @@ mod tests {
         assert_eq!(conflicts.len(), 2);
     }
 
+    #[test]
+    fn compile_ip_rules_separates_exact_from_cidr() {
+        let lines = vec![
+            "203.0.113.10".to_owned(),
+            "203.0.113.11/32".to_owned(),
+            "203.0.113.0/24".to_owned(),
+            "2001:db8::1/128 api.example".to_owned(),
+            "2001:db8:1::/48".to_owned(),
+        ];
+
+        let (cidrs, exact, domainless_exact) = compile_ip_rules(&lines, true);
+
+        assert!(exact.contains(&"203.0.113.10".parse().unwrap()));
+        assert!(exact.contains(&"203.0.113.11".parse().unwrap()));
+        assert!(exact.contains(&"2001:db8::1".parse().unwrap()));
+        assert!(domainless_exact.contains(&"203.0.113.10".parse().unwrap()));
+        assert!(domainless_exact.contains(&"203.0.113.11".parse().unwrap()));
+        assert!(!domainless_exact.contains(&"2001:db8::1".parse().unwrap()));
+        assert_eq!(
+            cidrs,
+            vec![
+                parse_ip_net("203.0.113.0/24").unwrap(),
+                parse_ip_net("2001:db8:1::/48").unwrap(),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn temporary_rules_persist_to_temp_files() {
         let dir = temp_rules_dir("temporary-persist");
@@ -4901,6 +5137,63 @@ mod tests {
         assert_eq!(cleared, 1);
         assert_eq!(state.dns_cache_stats().await.size, 0);
         assert!(!state.inner.read().await.reverse_domains.contains_key(&ip));
+    }
+
+    #[tokio::test]
+    async fn dns_cache_lookup_ignores_expired_without_prune() {
+        let dir = temp_rules_dir("dns-cache-expired-no-prune");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.dns_cache_capacity = 1024;
+        config.dns_cache_ttl_seconds = 60;
+
+        let state = RoutingState::load(config).await.unwrap();
+        state
+            .dns_cache_insert(
+                "expired.example",
+                "A",
+                RouteDecision::Direct,
+                Message::query(),
+                vec!["1.1.1.1".parse().unwrap()],
+            )
+            .await;
+
+        let key = dns_cache_key("expired.example", "A", RouteDecision::Direct);
+        let expired_at = now().saturating_sub(1);
+        {
+            let mut inner = state.inner.write().await;
+            let old_expires_at = inner.dns_cache.get(&key).unwrap().expires_at;
+            remove_dns_cache_expiration(&mut inner, &key, old_expires_at);
+            inner.dns_cache.get_mut(&key).unwrap().expires_at = expired_at;
+            insert_dns_cache_expiration(&mut inner, key, expired_at);
+        }
+
+        assert!(
+            state
+                .dns_cache_lookup("expired.example", "A", RouteDecision::Direct)
+                .await
+                .is_none()
+        );
+        assert_eq!(state.dns_cache_stats().await.size, 1);
+    }
+
+    #[test]
+    fn dns_cache_prune_requires_saturday_and_monthly_interval() {
+        let saturday = 1_704_499_200; // 2024-01-06 00:00:00 UTC.
+        let friday = saturday - SECONDS_PER_DAY;
+
+        assert!(is_saturday_utc(saturday));
+        assert!(!is_saturday_utc(friday));
+        assert!(dns_cache_prune_is_due(0, saturday));
+        assert!(!dns_cache_prune_is_due(0, friday));
+        assert!(!dns_cache_prune_is_due(
+            saturday - DNS_CACHE_PRUNE_INTERVAL_SECONDS + 1,
+            saturday
+        ));
+        assert!(dns_cache_prune_is_due(
+            saturday - DNS_CACHE_PRUNE_INTERVAL_SECONDS,
+            saturday
+        ));
     }
 
     #[tokio::test]

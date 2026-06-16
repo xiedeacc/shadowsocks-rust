@@ -54,6 +54,8 @@ const FIXED_DIRECT4_RULES: [&str; 10] = [
 ];
 const FIXED_DIRECT6_RULES: [&str; 5] = ["::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"];
 
+static NFT_SETS_READY: AtomicBool = AtomicBool::new(false);
+
 pub struct DnsInterceptGuard {
     backend: Backend,
 }
@@ -73,6 +75,7 @@ impl Drop for DnsInterceptGuard {
     fn drop(&mut self) {
         match self.backend {
             Backend::Nft { udp_tproxy } => {
+                NFT_SETS_READY.store(false, Ordering::Relaxed);
                 let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
                 if udp_tproxy {
                     cleanup_tproxy_policy_routing();
@@ -101,6 +104,7 @@ pub fn cleanup_stale_nft_table() {
         .status();
     match status {
         Ok(s) if s.success() => {
+            NFT_SETS_READY.store(false, Ordering::Relaxed);
             if let Err(err) = command("nft", &["delete", "table", "inet", NFT_TABLE]) {
                 warn!("failed to delete stale nft table {}: {}", NFT_TABLE, err);
             } else {
@@ -143,6 +147,7 @@ pub fn setup_firewall_redirect(
             warn!("failed to install nftables DNS interception rules: {}", nft_err);
             cleanup_nft_tproxy_chains();
             cleanup_tproxy_policy_routing();
+            NFT_SETS_READY.store(false, Ordering::Relaxed);
             let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
             setup_iptables(port, dns_exempt_ips)?;
             info!("installed iptables DNS interception rules on local port {}", port);
@@ -186,7 +191,7 @@ pub fn add_route_ips(decision: RouteDecision, ips: &[IpAddr]) -> io::Result<()> 
     // `nft -f -` returns non-zero on any duplicate element. We want
     // duplicates to be ignored (rule files are the source of truth),
     // so map the failure to Ok — same semantics as the per-IP loop.
-    let _ = nft_apply_script(&script);
+    let _ = nft_apply_script_with_retry(&script);
     Ok(())
 }
 
@@ -309,7 +314,7 @@ pub fn remove_route_ips(decision: RouteDecision, ips: &[IpAddr]) -> io::Result<(
             let _ = script.write_str(" }\n");
         }
     }
-    let _ = nft_apply_script(&script);
+    let _ = nft_apply_script_with_retry(&script);
     Ok(())
 }
 
@@ -326,17 +331,40 @@ fn nft_apply_script(script: &str) -> io::Result<()> {
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(script.as_bytes())?;
     }
-    let status = child.wait()?;
-    if status.success() {
+    let output = child.wait_with_output()?;
+    if output.status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(format!("nft -f - exited with {status}")))
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            Err(io::Error::other(format!("nft -f - exited with {}", output.status)))
+        } else {
+            Err(io::Error::other(format!("nft -f - exited with {}: {stderr}", output.status)))
+        }
     }
+}
+
+fn nft_apply_script_with_retry(script: &str) -> io::Result<()> {
+    match nft_apply_script(script) {
+        Ok(()) => Ok(()),
+        Err(err) if nft_error_looks_like_missing_table(&err) => {
+            NFT_SETS_READY.store(false, Ordering::Relaxed);
+            ensure_nft_sets_slow()?;
+            nft_apply_script(script)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn nft_error_looks_like_missing_table(err: &io::Error) -> bool {
+    let err = err.to_string();
+    err.contains("No such file or directory") || err.contains("does not exist")
 }
 
 pub fn replace_route_nets(work_dir: &Path, direct: &[IpNet], proxy: &[IpNet]) -> io::Result<()> {
@@ -350,7 +378,17 @@ pub fn replace_route_nets(work_dir: &Path, direct: &[IpNet], proxy: &[IpNet]) ->
         write_add_elements(&mut script, RouteDecision::Direct, direct)?;
         write_add_elements(&mut script, RouteDecision::Proxy, proxy)?;
     }
-    let result = command("nft", &["-f", &script_path.to_string_lossy()]);
+    let script_arg = script_path.to_string_lossy().to_string();
+    let mut result = command("nft", &["-f", &script_arg]);
+    if result.is_err() {
+        NFT_SETS_READY.store(false, Ordering::Relaxed);
+        if ensure_nft_sets_slow().is_ok() {
+            result = command("nft", &["-f", &script_arg]);
+        }
+    }
+    if result.is_ok() {
+        NFT_SETS_READY.store(true, Ordering::Relaxed);
+    }
     let _ = fs::remove_file(script_path);
     result
 }
@@ -402,14 +440,41 @@ impl RouteSetCounts {
 }
 
 pub fn route_set_counts() -> io::Result<RouteSetCounts> {
+    let output = Command::new("nft")
+        .args(["list", "table", "inet", NFT_TABLE])
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "nft list table {} exited with {}",
+            NFT_TABLE, output.status
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
     Ok(RouteSetCounts {
-        direct4: nft_set_entry_count(DIRECT4_SET)?,
-        direct6: nft_set_entry_count(DIRECT6_SET)?,
-        proxy4: nft_set_entry_count(PROXY4_SET)?,
-        proxy6: nft_set_entry_count(PROXY6_SET)?,
+        direct4: nft_set_entry_count_from_table(&text, DIRECT4_SET),
+        direct6: nft_set_entry_count_from_table(&text, DIRECT6_SET),
+        proxy4: nft_set_entry_count_from_table(&text, PROXY4_SET),
+        proxy6: nft_set_entry_count_from_table(&text, PROXY6_SET),
     })
 }
 
+fn nft_set_entry_count_from_table(table: &str, set_name: &str) -> usize {
+    let marker = format!("set {set_name} {{");
+    let Some(start) = table.find(&marker) else {
+        return 0;
+    };
+    let section = &table[start..];
+    let end = section
+        .find("\n\tset ")
+        .or_else(|| section.find("\n    set "))
+        .or_else(|| section.find("\n\tchain "))
+        .or_else(|| section.find("\n    chain "))
+        .unwrap_or(section.len());
+    parse_nft_ip_nets(&section[..end]).len()
+}
+
+#[allow(dead_code)]
 fn nft_set_entry_count(set_name: &str) -> io::Result<usize> {
     let output = Command::new("nft")
         .args(["list", "set", "inet", NFT_TABLE, set_name])
@@ -539,9 +604,11 @@ fn setup_nft(
     proxy_local_output: bool,
     client_ip_rules: &ClientIpRules,
 ) -> io::Result<bool> {
+    NFT_SETS_READY.store(false, Ordering::Relaxed);
     let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
     command("nft", &["add", "table", "inet", NFT_TABLE])?;
     add_nft_sets()?;
+    NFT_SETS_READY.store(true, Ordering::Relaxed);
     add_fixed_direct_set_elements()?;
     add_client_ip_set_elements(client_ip_rules)?;
     command(
@@ -1145,10 +1212,19 @@ fn cleanup_nft_tproxy_chains() {
 }
 
 fn ensure_nft_sets() -> io::Result<()> {
+    if NFT_SETS_READY.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    ensure_nft_sets_slow()
+}
+
+fn ensure_nft_sets_slow() -> io::Result<()> {
     if command("nft", &["list", "table", "inet", NFT_TABLE]).is_err() {
         command("nft", &["add", "table", "inet", NFT_TABLE])?;
     }
-    add_nft_sets()
+    add_nft_sets()?;
+    NFT_SETS_READY.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 fn add_nft_sets() -> io::Result<()> {
