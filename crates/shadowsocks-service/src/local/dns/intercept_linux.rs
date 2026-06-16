@@ -8,13 +8,13 @@ use std::{
     fmt::Write as _,
     fs::{self, File},
     io::{self, Write},
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Subnets, Ipv6Subnets};
 use log::{info, warn};
 
 #[cfg(feature = "local-web-admin")]
@@ -188,11 +188,7 @@ pub fn add_route_ips(decision: RouteDecision, ips: &[IpAddr]) -> io::Result<()> 
             let _ = script.write_str(" }\n");
         }
     }
-    // `nft -f -` returns non-zero on any duplicate element. We want
-    // duplicates to be ignored (rule files are the source of truth),
-    // so map the failure to Ok — same semantics as the per-IP loop.
-    let _ = nft_apply_script_with_retry(&script);
-    Ok(())
+    nft_apply_script_with_retry(&script)
 }
 
 /// Logged at most once so a router without `conntrack-tools` doesn't spam.
@@ -425,6 +421,31 @@ pub struct RouteSetCounts {
     pub proxy6: usize,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct RouteSetSnapshot {
+    pub direct: Vec<IpNet>,
+    pub proxy: Vec<IpNet>,
+}
+
+pub fn route_set_snapshot() -> io::Result<RouteSetSnapshot> {
+    let output = Command::new("nft")
+        .args(["list", "table", "inet", NFT_TABLE])
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "nft list table {} exited with {}",
+            NFT_TABLE, output.status
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut direct = nft_set_nets_from_table(&text, DIRECT4_SET);
+    direct.extend(nft_set_nets_from_table(&text, DIRECT6_SET));
+    let mut proxy = nft_set_nets_from_table(&text, PROXY4_SET);
+    proxy.extend(nft_set_nets_from_table(&text, PROXY6_SET));
+    Ok(RouteSetSnapshot { direct, proxy })
+}
+
 impl RouteSetCounts {
     pub fn direct_total(self) -> usize {
         self.direct4 + self.direct6
@@ -460,9 +481,13 @@ pub fn route_set_counts() -> io::Result<RouteSetCounts> {
 }
 
 fn nft_set_entry_count_from_table(table: &str, set_name: &str) -> usize {
+    nft_set_nets_from_table(table, set_name).len()
+}
+
+fn nft_set_nets_from_table(table: &str, set_name: &str) -> Vec<IpNet> {
     let marker = format!("set {set_name} {{");
     let Some(start) = table.find(&marker) else {
-        return 0;
+        return Vec::new();
     };
     let section = &table[start..];
     let end = section
@@ -471,7 +496,7 @@ fn nft_set_entry_count_from_table(table: &str, set_name: &str) -> usize {
         .or_else(|| section.find("\n\tchain "))
         .or_else(|| section.find("\n    chain "))
         .unwrap_or(section.len());
-    parse_nft_ip_nets(&section[..end]).len()
+    parse_nft_ip_nets(&section[..end])
 }
 
 #[allow(dead_code)]
@@ -536,17 +561,54 @@ fn parse_debug_ip_query(input: &str) -> io::Result<DebugIpQuery> {
 fn parse_nft_ip_nets(output: &str) -> Vec<IpNet> {
     output
         .split(|c: char| c.is_ascii_whitespace() || matches!(c, ',' | '{' | '}'))
-        .filter_map(|token| {
+        .flat_map(|token| {
             let token = token.trim_matches([';', '"']);
-            if token.is_empty() || token.contains('-') {
-                return None;
+            if token.is_empty() {
+                return Vec::new();
             }
-            token
+            if let Some((start, end)) = token.split_once('-') {
+                return nft_ip_range_to_nets(start, end);
+            }
+            match token
                 .parse::<IpNet>()
                 .ok()
                 .or_else(|| token.parse::<IpAddr>().ok().map(IpNet::from))
+            {
+                Some(net) => vec![net],
+                None => Vec::new(),
+            }
         })
         .collect()
+}
+
+fn nft_ip_range_to_nets(start: &str, end: &str) -> Vec<IpNet> {
+    match (start.parse::<IpAddr>(), end.parse::<IpAddr>()) {
+        (Ok(IpAddr::V4(start)), Ok(IpAddr::V4(end))) => {
+            let (start, end) = ordered_ipv4_range(start, end);
+            Ipv4Subnets::new(start, end, 0).map(IpNet::from).collect()
+        }
+        (Ok(IpAddr::V6(start)), Ok(IpAddr::V6(end))) => {
+            let (start, end) = ordered_ipv6_range(start, end);
+            Ipv6Subnets::new(start, end, 0).map(IpNet::from).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn ordered_ipv4_range(start: Ipv4Addr, end: Ipv4Addr) -> (Ipv4Addr, Ipv4Addr) {
+    if u32::from(start) <= u32::from(end) {
+        (start, end)
+    } else {
+        (end, start)
+    }
+}
+
+fn ordered_ipv6_range(start: Ipv6Addr, end: Ipv6Addr) -> (Ipv6Addr, Ipv6Addr) {
+    if u128::from(start) <= u128::from(end) {
+        (start, end)
+    } else {
+        (end, start)
+    }
 }
 
 fn ip_nets_overlap(left: &IpNet, right: &IpNet) -> bool {
@@ -1436,5 +1498,34 @@ fn command(program: &str, args: &[&str]) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::other(format!("{program} exited with {status}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_nft_ip_nets_expands_ipv4_ranges() {
+        let nets = parse_nft_ip_nets("elements = { 13.249.231.99-13.249.231.100 }");
+        let first = "13.249.231.99".parse::<IpAddr>().unwrap();
+        let second = "13.249.231.100".parse::<IpAddr>().unwrap();
+        let outside = "13.249.231.101".parse::<IpAddr>().unwrap();
+
+        assert!(nets.iter().any(|net| net.contains(&first)));
+        assert!(nets.iter().any(|net| net.contains(&second)));
+        assert!(!nets.iter().any(|net| net.contains(&outside)));
+    }
+
+    #[test]
+    fn parse_nft_ip_nets_expands_ipv6_ranges() {
+        let nets = parse_nft_ip_nets("elements = { 2001:db8::1-2001:db8::2 }");
+        let first = "2001:db8::1".parse::<IpAddr>().unwrap();
+        let second = "2001:db8::2".parse::<IpAddr>().unwrap();
+        let outside = "2001:db8::3".parse::<IpAddr>().unwrap();
+
+        assert!(nets.iter().any(|net| net.contains(&first)));
+        assert!(nets.iter().any(|net| net.contains(&second)));
+        assert!(!nets.iter().any(|net| net.contains(&outside)));
     }
 }

@@ -91,6 +91,7 @@ const DNS_CACHE_PERSIST_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DNS_CACHE_PRUNE_INTERVAL_SECONDS: u64 = 30 * 24 * 60 * 60;
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 const SOURCE_REFRESH_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const NFT_INDEX_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const PRIVATE_DIRECT_IP_RULES: [&str; 15] = [
     "0.0.0.0/8",
     "127.0.0.0/8",
@@ -530,6 +531,14 @@ struct CompiledDomainRules {
     match_all: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct NftRouteIndex {
+    direct_ip: Vec<IpNet>,
+    direct_ip_exact: HashSet<IpAddr>,
+    proxy_ip: Vec<IpNet>,
+    proxy_ip_exact: HashSet<IpAddr>,
+}
+
 #[derive(Debug)]
 struct RoutingInner {
     rules_dir: PathBuf,
@@ -538,7 +547,7 @@ struct RoutingInner {
     persistent_raw: RuleLists,
     temporary: CompiledRules,
     persistent: CompiledRules,
-    proxy_nft_sync_attempted_exact: HashSet<IpAddr>,
+    nft_route_index: NftRouteIndex,
     geoip_cn: Vec<IpNet>,
     geoip_modified: Option<SystemTime>,
     temporary_fingerprint: Vec<Option<u64>>,
@@ -776,7 +785,7 @@ impl RoutingState {
             persistent_raw,
             temporary,
             persistent,
-            proxy_nft_sync_attempted_exact: HashSet::new(),
+            nft_route_index: NftRouteIndex::default(),
             geoip_cn,
             geoip_modified,
             temporary_fingerprint,
@@ -827,6 +836,8 @@ impl RoutingState {
         state.spawn_periodic_source_update();
         state.spawn_periodic_temporary_reload();
         state.spawn_periodic_dns_cache_persist();
+        #[cfg(all(target_os = "linux", feature = "local-dns"))]
+        state.spawn_periodic_nft_index_sync();
         Ok(state)
     }
 
@@ -985,7 +996,7 @@ impl RoutingState {
             if let Err(err) = crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct_nets, &proxy_nets) {
                 warn!("failed to refresh nft proxy set after temporary rule change: {}", err);
             } else {
-                self.reset_proxy_nft_sync_attempts().await;
+                self.set_nft_route_index_from_nets(&direct_nets, &proxy_nets).await;
             }
         }
         // Newly added proxy domains have no IP in nft yet — ask the DNS server
@@ -1036,7 +1047,7 @@ impl RoutingState {
             if let Err(err) = crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct_nets, &proxy_nets) {
                 warn!("failed to refresh nft proxy set after learned SOCKS proxy IP: {}", err);
             } else {
-                self.reset_proxy_nft_sync_attempts().await;
+                self.set_nft_route_index_from_nets(&direct_nets, &proxy_nets).await;
             }
             crate::local::dns::intercept_linux::flush_conntrack_dst(&[ip]);
         }
@@ -1074,7 +1085,7 @@ impl RoutingState {
             if let Err(err) = crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct_nets, &proxy_nets) {
                 warn!("failed to refresh nft proxy set after temporary rule reload: {}", err);
             } else {
-                self.reset_proxy_nft_sync_attempts().await;
+                self.set_nft_route_index_from_nets(&direct_nets, &proxy_nets).await;
             }
         }
         self.proxy_warmup_notify.notify_one();
@@ -1122,7 +1133,9 @@ impl RoutingState {
             for ip in results {
                 match decision {
                     RouteDecision::Direct => {
-                        if direct_dns_result_needs_nft_sync(&inner, ip, global_proxy) {
+                        if direct_dns_result_needs_nft_sync(&inner, ip, global_proxy)
+                            && !nft_route_index_matches(&inner.nft_route_index, RouteDecision::Direct, ip)
+                        {
                             nft_ips.push(*ip);
                         }
                     }
@@ -1130,7 +1143,7 @@ impl RoutingState {
                         let target_exists =
                             compiled_rules_match_ip(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip, ip);
                         if proxy_dns_result_needs_nft_sync(&inner, ip)
-                            && inner.proxy_nft_sync_attempted_exact.insert(*ip)
+                            && !nft_route_index_matches(&inner.nft_route_index, RouteDecision::Proxy, ip)
                         {
                             nft_ips.push(*ip);
                         }
@@ -1225,7 +1238,9 @@ impl RoutingState {
                 // direct before the IP entered proxy4 would stay direct. Drop
                 // those conntrack entries so the next packet is re-evaluated
                 // against the updated sets.
-                crate::local::dns::intercept_linux::flush_conntrack_dst(&additions_for_nft);
+                if res.is_ok() {
+                    crate::local::dns::intercept_linux::flush_conntrack_dst(&additions_for_nft);
+                }
                 res
             })
             .await
@@ -1256,6 +1271,15 @@ impl RoutingState {
                     RouteDecision::Proxy => {
                         warn!("failed to sync DNS result IPs to nft set: {}", err)
                     }
+                }
+            } else {
+                let index_decision = match decision {
+                    RouteDecision::Direct if global_proxy => Some(RouteDecision::Direct),
+                    RouteDecision::Proxy => Some(RouteDecision::Proxy),
+                    RouteDecision::Direct => None,
+                };
+                if let Some(index_decision) = index_decision {
+                    self.add_nft_route_index_ips(index_decision, &nft_ips).await;
                 }
             }
         }
@@ -1487,6 +1511,43 @@ impl RoutingState {
                 }
             }
         });
+    }
+
+    #[cfg(all(target_os = "linux", feature = "local-dns"))]
+    fn spawn_periodic_nft_index_sync(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(NFT_INDEX_SYNC_INTERVAL);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if !state.nft_index_sync_enabled().await {
+                    continue;
+                }
+                if let Err(err) = state.refresh_nft_route_index_from_firewall().await {
+                    warn!("failed to refresh nft route index: {}", err);
+                }
+            }
+        });
+    }
+
+    #[cfg(all(target_os = "linux", feature = "local-dns"))]
+    async fn nft_index_sync_enabled(&self) -> bool {
+        let mode = self.inner.read().await.sources.dns_intercept_mode.clone();
+        matches!(mode.as_str(), "firewall" | "both")
+    }
+
+    #[cfg(all(target_os = "linux", feature = "local-dns"))]
+    async fn refresh_nft_route_index_from_firewall(&self) -> io::Result<()> {
+        let snapshot = tokio::task::spawn_blocking(crate::local::dns::intercept_linux::route_set_snapshot)
+            .await
+            .map_err(|err| io::Error::other(format!("nft index sync join error: {err}")))??;
+        let index = nft_route_index_from_nets(&snapshot.direct, &snapshot.proxy);
+        let mut inner = self.inner.write().await;
+        if inner.nft_route_index != index {
+            inner.nft_route_index = index;
+        }
+        Ok(())
     }
 
     pub async fn update_from_sources(&self) -> io::Result<()> {
@@ -1961,7 +2022,7 @@ impl RoutingState {
             (rules_dir, direct, proxy, conntrack_flush_ips)
         };
         crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct, &proxy)?;
-        self.reset_proxy_nft_sync_attempts().await;
+        self.set_nft_route_index_from_nets(&direct, &proxy).await;
         if !conntrack_flush_ips.is_empty() {
             log::info!(
                 "flushing conntrack for {} persisted proxy IPs after firewall sync",
@@ -1973,8 +2034,19 @@ impl RoutingState {
     }
 
     #[cfg(all(target_os = "linux", feature = "local-dns"))]
-    async fn reset_proxy_nft_sync_attempts(&self) {
-        self.inner.write().await.proxy_nft_sync_attempted_exact.clear();
+    async fn set_nft_route_index_from_nets(&self, direct: &[IpNet], proxy: &[IpNet]) {
+        self.inner.write().await.nft_route_index = nft_route_index_from_nets(direct, proxy);
+    }
+
+    async fn add_nft_route_index_ips(&self, decision: RouteDecision, ips: &[IpAddr]) {
+        if ips.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write().await;
+        match decision {
+            RouteDecision::Direct => inner.nft_route_index.direct_ip_exact.extend(ips.iter().copied()),
+            RouteDecision::Proxy => inner.nft_route_index.proxy_ip_exact.extend(ips.iter().copied()),
+        }
     }
 
     pub async fn record_connection(
@@ -3032,6 +3104,38 @@ fn compiled_rule_nets_for_nft(exact: &HashSet<IpAddr>, cidrs: &[IpNet]) -> Vec<I
 
 fn compiled_rule_net_count(exact: &HashSet<IpAddr>, cidrs: &[IpNet]) -> usize {
     exact.len() + cidrs.len()
+}
+
+fn nft_route_index_from_nets(direct: &[IpNet], proxy: &[IpNet]) -> NftRouteIndex {
+    let (direct_ip, direct_ip_exact) = nft_route_index_split_nets(direct);
+    let (proxy_ip, proxy_ip_exact) = nft_route_index_split_nets(proxy);
+    NftRouteIndex {
+        direct_ip,
+        direct_ip_exact,
+        proxy_ip,
+        proxy_ip_exact,
+    }
+}
+
+fn nft_route_index_split_nets(nets: &[IpNet]) -> (Vec<IpNet>, HashSet<IpAddr>) {
+    let mut cidrs = Vec::new();
+    let mut exact = HashSet::new();
+    for net in nets {
+        if let Some(ip) = host_net_ip(net) {
+            exact.insert(ip);
+        } else {
+            cidrs.push(*net);
+        }
+    }
+    cidrs.sort_unstable();
+    (cidrs, exact)
+}
+
+fn nft_route_index_matches(index: &NftRouteIndex, decision: RouteDecision, ip: &IpAddr) -> bool {
+    match decision {
+        RouteDecision::Direct => compiled_rules_match_ip(&index.direct_ip_exact, &index.direct_ip, ip),
+        RouteDecision::Proxy => compiled_rules_match_ip(&index.proxy_ip_exact, &index.proxy_ip, ip),
+    }
 }
 
 fn compile_domain_rules(lines: &[String]) -> io::Result<CompiledDomainRules> {
@@ -5235,11 +5339,42 @@ mod tests {
         let inner = state.inner.read().await;
         assert!(!inner.proxy_ip_dirty);
         assert!(!inner.proxy_ip_persist_scheduled);
-        assert!(inner.proxy_nft_sync_attempted_exact.contains(&ip));
         drop(inner);
 
         let lines = read_lines(dir.join(PROXY_IP_FILE)).unwrap();
         assert_eq!(lines, vec!["203.0.113.10 a.example.com".to_owned()]);
+    }
+
+    #[test]
+    fn nft_route_index_matches_exact_and_cidr_entries() {
+        let index = nft_route_index_from_nets(
+            &[IpNet::from("198.51.100.10".parse::<IpAddr>().unwrap())],
+            &[
+                "203.0.113.0/24".parse().unwrap(),
+                "2001:db8::/32".parse().unwrap(),
+            ],
+        );
+
+        assert!(nft_route_index_matches(
+            &index,
+            RouteDecision::Direct,
+            &"198.51.100.10".parse().unwrap()
+        ));
+        assert!(nft_route_index_matches(
+            &index,
+            RouteDecision::Proxy,
+            &"203.0.113.55".parse().unwrap()
+        ));
+        assert!(nft_route_index_matches(
+            &index,
+            RouteDecision::Proxy,
+            &"2001:db8::1234".parse().unwrap()
+        ));
+        assert!(!nft_route_index_matches(
+            &index,
+            RouteDecision::Proxy,
+            &"198.51.100.10".parse().unwrap()
+        ));
     }
 
     #[tokio::test]
@@ -5668,6 +5803,47 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn dns_cache_persistence_keeps_resolver_separate() {
+        let dir = temp_rules_dir("dns-cache-persist-resolver");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+
+        let state = RoutingState::load(config).await.unwrap();
+        state
+            .dns_cache_insert(
+                "resolver.example",
+                "A",
+                RouteDecision::Proxy,
+                Message::query(),
+                vec!["8.8.8.8".parse().unwrap()],
+            )
+            .await;
+        state
+            .dns_cache_insert(
+                "resolver.example",
+                "A",
+                RouteDecision::Direct,
+                Message::query(),
+                vec!["223.5.5.5".parse().unwrap()],
+            )
+            .await;
+        state.persist_dns_cache_now().await.unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        let reloaded = RoutingState::load(config).await.unwrap();
+
+        let rows = reloaded.dns_cache_query("resolver.example").await;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row.resolver == RouteDecision::Proxy && row.results == vec!["8.8.8.8".parse::<IpAddr>().unwrap()]
+        }));
+        assert!(rows.iter().any(|row| {
+            row.resolver == RouteDecision::Direct && row.results == vec!["223.5.5.5".parse::<IpAddr>().unwrap()]
+        }));
     }
 
     #[tokio::test]
