@@ -558,6 +558,9 @@ struct RoutingInner {
     persistent: CompiledRules,
     nft_route_index: NftRouteIndex,
     geoip_cn: Vec<IpNet>,
+    // LPM index over `geoip_cn` for O(log n) membership on the learning hot path
+    // (audit #6). Kept in sync wherever `geoip_cn` is assigned.
+    geoip_cn_ranges: CidrRanges,
     geoip_modified: Option<SystemTime>,
     temporary_fingerprint: Vec<Option<u64>>,
     direct_ip_modified: Option<SystemTime>,
@@ -795,6 +798,7 @@ impl RoutingState {
             temporary,
             persistent,
             nft_route_index: NftRouteIndex::default(),
+            geoip_cn_ranges: CidrRanges::build(&geoip_cn),
             geoip_cn,
             geoip_modified,
             temporary_fingerprint,
@@ -1740,6 +1744,7 @@ impl RoutingState {
         inner.persistent_raw = lists;
         inner.persistent = persistent;
         inner.geoip_cn = geoip_cn;
+        inner.geoip_cn_ranges = CidrRanges::build(&inner.geoip_cn);
         inner.geoip_modified = file_modified(&inner.rules_dir.join(SOURCE_DIR).join("geoip.dat"))?;
         inner.direct_ip_modified = file_modified(&inner.rules_dir.join(DIRECT_IP_FILE))?;
         inner.proxy_ip_modified = file_modified(&inner.rules_dir.join(PROXY_IP_FILE))?;
@@ -2806,6 +2811,7 @@ fn refresh_rule_files_from_disk_inner(inner: &mut RoutingInner) -> io::Result<()
     inner.persistent = compile_rules(&inner.persistent_raw)?;
     if geoip_modified != inner.geoip_modified {
         inner.geoip_cn = read_geoip_cn_nets(&geoip_path)?;
+        inner.geoip_cn_ranges = CidrRanges::build(&inner.geoip_cn);
     }
     inner.direct_ip_modified = direct_ip_modified;
     inner.proxy_ip_modified = proxy_ip_modified;
@@ -2868,7 +2874,10 @@ fn index_new_proxy_ip_conflicts(inner: &mut RoutingInner, new_proxy_ips: &[IpAdd
                 vec![DIRECT_IP_FILE.to_owned(), PROXY_IP_FILE.to_owned()],
             );
         }
-        if rules_match_ip(&inner.geoip_cn, ip) {
+        // #6: O(log n) membership over the ~thousands of CN CIDRs instead of a
+        // linear scan, on the per-learned-IP path. (Equivalent to
+        // rules_match_ip(&inner.geoip_cn, ip); see CidrRanges property test.)
+        if inner.geoip_cn_ranges.contains(ip) {
             push_ip_conflict_if_absent(
                 &mut inner.ip_conflicts,
                 &value,

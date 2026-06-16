@@ -93,6 +93,66 @@ pub(super) fn ip_range_end(start: u128, bits: u8, prefix_len: u8) -> u128 {
     }
 }
 
+/// Sorted, merged, non-overlapping `[start, end]` u128 ranges (v4 and v6 kept
+/// separate) giving O(log n) CIDR membership. Behaviour-equivalent to
+/// `nets.iter().any(|n| n.contains(ip))` but suitable for large sets — chiefly
+/// the geoip-CN table (thousands of CIDRs) that the DNS learning path probes for
+/// every newly learned proxy IP (audit #6). Rebuilt only when the source set
+/// changes, so the per-IP probe on the hot path is a binary search, not a scan.
+#[derive(Clone, Debug, Default)]
+pub(super) struct CidrRanges {
+    v4: Vec<(u128, u128)>,
+    v6: Vec<(u128, u128)>,
+}
+
+impl CidrRanges {
+    pub(super) fn build(nets: &[IpNet]) -> Self {
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        for net in nets {
+            let range = ip_net_range(net);
+            if range.is_v4 {
+                v4.push((range.start, range.end));
+            } else {
+                v6.push((range.start, range.end));
+            }
+        }
+        Self {
+            v4: merge_sorted_ranges(v4),
+            v6: merge_sorted_ranges(v6),
+        }
+    }
+
+    pub(super) fn contains(&self, ip: &IpAddr) -> bool {
+        let (ranges, key) = match ip {
+            IpAddr::V4(addr) => (&self.v4, u128::from(u32::from(*addr))),
+            IpAddr::V6(addr) => (&self.v6, u128::from(*addr)),
+        };
+        // Ranges are sorted by start and non-overlapping, so the only candidate
+        // that can contain `key` is the last range whose start <= key.
+        let idx = ranges.partition_point(|&(start, _)| start <= key);
+        idx > 0 && ranges[idx - 1].1 >= key
+    }
+}
+
+/// Sort by start, then coalesce overlapping or adjacent ranges into a minimal
+/// non-overlapping set (so `contains`'s binary search is valid).
+fn merge_sorted_ranges(mut ranges: Vec<(u128, u128)>) -> Vec<(u128, u128)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u128, u128)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1.saturating_add(1) => {
+                if end > last.1 {
+                    last.1 = end;
+                }
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
 pub(super) fn ip_range_conflicts(mut direct: Vec<IpRange>, mut proxy: Vec<IpRange>) -> Vec<String> {
     direct.sort_unstable_by_key(|range| (range.start, range.end));
     proxy.sort_unstable_by_key(|range| (range.start, range.end));

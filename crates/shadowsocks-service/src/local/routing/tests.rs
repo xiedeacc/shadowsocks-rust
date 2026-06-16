@@ -1444,3 +1444,105 @@
             "2.2.2.2"
         );
     }
+
+    // #6: the CidrRanges LPM index must be exactly equivalent to the linear
+    // `nets.iter().any(|n| n.contains(ip))` it replaces on the learning path.
+    #[test]
+    fn cidr_ranges_membership_matches_linear_scan() {
+        // Fixed edge cases: /0, /32, adjacency, overlap, boundaries, v6.
+        let fixed: Vec<IpNet> = [
+            "0.0.0.0/0",
+            "10.0.0.0/8",
+            "10.0.0.0/9",
+            "192.168.0.0/16",
+            "192.168.1.1/32",
+            "255.255.255.255/32",
+            "1.2.3.0/24",
+            "1.2.4.0/24",
+            "::/0",
+            "2001:db8::/32",
+            "fe80::/10",
+            "::1/128",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        let ranges = CidrRanges::build(&fixed);
+        for probe in [
+            "0.0.0.0",
+            "10.128.0.1",
+            "192.168.1.1",
+            "192.168.1.2",
+            "1.2.3.255",
+            "1.2.4.0",
+            "9.9.9.9",
+            "::1",
+            "2001:db8::1",
+            "2001:db9::1",
+            "fe80::abcd",
+        ] {
+            let ip: IpAddr = probe.parse().unwrap();
+            assert_eq!(ranges.contains(&ip), rules_match_ip(&fixed, &ip), "fixed probe {probe}");
+        }
+
+        // Randomised fuzz (deterministic LCG, no extra deps): random IPv4 CIDR
+        // sets vs random IPv4 probes — the new index must agree with the scan.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for _ in 0..300 {
+            let count = (next() % 40) as usize;
+            let nets: Vec<IpNet> = (0..count)
+                .map(|_| {
+                    let addr = std::net::Ipv4Addr::from(next());
+                    let prefix = (next() % 33) as u8;
+                    IpNet::V4(ipnet::Ipv4Net::new(addr, prefix).unwrap().trunc())
+                })
+                .collect();
+            let ranges = CidrRanges::build(&nets);
+            for _ in 0..40 {
+                let ip = IpAddr::V4(std::net::Ipv4Addr::from(next()));
+                assert_eq!(
+                    ranges.contains(&ip),
+                    rules_match_ip(&nets, &ip),
+                    "v4 fuzz ip={ip}"
+                );
+            }
+        }
+
+        // Same fuzz for IPv6 — geoip_cn genuinely contains v6 prefixes, so the
+        // v6 contains/merge path must be randomly exercised too (review gap).
+        // (Compose a u128 inline from four LCG draws; a separate closure would
+        // double-borrow `next`.)
+        for _ in 0..300 {
+            let count = (next() % 40) as usize;
+            let nets: Vec<IpNet> = (0..count)
+                .map(|_| {
+                    let bits = ((next() as u128) << 96)
+                        | ((next() as u128) << 64)
+                        | ((next() as u128) << 32)
+                        | (next() as u128);
+                    let addr = std::net::Ipv6Addr::from(bits);
+                    let prefix = (next() % 129) as u8;
+                    IpNet::V6(ipnet::Ipv6Net::new(addr, prefix).unwrap().trunc())
+                })
+                .collect();
+            let ranges = CidrRanges::build(&nets);
+            for _ in 0..40 {
+                let bits = ((next() as u128) << 96)
+                    | ((next() as u128) << 64)
+                    | ((next() as u128) << 32)
+                    | (next() as u128);
+                let ip = IpAddr::V6(std::net::Ipv6Addr::from(bits));
+                assert_eq!(
+                    ranges.contains(&ip),
+                    rules_match_ip(&nets, &ip),
+                    "v6 fuzz ip={ip}"
+                );
+            }
+        }
+    }
