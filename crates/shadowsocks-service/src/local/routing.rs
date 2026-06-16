@@ -538,6 +538,7 @@ struct RoutingInner {
     persistent_raw: RuleLists,
     temporary: CompiledRules,
     persistent: CompiledRules,
+    proxy_nft_sync_attempted_exact: HashSet<IpAddr>,
     geoip_cn: Vec<IpNet>,
     geoip_modified: Option<SystemTime>,
     temporary_fingerprint: Vec<Option<u64>>,
@@ -775,6 +776,7 @@ impl RoutingState {
             persistent_raw,
             temporary,
             persistent,
+            proxy_nft_sync_attempted_exact: HashSet::new(),
             geoip_cn,
             geoip_modified,
             temporary_fingerprint,
@@ -982,6 +984,8 @@ impl RoutingState {
         {
             if let Err(err) = crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct_nets, &proxy_nets) {
                 warn!("failed to refresh nft proxy set after temporary rule change: {}", err);
+            } else {
+                self.reset_proxy_nft_sync_attempts().await;
             }
         }
         // Newly added proxy domains have no IP in nft yet — ask the DNS server
@@ -1031,6 +1035,8 @@ impl RoutingState {
             };
             if let Err(err) = crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct_nets, &proxy_nets) {
                 warn!("failed to refresh nft proxy set after learned SOCKS proxy IP: {}", err);
+            } else {
+                self.reset_proxy_nft_sync_attempts().await;
             }
             crate::local::dns::intercept_linux::flush_conntrack_dst(&[ip]);
         }
@@ -1067,6 +1073,8 @@ impl RoutingState {
         {
             if let Err(err) = crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct_nets, &proxy_nets) {
                 warn!("failed to refresh nft proxy set after temporary rule reload: {}", err);
+            } else {
+                self.reset_proxy_nft_sync_attempts().await;
             }
         }
         self.proxy_warmup_notify.notify_one();
@@ -1121,8 +1129,11 @@ impl RoutingState {
                     RouteDecision::Proxy => {
                         let target_exists =
                             compiled_rules_match_ip(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip, ip);
-                        let direct_exists =
-                            dns_proxy_ip_blocked_from_nft_by_direct_rule(&inner, ip);
+                        if proxy_dns_result_needs_nft_sync(&inner, ip)
+                            && inner.proxy_nft_sync_attempted_exact.insert(*ip)
+                        {
+                            nft_ips.push(*ip);
+                        }
                         let line = format_proxy_ip_domain_line(ip, domain);
                         if target_exists {
                             if inner.persistent.proxy_ip_domainless_exact.contains(ip)
@@ -1147,9 +1158,6 @@ impl RoutingState {
                             lines.push(line);
                             proxy_changed = true;
                             inner.persistent.proxy_ip_exact.insert(*ip);
-                            if !direct_exists {
-                                nft_ips.push(*ip);
-                            }
                         }
                     }
                 }
@@ -1953,6 +1961,7 @@ impl RoutingState {
             (rules_dir, direct, proxy, conntrack_flush_ips)
         };
         crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct, &proxy)?;
+        self.reset_proxy_nft_sync_attempts().await;
         if !conntrack_flush_ips.is_empty() {
             log::info!(
                 "flushing conntrack for {} persisted proxy IPs after firewall sync",
@@ -1961,6 +1970,11 @@ impl RoutingState {
             crate::local::dns::intercept_linux::flush_conntrack_dst(&conntrack_flush_ips);
         }
         Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "local-dns"))]
+    async fn reset_proxy_nft_sync_attempts(&self) {
+        self.inner.write().await.proxy_nft_sync_attempted_exact.clear();
     }
 
     pub async fn record_connection(
@@ -3541,12 +3555,12 @@ fn dns_proxy_ip_blocked_from_nft_by_direct_rule(inner: &RoutingInner, ip: &IpAdd
         || compiled_rules_match_ip(&inner.temporary.direct_ip_exact, &inner.temporary.direct_ip, ip)
 }
 
-fn direct_dns_result_needs_nft_sync(inner: &RoutingInner, ip: &IpAddr, global_proxy: bool) -> bool {
-    if global_proxy {
-        return true;
-    }
-    compiled_rules_match_ip(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip, ip)
-        || compiled_rules_match_ip(&inner.temporary.proxy_ip_exact, &inner.temporary.proxy_ip, ip)
+fn proxy_dns_result_needs_nft_sync(inner: &RoutingInner, ip: &IpAddr) -> bool {
+    !dns_proxy_ip_blocked_from_nft_by_direct_rule(inner, ip)
+}
+
+fn direct_dns_result_needs_nft_sync(_inner: &RoutingInner, _ip: &IpAddr, global_proxy: bool) -> bool {
+    global_proxy
 }
 
 #[cfg(all(target_os = "linux", feature = "local-dns"))]
@@ -5145,7 +5159,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_dns_results_sync_nft_only_when_needed() {
+    async fn direct_dns_results_sync_nft_only_for_global_proxy_exceptions() {
         let dir = temp_rules_dir("dns-direct-nft-sync-needed");
         write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
         write_lines_atomic(dir.join(PROXY_IP_FILE), &["203.0.113.10 a.example.com".to_owned()]).unwrap();
@@ -5162,7 +5176,7 @@ mod tests {
         let inner = state.inner.read().await;
 
         assert!(!direct_dns_result_needs_nft_sync(&inner, &unrelated, false));
-        assert!(direct_dns_result_needs_nft_sync(&inner, &proxy_conflict, false));
+        assert!(!direct_dns_result_needs_nft_sync(&inner, &proxy_conflict, false));
         assert!(direct_dns_result_needs_nft_sync(&inner, &unrelated, true));
     }
 
@@ -5221,6 +5235,7 @@ mod tests {
         let inner = state.inner.read().await;
         assert!(!inner.proxy_ip_dirty);
         assert!(!inner.proxy_ip_persist_scheduled);
+        assert!(inner.proxy_nft_sync_attempted_exact.contains(&ip));
         drop(inner);
 
         let lines = read_lines(dir.join(PROXY_IP_FILE)).unwrap();
@@ -5249,6 +5264,7 @@ mod tests {
             &ip
         ));
         assert!(!dns_proxy_ip_blocked_from_nft_by_direct_rule(&inner, &ip));
+        assert!(proxy_dns_result_needs_nft_sync(&inner, &ip));
     }
 
     #[cfg(all(target_os = "linux", feature = "local-dns"))]
