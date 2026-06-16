@@ -1946,11 +1946,21 @@ impl RoutingState {
 
     #[cfg(all(target_os = "linux", feature = "local-dns"))]
     pub async fn sync_persistent_ip_rules_to_firewall(&self) -> io::Result<()> {
-        let (rules_dir, direct, proxy) = {
+        let (rules_dir, direct, proxy, conntrack_flush_ips) = {
             let inner = self.inner.read().await;
-            persistent_nft_route_nets(&inner)
+            let (rules_dir, direct, proxy) = persistent_nft_route_nets(&inner);
+            let conntrack_flush_ips = proxy_conntrack_flush_ips(&inner);
+            (rules_dir, direct, proxy, conntrack_flush_ips)
         };
-        crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct, &proxy)
+        crate::local::dns::intercept_linux::replace_route_nets(&rules_dir, &direct, &proxy)?;
+        if !conntrack_flush_ips.is_empty() {
+            log::info!(
+                "flushing conntrack for {} persisted proxy IPs after firewall sync",
+                conntrack_flush_ips.len()
+            );
+            crate::local::dns::intercept_linux::flush_conntrack_dst(&conntrack_flush_ips);
+        }
+        Ok(())
     }
 
     pub async fn record_connection(
@@ -3509,6 +3519,21 @@ fn persistent_nft_route_nets(inner: &RoutingInner) -> (PathBuf, Vec<IpNet>, Vec<
     ));
     proxy.retain(|net| !direct.iter().any(|direct| ip_nets_overlap(direct, net)));
     (inner.rules_dir.clone(), direct, proxy)
+}
+
+#[cfg(all(target_os = "linux", feature = "local-dns"))]
+fn proxy_conntrack_flush_ips(inner: &RoutingInner) -> Vec<IpAddr> {
+    let mut ips: Vec<IpAddr> = inner
+        .persistent
+        .proxy_ip_exact
+        .iter()
+        .chain(inner.temporary.proxy_ip_exact.iter())
+        .copied()
+        .filter(|ip| !is_fixed_direct_ip(ip) && !dns_proxy_ip_blocked_from_nft_by_direct_rule(inner, ip))
+        .collect();
+    ips.sort_unstable();
+    ips.dedup();
+    ips
 }
 
 fn dns_proxy_ip_blocked_from_nft_by_direct_rule(inner: &RoutingInner, ip: &IpAddr) -> bool {
@@ -5224,6 +5249,36 @@ mod tests {
             &ip
         ));
         assert!(!dns_proxy_ip_blocked_from_nft_by_direct_rule(&inner, &ip));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "local-dns"))]
+    #[tokio::test]
+    async fn proxy_conntrack_flush_ips_include_only_active_public_proxy_exact_ips() {
+        let dir = temp_rules_dir("proxy-conntrack-flush-ips");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &["198.51.100.20/32".to_owned()]).unwrap();
+        write_lines_atomic(
+            dir.join(PROXY_IP_FILE),
+            &[
+                "160.79.104.10 claude.com".to_owned(),
+                "198.51.100.20 direct-conflict.example".to_owned(),
+                "192.168.2.50 private.example".to_owned(),
+            ],
+        )
+        .unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &[]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+        let inner = state.inner.read().await;
+
+        assert_eq!(
+            proxy_conntrack_flush_ips(&inner),
+            vec!["160.79.104.10".parse::<IpAddr>().unwrap()]
+        );
     }
 
     #[tokio::test]
