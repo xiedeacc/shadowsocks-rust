@@ -14,13 +14,17 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use hickory_resolver::proto::op::{Message, ResponseCode};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use hickory_resolver::proto::{
+    op::{Message, ResponseCode},
+    serialize::binary::{BinDecodable, BinEncodable},
+};
 use ipnet::IpNet;
 use log::warn;
 use serde::{Deserialize, Serialize};
 use shadowsocks::relay::socks5::Address;
 use tokio::{
-    sync::{Notify, RwLock as TokioRwLock, mpsc, oneshot},
+    sync::{Mutex as TokioMutex, Notify, RwLock as TokioRwLock, mpsc, oneshot},
     time,
 };
 
@@ -70,6 +74,7 @@ const TEMP_DIRECT_DOMAIN_FILE: &str = "direct_domain.temp";
 const TEMP_PROXY_IP_FILE: &str = "proxy_ip.temp";
 const TEMP_PROXY_DOMAIN_FILE: &str = "proxy_domain.temp";
 const TEMP_DIR: &str = "temp";
+const DNS_CACHE_FILE: &str = "dns_cache.jsonl";
 const TEMP_IP_CONFLICTS_FILE: &str = "ip_conflicts.jsonl";
 const TEMP_DOMAIN_CONFLICTS_FILE: &str = "domain_conflicts.jsonl";
 const RECORD_FILE: &str = "record.txt";
@@ -81,6 +86,7 @@ const RECORD_MAX_DURATION: Duration = Duration::from_secs(300);
 const RECORD_QUEUE_CAPACITY: usize = 8192;
 const PROXY_IP_PERSIST_DELAY: Duration = Duration::from_secs(30);
 const DNS_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const DNS_CACHE_PERSIST_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DNS_CACHE_PRUNE_INTERVAL_SECONDS: u64 = 30 * 24 * 60 * 60;
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 const SOURCE_REFRESH_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -333,6 +339,32 @@ struct DnsCacheEntry {
     order: u64,
 }
 
+#[derive(Clone, Debug)]
+struct DnsCachePersistItem {
+    key: DnsCacheKey,
+    entry: DnsCacheEntry,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PersistedDnsCacheEntry {
+    domain: String,
+    query_type: String,
+    resolver: RouteDecision,
+    results: Vec<IpAddr>,
+    expires_at: u64,
+    inserted_at: u64,
+    refreshed_at: u64,
+    order: u64,
+    message: String,
+}
+
+#[derive(Debug, Default)]
+struct LoadedDnsCache {
+    cache: HashMap<DnsCacheKey, DnsCacheEntry>,
+    expirations: BTreeMap<u64, HashSet<DnsCacheKey>>,
+    next_order: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DnsCacheStats {
     pub size: usize,
@@ -532,6 +564,9 @@ struct RoutingInner {
     dns_cache_expirations: BTreeMap<u64, HashSet<DnsCacheKey>>,
     dns_cache_next_order: u64,
     last_dns_cache_prune_at: u64,
+    last_dns_cache_persist_at: u64,
+    dns_cache_generation: u64,
+    dns_cache_dirty: bool,
     proxy_ip_dirty: bool,
     proxy_ip_persist_scheduled: bool,
 }
@@ -550,6 +585,7 @@ pub struct RoutingState {
     /// `/api/dns` so the web admin can hot-reload upstreams without
     /// editing the config file.
     dns_runtime: Arc<TokioRwLock<DnsRuntimeState>>,
+    dns_cache_persist_lock: Arc<TokioMutex<()>>,
     /// Notified whenever the temporary proxy domain list changes so the DNS
     /// server can (re-)resolve those domains and pre-seed the nft proxy set,
     /// instead of waiting for a client to query them through us. See
@@ -711,7 +747,14 @@ impl RoutingState {
         ensure_file(temp_file_path(&config.rules_dir, TEMP_DIRECT_DOMAIN_FILE))?;
         ensure_file(temp_file_path(&config.rules_dir, TEMP_PROXY_IP_FILE))?;
         ensure_file(temp_file_path(&config.rules_dir, TEMP_PROXY_DOMAIN_FILE))?;
+        let dns_cache_path = dns_cache_file_path(&config.rules_dir);
+        ensure_file(&dns_cache_path)?;
 
+        let sources = RoutingSources::from(&config);
+        let loaded_dns_cache = read_dns_cache_file(&dns_cache_path, sources.dns_cache_capacity.max(1))?;
+        let dns_cache_last_persist_at = file_modified(&dns_cache_path)?
+            .and_then(system_time_unix_secs)
+            .unwrap_or(0);
         let persistent_raw = read_rule_lists(&config.rules_dir)?;
         let persistent = compile_rules(&persistent_raw)?;
         let geoip_path = config.rules_dir.join(SOURCE_DIR).join("geoip.dat");
@@ -725,7 +768,7 @@ impl RoutingState {
         let temporary_fingerprint = temporary_files_fingerprint(&config.rules_dir)?;
         let temporary = compile_rules(&temporary_raw)?;
         let mut inner = RoutingInner {
-            sources: RoutingSources::from(&config),
+            sources,
             rules_dir: config.rules_dir,
             temporary_raw,
             persistent_raw,
@@ -746,13 +789,17 @@ impl RoutingState {
             system_connection_first_seen: HashMap::new(),
             dns: VecDeque::new(),
             reverse_domains: HashMap::new(),
-            dns_cache: HashMap::new(),
-            dns_cache_expirations: BTreeMap::new(),
-            dns_cache_next_order: 0,
+            dns_cache: loaded_dns_cache.cache,
+            dns_cache_expirations: loaded_dns_cache.expirations,
+            dns_cache_next_order: loaded_dns_cache.next_order,
             last_dns_cache_prune_at: 0,
+            last_dns_cache_persist_at: dns_cache_last_persist_at,
+            dns_cache_generation: 0,
+            dns_cache_dirty: false,
             proxy_ip_dirty: false,
             proxy_ip_persist_scheduled: false,
         };
+        rebuild_reverse_domains_from_dns_cache(&mut inner);
         rebuild_conflicts(&mut inner);
         let v4_only = inner.sources.dns_ipv4_only;
         let inner = Arc::new(TokioRwLock::new(inner));
@@ -771,10 +818,12 @@ impl RoutingState {
             record_tx,
             dns_ipv4_only_flag: Arc::new(std::sync::atomic::AtomicBool::new(v4_only)),
             dns_runtime: Arc::new(TokioRwLock::new(DnsRuntimeState::default())),
+            dns_cache_persist_lock: Arc::new(TokioMutex::new(())),
             proxy_warmup_notify: Arc::new(Notify::new()),
         };
         state.spawn_periodic_source_update();
         state.spawn_periodic_temporary_reload();
+        state.spawn_periodic_dns_cache_persist();
         Ok(state)
     }
 
@@ -1267,6 +1316,41 @@ impl RoutingState {
         }
     }
 
+    async fn persist_dns_cache_now(&self) -> io::Result<bool> {
+        let _guard = self.dns_cache_persist_lock.lock().await;
+        let now_ts = now();
+        let (path, generation, rows) = {
+            let inner = self.inner.read().await;
+            (
+                dns_cache_file_path(&inner.rules_dir),
+                inner.dns_cache_generation,
+                dns_cache_persist_items(&inner, now_ts),
+            )
+        };
+
+        tokio::task::spawn_blocking(move || write_dns_cache_file(&path, rows))
+            .await
+            .map_err(|err| io::Error::other(format!("dns cache persist join error: {err}")))??;
+
+        let mut inner = self.inner.write().await;
+        inner.last_dns_cache_persist_at = now_ts;
+        if inner.dns_cache_generation == generation {
+            inner.dns_cache_dirty = false;
+        }
+        Ok(true)
+    }
+
+    async fn persist_dns_cache_if_due(&self) -> io::Result<bool> {
+        let now_ts = now();
+        {
+            let inner = self.inner.read().await;
+            if !inner.dns_cache_dirty || !dns_cache_persist_is_due(inner.last_dns_cache_persist_at, now_ts) {
+                return Ok(false);
+            }
+        }
+        self.persist_dns_cache_now().await
+    }
+
     pub async fn materialize_proxy_dns_cache_to_proxy_ip(&self) -> io::Result<usize> {
         let (path, lines, added) = {
             let mut inner = self.inner.write().await;
@@ -1377,6 +1461,20 @@ impl RoutingState {
                     }
                     Ok(_) => {}
                     Err(err) => warn!("failed to stat temporary rule files: {}", err),
+                }
+            }
+        });
+    }
+
+    fn spawn_periodic_dns_cache_persist(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(DNS_CACHE_PERSIST_CHECK_INTERVAL);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if let Err(err) = state.persist_dns_cache_if_due().await {
+                    warn!("failed to persist DNS cache: {}", err);
                 }
             }
         });
@@ -2035,6 +2133,7 @@ impl RoutingState {
         insert_dns_cache_expiration(&mut inner, key, expires_at);
         maybe_prune_dns_cache_for_capacity(&mut inner);
         enforce_dns_cache_capacity(&mut inner);
+        mark_dns_cache_dirty(&mut inner);
     }
 
     pub async fn dns_cache_proxy_refresh_candidates(&self) -> Vec<DnsCacheRefreshCandidate> {
@@ -2079,6 +2178,7 @@ impl RoutingState {
             entry.message = message;
             entry.results = results;
             entry.refreshed_at = now();
+            mark_dns_cache_dirty(&mut inner);
             true
         } else {
             false
@@ -2179,18 +2279,29 @@ impl RoutingState {
     }
 
     pub async fn dns_cache_clear(&self, domain: Option<&str>) -> usize {
-        let mut inner = self.inner.write().await;
-        let before = inner.dns_cache.len();
-        if let Some(domain) = domain {
-            let domain = normalize_dns_domain(domain);
-            inner.dns_cache.retain(|key, _| key.domain != domain);
-            rebuild_dns_cache_expirations(&mut inner);
-        } else {
-            inner.dns_cache.clear();
-            inner.dns_cache_expirations.clear();
+        let (cleared, should_persist) = {
+            let mut inner = self.inner.write().await;
+            let before = inner.dns_cache.len();
+            if let Some(domain) = domain {
+                let domain = normalize_dns_domain(domain);
+                inner.dns_cache.retain(|key, _| key.domain != domain);
+                rebuild_dns_cache_expirations(&mut inner);
+            } else {
+                inner.dns_cache.clear();
+                inner.dns_cache_expirations.clear();
+            }
+            rebuild_reverse_domains_from_dns_cache(&mut inner);
+            let cleared = before.saturating_sub(inner.dns_cache.len());
+            let should_persist = domain.is_none() || cleared > 0;
+            if should_persist {
+                mark_dns_cache_dirty(&mut inner);
+            }
+            (cleared, should_persist)
+        };
+        if should_persist && let Err(err) = self.persist_dns_cache_now().await {
+            warn!("failed to persist DNS cache after clear: {}", err);
         }
-        rebuild_reverse_domains_from_dns_cache(&mut inner);
-        before.saturating_sub(inner.dns_cache.len())
+        cleared
     }
 
     pub async fn ip_conflicts(&self) -> Vec<ConflictEvent> {
@@ -3478,6 +3589,10 @@ fn normalize_dns_domain(value: &str) -> String {
     normalize_domain(value)
 }
 
+fn dns_cache_file_path(dir: &Path) -> PathBuf {
+    temp_file_path(dir, DNS_CACHE_FILE)
+}
+
 fn dns_cache_key(domain: &str, query_type: &str, resolver: RouteDecision) -> DnsCacheKey {
     DnsCacheKey {
         domain: normalize_dns_domain(domain),
@@ -3488,6 +3603,176 @@ fn dns_cache_key(domain: &str, query_type: &str, resolver: RouteDecision) -> Dns
 
 fn dns_cache_message_is_cacheable(message: &Message, results: &[IpAddr]) -> bool {
     message.metadata.response_code == ResponseCode::NoError && !results.is_empty()
+}
+
+fn mark_dns_cache_dirty(inner: &mut RoutingInner) {
+    inner.dns_cache_dirty = true;
+    inner.dns_cache_generation = inner.dns_cache_generation.wrapping_add(1);
+}
+
+fn dns_cache_persist_items(inner: &RoutingInner, now_ts: u64) -> Vec<DnsCachePersistItem> {
+    let mut rows = inner
+        .dns_cache
+        .iter()
+        .filter(|(key, entry)| {
+            !key.domain.is_empty()
+                && entry.expires_at > now_ts
+                && dns_cache_message_is_cacheable(&entry.message, &entry.results)
+        })
+        .map(|(key, entry)| DnsCachePersistItem {
+            key: key.clone(),
+            entry: entry.clone(),
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        a.entry
+            .order
+            .cmp(&b.entry.order)
+            .then_with(|| a.key.domain.cmp(&b.key.domain))
+            .then_with(|| a.key.query_type.cmp(&b.key.query_type))
+            .then_with(|| {
+                route_decision_sort_key(a.key.resolver).cmp(&route_decision_sort_key(b.key.resolver))
+            })
+    });
+    rows
+}
+
+fn write_dns_cache_file(path: &Path, rows: Vec<DnsCachePersistItem>) -> io::Result<()> {
+    let mut lines = Vec::with_capacity(rows.len());
+    for row in rows {
+        let message = encode_dns_message(&row.entry.message)?;
+        let persisted = PersistedDnsCacheEntry {
+            domain: row.key.domain,
+            query_type: row.key.query_type,
+            resolver: row.key.resolver,
+            results: row.entry.results,
+            expires_at: row.entry.expires_at,
+            inserted_at: row.entry.inserted_at,
+            refreshed_at: row.entry.refreshed_at,
+            order: row.entry.order,
+            message,
+        };
+        lines.push(serde_json::to_string(&persisted).map_err(|err| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("serialize DNS cache row: {err}"))
+        })?);
+    }
+    write_lines_atomic(path, &lines)
+}
+
+fn read_dns_cache_file(path: &Path, capacity: usize) -> io::Result<LoadedDnsCache> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(LoadedDnsCache::default()),
+        Err(err) => return Err(err),
+    };
+    let now_ts = now();
+    let mut cache = HashMap::<DnsCacheKey, DnsCacheEntry>::new();
+    for (line_no, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let row = match serde_json::from_str::<PersistedDnsCacheEntry>(line) {
+            Ok(row) => row,
+            Err(err) => {
+                warn!("skipping invalid DNS cache row {}: {}", line_no + 1, err);
+                continue;
+            }
+        };
+        let message = match decode_dns_message(&row.message) {
+            Ok(message) => message,
+            Err(err) => {
+                warn!("skipping undecodable DNS cache row {}: {}", line_no + 1, err);
+                continue;
+            }
+        };
+        let key = dns_cache_key(&row.domain, &row.query_type, row.resolver);
+        if key.domain.is_empty()
+            || row.expires_at <= now_ts
+            || !dns_cache_message_is_cacheable(&message, &row.results)
+        {
+            continue;
+        }
+        let entry = DnsCacheEntry {
+            message,
+            results: row.results,
+            expires_at: row.expires_at,
+            inserted_at: row.inserted_at,
+            refreshed_at: row.refreshed_at,
+            order: row.order,
+        };
+        match cache.get(&key) {
+            Some(existing)
+                if (existing.expires_at, existing.refreshed_at, existing.order)
+                    >= (entry.expires_at, entry.refreshed_at, entry.order) => {}
+            _ => {
+                cache.insert(key, entry);
+            }
+        }
+    }
+
+    let capacity = capacity.max(1);
+    if cache.len() > capacity {
+        let mut rows = cache.into_iter().collect::<Vec<_>>();
+        rows.sort_by(|(left_key, left), (right_key, right)| {
+            right
+                .expires_at
+                .cmp(&left.expires_at)
+                .then_with(|| right.refreshed_at.cmp(&left.refreshed_at))
+                .then_with(|| right.order.cmp(&left.order))
+                .then_with(|| left_key.domain.cmp(&right_key.domain))
+        });
+        rows.truncate(capacity);
+        cache = rows.into_iter().collect();
+    }
+
+    let next_order = cache
+        .values()
+        .map(|entry| entry.order)
+        .max()
+        .map(|order| order.wrapping_add(1))
+        .unwrap_or(0);
+    let mut expirations = BTreeMap::<u64, HashSet<DnsCacheKey>>::new();
+    for (key, entry) in &cache {
+        expirations.entry(entry.expires_at).or_default().insert(key.clone());
+    }
+    Ok(LoadedDnsCache {
+        cache,
+        expirations,
+        next_order,
+    })
+}
+
+fn encode_dns_message(message: &Message) -> io::Result<String> {
+    let bytes = message.to_bytes().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("encode DNS message: {err}"),
+        )
+    })?;
+    Ok(BASE64_STANDARD.encode(bytes))
+}
+
+fn decode_dns_message(encoded: &str) -> io::Result<Message> {
+    let bytes = BASE64_STANDARD.decode(encoded).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("decode DNS message base64: {err}"),
+        )
+    })?;
+    Message::from_bytes(&bytes).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("decode DNS message: {err}"),
+        )
+    })
+}
+
+fn route_decision_sort_key(decision: RouteDecision) -> u8 {
+    match decision {
+        RouteDecision::Direct => 0,
+        RouteDecision::Proxy => 1,
+    }
 }
 
 fn parse_text_rules(text: &str) -> Vec<String> {
@@ -3942,9 +4227,17 @@ fn dns_cache_prune_is_due(last_prune_at: u64, now: u64) -> bool {
     is_saturday_utc(now) && now.saturating_sub(last_prune_at) >= DNS_CACHE_PRUNE_INTERVAL_SECONDS
 }
 
+fn dns_cache_persist_is_due(last_persist_at: u64, now: u64) -> bool {
+    is_saturday_utc(now) && utc_day(last_persist_at) != utc_day(now)
+}
+
 fn is_saturday_utc(timestamp: u64) -> bool {
     // 1970-01-01 was Thursday. With Sunday=0, Saturday=6.
-    ((timestamp / SECONDS_PER_DAY) + 4) % 7 == 6
+    (utc_day(timestamp) + 4) % 7 == 6
+}
+
+fn utc_day(timestamp: u64) -> u64 {
+    timestamp / SECONDS_PER_DAY
 }
 
 fn prune_dns_cache(inner: &mut RoutingInner, now: u64) {
@@ -4040,6 +4333,10 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn system_time_unix_secs(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH).ok().map(|duration| duration.as_secs())
 }
 
 #[cfg(test)]
@@ -5231,6 +5528,69 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn dns_cache_persists_and_loads_from_disk() {
+        let dir = temp_rules_dir("dns-cache-persist");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+        config.dns_cache_ttl_seconds = 60;
+
+        let state = RoutingState::load(config).await.unwrap();
+        state
+            .dns_cache_insert(
+                "Persist.EXAMPLE.",
+                "A",
+                RouteDecision::Proxy,
+                Message::query(),
+                vec!["8.8.8.8".parse().unwrap()],
+            )
+            .await;
+        state.persist_dns_cache_now().await.unwrap();
+        assert!(!fs::read_to_string(dns_cache_file_path(&dir)).unwrap().is_empty());
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        let reloaded = RoutingState::load(config).await.unwrap();
+        let rows = reloaded.dns_cache_query("persist.example").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].resolver, RouteDecision::Proxy);
+        assert_eq!(rows[0].results[0].to_string(), "8.8.8.8");
+        assert!(
+            reloaded
+                .dns_cache_lookup("persist.example", "A", RouteDecision::Proxy)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_cache_clear_all_truncates_persistent_file() {
+        let dir = temp_rules_dir("dns-cache-clear-persist");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+
+        let state = RoutingState::load(config).await.unwrap();
+        state
+            .dns_cache_insert(
+                "clear.example",
+                "A",
+                RouteDecision::Direct,
+                Message::query(),
+                vec!["9.9.9.9".parse().unwrap()],
+            )
+            .await;
+        state.persist_dns_cache_now().await.unwrap();
+        assert!(!fs::read_to_string(dns_cache_file_path(&dir)).unwrap().is_empty());
+
+        assert_eq!(state.dns_cache_clear(None).await, 1);
+        assert_eq!(fs::read_to_string(dns_cache_file_path(&dir)).unwrap(), "");
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        let reloaded = RoutingState::load(config).await.unwrap();
+        assert_eq!(reloaded.dns_cache_stats().await.size, 0);
+    }
+
     #[test]
     fn dns_cache_prune_requires_saturday_and_monthly_interval() {
         let saturday = 1_704_499_200; // 2024-01-06 00:00:00 UTC.
@@ -5248,6 +5608,18 @@ mod tests {
             saturday - DNS_CACHE_PRUNE_INTERVAL_SECONDS,
             saturday
         ));
+    }
+
+    #[test]
+    fn dns_cache_persist_due_only_once_per_saturday() {
+        let saturday = 1_704_499_200; // 2024-01-06 00:00:00 UTC.
+        let friday = saturday - SECONDS_PER_DAY;
+        let next_saturday = saturday + 7 * SECONDS_PER_DAY;
+
+        assert!(dns_cache_persist_is_due(0, saturday));
+        assert!(!dns_cache_persist_is_due(0, friday));
+        assert!(!dns_cache_persist_is_due(saturday, saturday + 60 * 60));
+        assert!(dns_cache_persist_is_due(saturday, next_saturday));
     }
 
     #[tokio::test]
