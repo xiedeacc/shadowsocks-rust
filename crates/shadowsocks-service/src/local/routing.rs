@@ -1201,6 +1201,75 @@ impl RoutingState {
         }
     }
 
+    pub async fn materialize_proxy_dns_cache_to_proxy_ip(&self) -> io::Result<usize> {
+        let (path, lines, added) = {
+            let mut inner = self.inner.write().await;
+            prune_dns_cache(&mut inner);
+
+            let mut candidates = Vec::new();
+            for (key, entry) in &inner.dns_cache {
+                if key.resolver != RouteDecision::Proxy || key.domain.is_empty() {
+                    continue;
+                }
+                for ip in &entry.results {
+                    candidates.push((*ip, key.domain.clone()));
+                }
+            }
+            candidates.sort_unstable();
+            candidates.dedup_by_key(|(ip, _)| *ip);
+
+            let mut added = 0;
+            for (ip, domain) in candidates {
+                if is_fixed_direct_ip(&ip) || dns_proxy_ip_blocked_from_nft_by_direct_rule(&inner, &ip) {
+                    continue;
+                }
+
+                let line = format_proxy_ip_domain_line(&ip, &domain);
+                match inner
+                    .persistent_raw
+                    .proxy_ip
+                    .iter()
+                    .position(|rule| proxy_ip_line_matches_ip(rule, &ip))
+                {
+                    Some(idx) => {
+                        if proxy_ip_line_domain(&inner.persistent_raw.proxy_ip[idx]).is_none() {
+                            inner.persistent_raw.proxy_ip[idx] = line;
+                        }
+                    }
+                    None => {
+                        inner.persistent_raw.proxy_ip.push(line);
+                        added += 1;
+                    }
+                }
+
+                if !compiled_rules_match_ip(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip, &ip) {
+                    inner.persistent.proxy_ip_exact.insert(ip);
+                    inner.persistent.proxy_ip.push(IpNet::from(ip));
+                }
+            }
+
+            if added == 0 {
+                inner.proxy_ip_dirty = false;
+                inner.proxy_ip_persist_scheduled = false;
+                return Ok(0);
+            }
+
+            rebuild_ip_conflicts(&mut inner);
+            inner.proxy_ip_dirty = false;
+            inner.proxy_ip_persist_scheduled = false;
+            (
+                inner.rules_dir.join(PROXY_IP_FILE),
+                normalize_proxy_ip_lines(inner.persistent_raw.proxy_ip.clone()),
+                added,
+            )
+        };
+
+        tokio::task::spawn_blocking(move || write_lines_atomic(path, &lines))
+            .await
+            .map_err(|err| io::Error::other(format!("proxy dns cache materialize join error: {err}")))??;
+        Ok(added)
+    }
+
     fn spawn_periodic_source_update(&self) {
         let state = self.clone();
         tokio::spawn(async move {
