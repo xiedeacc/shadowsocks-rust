@@ -4,12 +4,12 @@
 
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{self, ErrorKind},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use byteorder::{BigEndian, ByteOrder};
@@ -26,6 +26,7 @@ use log::{debug, error, info, trace, warn};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
+    sync::Mutex,
     time,
 };
 
@@ -39,7 +40,7 @@ use shadowsocks::{
 #[cfg(feature = "local-web-admin")]
 use crate::local::routing::RouteDecision;
 #[cfg(not(feature = "local-web-admin"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum RouteDecision {
     Direct,
     Proxy,
@@ -54,6 +55,15 @@ use crate::{
 };
 
 use super::{client_cache::DnsClientCache, config::NameServerAddr};
+
+const SERVICE_BINDING_NEGATIVE_TTL: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ServiceBindingCacheKey {
+    domain: String,
+    query_type: String,
+    resolver: RouteDecision,
+}
 
 /// DNS Relay server builder
 pub struct DnsBuilder {
@@ -195,6 +205,29 @@ mod tests {
         assert!(dns_query_type_should_short_circuit_empty(RecordType::SVCB));
         assert!(!dns_query_type_should_short_circuit_empty(RecordType::A));
         assert!(!dns_query_type_should_short_circuit_empty(RecordType::AAAA));
+    }
+
+    #[test]
+    fn service_binding_answer_detection_requires_matching_type() {
+        let message = service_binding_message(RecordType::HTTPS);
+        assert!(dns_message_has_service_binding_answers(&message, RecordType::HTTPS));
+        assert!(!dns_message_has_service_binding_answers(&message, RecordType::SVCB));
+        assert!(!dns_message_has_service_binding_answers(&Message::response(1, OpCode::Query), RecordType::HTTPS));
+    }
+
+    fn service_binding_message(query_type: RecordType) -> Message {
+        let name = Name::from_ascii("example.com.").unwrap();
+        let svcb = hickory_resolver::proto::rr::rdata::SVCB::new(1, Name::root(), Vec::new());
+        let data = match query_type {
+            RecordType::HTTPS => RData::HTTPS(hickory_resolver::proto::rr::rdata::HTTPS(svcb)),
+            RecordType::SVCB => RData::SVCB(svcb),
+            _ => unreachable!(),
+        };
+        let mut message = Message::response(1, OpCode::Query);
+        message
+            .answers
+            .push(hickory_resolver::proto::rr::Record::from_rdata(name, 60, data));
+        message
     }
 }
 
@@ -656,6 +689,24 @@ fn dns_query_type_should_short_circuit_empty(query_type: RecordType) -> bool {
     matches!(query_type, RecordType::HTTPS | RecordType::SVCB)
 }
 
+fn dns_message_has_service_binding_answers(message: &Message, query_type: RecordType) -> bool {
+    message.metadata.response_code == ResponseCode::NoError
+        && message.answers.iter().any(|record| {
+            matches!(
+                (&record.data, query_type),
+                (RData::HTTPS(_), RecordType::HTTPS) | (RData::SVCB(_), RecordType::SVCB)
+            )
+        })
+}
+
+fn empty_response_for_request(request: &Message) -> Message {
+    let mut response = Message::response(request.id, request.op_code);
+    response.metadata.recursion_desired = true;
+    response.metadata.recursion_available = true;
+    response.queries = request.queries.clone();
+    response
+}
+
 #[cfg(feature = "local-web-admin")]
 fn collect_answer_ips(message: &Message) -> Vec<IpAddr> {
     message
@@ -846,6 +897,8 @@ struct DnsClient {
     mode: Mode,
     balancer: PingBalancer,
     attempts: usize,
+    service_binding_refreshes: Mutex<HashSet<ServiceBindingCacheKey>>,
+    service_binding_negative_cache: Mutex<HashMap<ServiceBindingCacheKey, Instant>>,
 }
 
 impl DnsClient {
@@ -856,6 +909,8 @@ impl DnsClient {
             mode,
             balancer,
             attempts: 2,
+            service_binding_refreshes: Mutex::new(HashSet::new()),
+            service_binding_negative_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -979,8 +1034,161 @@ impl DnsClient {
         }
     }
 
-    async fn resolve(
+    async fn resolve_service_binding(
+        self: &Arc<Self>,
+        request: &Message,
+        local_addr: &NameServerAddr,
+        remote_addr: &Address,
+        source_ip: Option<IpAddr>,
+    ) -> Option<Message> {
+        #[cfg(not(feature = "local-web-admin"))]
+        let _ = source_ip;
+
+        let query = request.queries.first()?;
+        if !dns_query_type_should_short_circuit_empty(query.query_type()) {
+            return None;
+        }
+
+        let domain = query.name().to_ascii();
+        let query_type = query.query_type().to_string();
+        let decision = self.service_binding_route_decision(&domain).await;
+
+        #[cfg(feature = "local-web-admin")]
+        if let Some(routing_state) = self.context.routing_state()
+            && let Some(mut cached) = routing_state
+                .dns_cache_lookup(&domain, &query_type, decision)
+                .await
+        {
+            cached.metadata.id = request.id;
+            cached.queries = request.queries.clone();
+            routing_state
+                .record_dns(source_ip, domain, query_type, Vec::new(), decision, true)
+                .await;
+            return Some(cached);
+        }
+
+        self.maybe_spawn_service_binding_refresh(
+            query.clone(),
+            domain.clone(),
+            query_type.clone(),
+            decision,
+            local_addr.clone(),
+            remote_addr.clone(),
+        )
+        .await;
+
+        #[cfg(feature = "local-web-admin")]
+        if let Some(routing_state) = self.context.routing_state() {
+            routing_state
+                .record_dns(source_ip, domain, query_type, Vec::new(), decision, false)
+                .await;
+        }
+
+        Some(empty_response_for_request(request))
+    }
+
+    #[cfg(feature = "local-web-admin")]
+    async fn service_binding_route_decision(&self, domain: &str) -> RouteDecision {
+        if let Some(routing_state) = self.context.routing_state() {
+            routing_state
+                .route_domain(domain)
+                .await
+                .unwrap_or(RouteDecision::Direct)
+        } else {
+            RouteDecision::Direct
+        }
+    }
+
+    #[cfg(not(feature = "local-web-admin"))]
+    async fn service_binding_route_decision(&self, _domain: &str) -> RouteDecision {
+        RouteDecision::Direct
+    }
+
+    async fn maybe_spawn_service_binding_refresh(
+        self: &Arc<Self>,
+        query: Query,
+        domain: String,
+        query_type: String,
+        decision: RouteDecision,
+        local_addr: NameServerAddr,
+        remote_addr: Address,
+    ) {
+        let key = ServiceBindingCacheKey {
+            domain: domain.clone(),
+            query_type: query_type.clone(),
+            resolver: decision,
+        };
+        if !self.begin_service_binding_refresh(key.clone()).await {
+            return;
+        }
+
+        let client = self.clone();
+        tokio::spawn(async move {
+            client
+                .refresh_service_binding(key, query, domain, query_type, decision, local_addr, remote_addr)
+                .await;
+        });
+    }
+
+    async fn begin_service_binding_refresh(&self, key: ServiceBindingCacheKey) -> bool {
+        let now = Instant::now();
+        {
+            let mut negative_cache = self.service_binding_negative_cache.lock().await;
+            negative_cache.retain(|_, expires_at| *expires_at > now);
+            if let Some(expires_at) = negative_cache.get(&key) {
+                if *expires_at > now {
+                    return false;
+                }
+            }
+        }
+        self.service_binding_refreshes.lock().await.insert(key)
+    }
+
+    async fn refresh_service_binding(
         &self,
+        key: ServiceBindingCacheKey,
+        query: Query,
+        domain: String,
+        query_type: String,
+        decision: RouteDecision,
+        local_addr: NameServerAddr,
+        remote_addr: Address,
+    ) {
+        #[cfg(not(feature = "local-web-admin"))]
+        let _ = (&domain, &query_type);
+
+        let response = match decision {
+            RouteDecision::Direct => self.lookup_local(&query, &local_addr).await,
+            RouteDecision::Proxy => self.lookup_remote(&query, &remote_addr).await,
+        };
+
+        let has_service_binding_answers = response
+            .as_ref()
+            .is_ok_and(|message| dns_message_has_service_binding_answers(message, query.query_type()));
+
+        #[cfg(feature = "local-web-admin")]
+        if has_service_binding_answers
+            && let Some(routing_state) = self.context.routing_state()
+            && let Ok(message) = response.as_ref()
+        {
+            routing_state
+                .dns_cache_insert(&domain, &query_type, decision, message.clone(), Vec::new())
+                .await;
+        }
+
+        if has_service_binding_answers {
+            self.service_binding_negative_cache.lock().await.remove(&key);
+        } else {
+            self.service_binding_negative_cache
+                .lock()
+                .await
+                .insert(key.clone(), Instant::now() + SERVICE_BINDING_NEGATIVE_TTL);
+        }
+        self.service_binding_refreshes.lock().await.remove(&key);
+    }
+
+    async fn resolve(
+        self: &Arc<Self>,
         request: Message,
         local_addr: &NameServerAddr,
         remote_addr: &Address,
@@ -1023,28 +1231,11 @@ impl DnsClient {
                 return Ok(message);
             }
 
-            if dns_query_type_should_short_circuit_empty(request.queries[0].query_type()) {
-                #[cfg(feature = "local-web-admin")]
-                if let Some(routing_state) = self.context.routing_state() {
-                    let query = &request.queries[0];
-                    let domain = query.name().to_ascii();
-                    let decision = routing_state
-                        .route_domain(&domain)
-                        .await
-                        .unwrap_or(RouteDecision::Direct);
-                    routing_state
-                        .record_dns(
-                            source_ip,
-                            domain,
-                            query.query_type().to_string(),
-                            Vec::new(),
-                            decision,
-                            false,
-                        )
-                        .await;
-                }
-                message.queries = request.queries.clone();
-                return Ok(message);
+            if let Some(response) = self
+                .resolve_service_binding(&request, local_addr, remote_addr, source_ip)
+                .await
+            {
+                return Ok(response);
             }
 
             // Make queries according to ACL rules

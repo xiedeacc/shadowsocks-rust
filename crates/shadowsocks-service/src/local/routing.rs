@@ -17,6 +17,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use hickory_resolver::proto::{
     op::{Message, ResponseCode},
+    rr::RData,
     serialize::binary::{BinDecodable, BinEncodable},
 };
 use ipnet::IpNet;
@@ -2094,7 +2095,7 @@ impl RoutingState {
         message: Message,
         results: Vec<IpAddr>,
     ) {
-        if !dns_cache_message_is_cacheable(&message, &results) {
+        if !dns_cache_message_is_cacheable(query_type, &message, &results) {
             return;
         }
         let mut inner = self.inner.write().await;
@@ -2166,7 +2167,7 @@ impl RoutingState {
         message: Message,
         results: Vec<IpAddr>,
     ) -> bool {
-        if !dns_cache_message_is_cacheable(&message, &results) {
+        if !dns_cache_message_is_cacheable(query_type, &message, &results) {
             return false;
         }
         let mut inner = self.inner.write().await;
@@ -3601,8 +3602,19 @@ fn dns_cache_key(domain: &str, query_type: &str, resolver: RouteDecision) -> Dns
     }
 }
 
-fn dns_cache_message_is_cacheable(message: &Message, results: &[IpAddr]) -> bool {
-    message.metadata.response_code == ResponseCode::NoError && !results.is_empty()
+fn dns_cache_message_is_cacheable(query_type: &str, message: &Message, results: &[IpAddr]) -> bool {
+    message.metadata.response_code == ResponseCode::NoError
+        && (!results.is_empty() || dns_cache_message_has_service_binding_answers(query_type, message))
+}
+
+fn dns_cache_message_has_service_binding_answers(query_type: &str, message: &Message) -> bool {
+    let query_type = query_type.to_ascii_uppercase();
+    message.answers.iter().any(|record| {
+        matches!(
+            (&record.data, query_type.as_str()),
+            (RData::HTTPS(_), "HTTPS") | (RData::SVCB(_), "SVCB")
+        )
+    })
 }
 
 fn mark_dns_cache_dirty(inner: &mut RoutingInner) {
@@ -3617,7 +3629,7 @@ fn dns_cache_persist_items(inner: &RoutingInner, now_ts: u64) -> Vec<DnsCachePer
         .filter(|(key, entry)| {
             !key.domain.is_empty()
                 && entry.expires_at > now_ts
-                && dns_cache_message_is_cacheable(&entry.message, &entry.results)
+                && dns_cache_message_is_cacheable(&key.query_type, &entry.message, &entry.results)
         })
         .map(|(key, entry)| DnsCachePersistItem {
             key: key.clone(),
@@ -3689,7 +3701,7 @@ fn read_dns_cache_file(path: &Path, capacity: usize) -> io::Result<LoadedDnsCach
         let key = dns_cache_key(&row.domain, &row.query_type, row.resolver);
         if key.domain.is_empty()
             || row.expires_at <= now_ts
-            || !dns_cache_message_is_cacheable(&message, &row.results)
+            || !dns_cache_message_is_cacheable(&key.query_type, &message, &row.results)
         {
             continue;
         }
@@ -5526,6 +5538,30 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[test]
+    fn dns_cache_accepts_real_service_binding_responses() {
+        let mut message = Message::response(1, hickory_resolver::proto::op::OpCode::Query);
+        let name = hickory_resolver::proto::rr::Name::from_ascii("example.com.").unwrap();
+        let svcb = hickory_resolver::proto::rr::rdata::SVCB::new(
+            1,
+            hickory_resolver::proto::rr::Name::root(),
+            Vec::new(),
+        );
+        message.answers.push(hickory_resolver::proto::rr::Record::from_rdata(
+            name,
+            60,
+            RData::HTTPS(hickory_resolver::proto::rr::rdata::HTTPS(svcb)),
+        ));
+
+        assert!(dns_cache_message_is_cacheable("HTTPS", &message, &[]));
+        assert!(!dns_cache_message_is_cacheable("A", &message, &[]));
+        assert!(!dns_cache_message_is_cacheable(
+            "HTTPS",
+            &Message::response(1, hickory_resolver::proto::op::OpCode::Query),
+            &[]
+        ));
     }
 
     #[tokio::test]
