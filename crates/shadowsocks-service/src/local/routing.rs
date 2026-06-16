@@ -79,6 +79,11 @@ const DIRECT_IP_FILE: &str = "direct_ip.txt";
 const DIRECT_DOMAIN_FILE: &str = "direct_domain.txt";
 const PROXY_IP_FILE: &str = "proxy_ip.txt";
 const PROXY_DOMAIN_FILE: &str = "proxy_domain.txt";
+/// Durable accumulation of Futu-learned destination IPs/CIDRs (the special
+/// record_proxy_ip SOCKS listener, e.g. port 1082). Kept in `data/` (not
+/// `temp/`); on each new learned IP it is rewritten as the deduped union of its
+/// existing contents and the current `proxy_ip.temp`.
+const FUTU_IP_FILE: &str = "futu_ip.txt";
 const TEMP_DIRECT_IP_FILE: &str = "direct_ip.temp";
 const TEMP_DIRECT_DOMAIN_FILE: &str = "direct_domain.temp";
 const TEMP_PROXY_IP_FILE: &str = "proxy_ip.temp";
@@ -766,6 +771,7 @@ impl RoutingState {
         ensure_file(config.rules_dir.join(DIRECT_DOMAIN_FILE))?;
         ensure_file(config.rules_dir.join(PROXY_IP_FILE))?;
         ensure_file(config.rules_dir.join(PROXY_DOMAIN_FILE))?;
+        ensure_file(config.rules_dir.join(FUTU_IP_FILE))?;
         ensure_file(temp_file_path(&config.rules_dir, TEMP_DIRECT_IP_FILE))?;
         ensure_file(temp_file_path(&config.rules_dir, TEMP_DIRECT_DOMAIN_FILE))?;
         ensure_file(temp_file_path(&config.rules_dir, TEMP_PROXY_IP_FILE))?;
@@ -1059,6 +1065,12 @@ impl RoutingState {
         let write_dir = rules_dir.clone();
         let write_result = tokio::task::spawn_blocking(move || -> io::Result<Vec<Option<u64>>> {
             write_temporary_rule_lists(&write_dir, &rules_to_write)?;
+            // Also accumulate the learned Futu destination into data/futu_ip.txt
+            // (deduped union of futu_ip.txt + the just-written proxy_ip.temp).
+            // Best-effort: a failure here must not drop the proxy_ip.temp write.
+            if let Err(err) = rewrite_futu_ip_file(&write_dir) {
+                warn!("failed to update {}: {}", FUTU_IP_FILE, err);
+            }
             temporary_files_fingerprint(&write_dir)
         })
         .await;

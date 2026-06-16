@@ -326,13 +326,14 @@ find \"\$REMOTE_TMP\" -maxdepth 1 -type f \\
 	! -name direct_domain.txt \\
 	! -name proxy_ip.txt \\
 	! -name proxy_domain.txt \\
+	! -name futu_ip.txt \\
 	! -name direct_ip.temp \\
 	! -name direct_domain.temp \\
 	! -name proxy_ip.temp \\
 	! -name proxy_domain.temp \\
 	! -name record.txt \\
 	-exec cp -f {} \"\$REMOTE_DIR/data/\" \\;
-for rule_file in direct_ip.txt direct_domain.txt proxy_ip.txt proxy_domain.txt \\
+for rule_file in direct_ip.txt direct_domain.txt proxy_ip.txt proxy_domain.txt futu_ip.txt \\
 	direct_ip.temp direct_domain.temp proxy_ip.temp proxy_domain.temp record.txt; do
 	if [ ! -e \"\$REMOTE_DIR/data/\$rule_file\" ] && [ -e \"\$REMOTE_TMP/\$rule_file\" ]; then
 		cp -f \"\$REMOTE_TMP/\$rule_file\" \"\$REMOTE_DIR/data/\$rule_file\"

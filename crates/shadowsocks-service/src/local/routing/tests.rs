@@ -1546,3 +1546,38 @@
             }
         }
     }
+
+    #[test]
+    fn futu_ip_file_merges_and_dedups() {
+        let dir = temp_rules_dir("futu-ip-merge");
+        // Existing futu_ip.txt: a CIDR and a bare host.
+        write_lines_atomic(
+            dir.join(FUTU_IP_FILE),
+            &["1.14.192.0/18".to_owned(), "203.0.113.7".to_owned()],
+        )
+        .unwrap();
+        // proxy_ip.temp: the same host as a /32 (must dedup), a domain-annotated
+        // entry (annotation must be stripped), and a fresh CIDR.
+        write_lines_atomic(
+            temp_file_path(&dir, TEMP_PROXY_IP_FILE),
+            &[
+                "203.0.113.7/32".to_owned(),
+                "198.51.100.9 futu.example".to_owned(),
+                "101.32.0.0/16".to_owned(),
+            ],
+        )
+        .unwrap();
+
+        rewrite_futu_ip_file(&dir).unwrap();
+
+        let mut got = read_lines(dir.join(FUTU_IP_FILE)).unwrap();
+        got.sort();
+        let mut want = vec![
+            "1.14.192.0/18".to_owned(),
+            "101.32.0.0/16".to_owned(),
+            "198.51.100.9".to_owned(),
+            "203.0.113.7".to_owned(),
+        ];
+        want.sort();
+        assert_eq!(got, want);
+    }

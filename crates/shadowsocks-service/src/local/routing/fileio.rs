@@ -413,3 +413,35 @@ pub(super) fn read_varint(bytes: &mut &[u8]) -> io::Result<u64> {
     Err(io::Error::new(io::ErrorKind::InvalidData, "protobuf varint too long"))
 }
 
+/// Rewrite `data/futu_ip.txt` as the deduped union of its current contents and
+/// `data/temp/proxy_ip.temp` (into which the Futu learner has just appended the
+/// new destination). Tokens are canonicalised so a bare IP and its `/32` (or v6
+/// `/128`) collapse to one entry; the result is sorted and written atomically.
+/// Best-effort: the caller logs and ignores failures.
+pub(super) fn rewrite_futu_ip_file(rules_dir: &Path) -> io::Result<()> {
+    let futu_path = rules_dir.join(FUTU_IP_FILE);
+    let temp_proxy_path = temp_file_path(rules_dir, TEMP_PROXY_IP_FILE);
+
+    let mut canonical: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for path in [&futu_path, &temp_proxy_path] {
+        // Missing/unreadable sources contribute nothing (e.g. first run before
+        // futu_ip.txt exists).
+        for line in read_lines(path).unwrap_or_default() {
+            if let Some(value) = canonical_ip_or_cidr(&line) {
+                canonical.insert(value);
+            }
+        }
+    }
+    let lines: Vec<String> = canonical.into_iter().collect();
+    write_lines_atomic(&futu_path, &lines)
+}
+
+/// Canonicalise a rule line (which may carry a trailing domain annotation) to a
+/// bare IP/CIDR string — a host address for `/32`/`/128`, the network form
+/// otherwise — so `1.2.3.4` and `1.2.3.4/32` dedup to one entry. `None` if the
+/// line has no parseable IP/CIDR. (`parse_ip_net` extracts the first token via
+/// `ip_rule_value` and accepts both bare IPs and CIDRs.)
+fn canonical_ip_or_cidr(line: &str) -> Option<String> {
+    parse_ip_net(line).map(|net| display_ip_net(&net))
+}
+

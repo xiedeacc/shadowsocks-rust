@@ -1488,8 +1488,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <fieldset>
           <div class="form-line"><label>Enable Redir</label><input id="redirEnable" type="checkbox"></div>
           <div class="form-line"><label>Global Proxy</label><input id="globalProxy" type="checkbox"></div>
-          <div class="form-line"><label>Client Global Proxy</label><div id="clientGlobalProxyList" class="client-list"></div></div>
-          <div class="form-line"><label>Client Direct</label><div id="clientDirectList" class="client-list"></div></div>
+          <div class="form-line"><label>Global Proxy Client</label><div id="clientGlobalProxyList" class="client-list"></div></div>
+          <div class="form-line"><label>Direct Client</label><div id="clientDirectList" class="client-list"></div></div>
           <div class="form-line"><label>Bind Address</label><select id="redirBind"><option>127.0.0.1</option><option>0.0.0.0</option></select></div>
           <div class="form-line"><label>Port</label><input id="redirPort" type="number" min="1" max="65535"></div>
           <div class="form-line"><label>Mode</label><select id="redirMode"><option>tcp_only</option><option>tcp_and_udp</option></select></div>
