@@ -50,6 +50,7 @@ impl WebAdminBuilder {
             token: self.config.token,
             config_path: PathBuf::from(DEFAULT_DEPLOY_DIR).join("conf/shadowsocks-client.json"),
             routing_state: self.routing_state,
+            process_started_at: unix_now(),
         })
     }
 }
@@ -59,6 +60,7 @@ pub struct WebAdmin {
     token: Option<String>,
     config_path: PathBuf,
     routing_state: RoutingState,
+    process_started_at: u64,
 }
 
 impl WebAdmin {
@@ -71,6 +73,7 @@ impl WebAdmin {
             routing_state: self.routing_state,
             server_filters,
             debug_lock: Mutex::new(()),
+            process_started_at: self.process_started_at,
         });
 
         loop {
@@ -104,6 +107,7 @@ struct WebAdminHandler {
     routing_state: RoutingState,
     server_filters: Arc<HashSet<IpAddr>>,
     debug_lock: Mutex<()>,
+    process_started_at: u64,
 }
 
 impl WebAdminHandler {
@@ -317,6 +321,7 @@ impl WebAdminHandler {
                 Ok(json_response(StatusCode::OK, &self.routing_state.recent_dns().await))
             }
             (Method::GET, "/api/sys/status") => Ok(json_response(StatusCode::OK, &self.sys_status().await)),
+            (Method::GET, "/api/sys/uptime") => Ok(json_response(StatusCode::OK, &self.process_uptime())),
             (Method::GET, "/api/sys/platform") => Ok(json_response(StatusCode::OK, &platform_info())),
             (Method::POST, "/api/sys/debug-url") => {
                 let payload: DebugUrlPayload = read_json(req).await?;
@@ -365,8 +370,28 @@ impl WebAdminHandler {
         if let Some(object) = status.as_object_mut() {
             object.insert("ip_conflicts".to_owned(), serde_json::json!(ip_conflicts));
             object.insert("domain_conflicts".to_owned(), serde_json::json!(domain_conflicts));
+            object.insert(
+                "process_started_at".to_owned(),
+                serde_json::json!(self.process_started_at),
+            );
+            object.insert(
+                "process_uptime_seconds".to_owned(),
+                serde_json::json!(self.process_uptime_seconds()),
+            );
         }
         status
+    }
+
+    fn process_uptime_seconds(&self) -> u64 {
+        unix_now().saturating_sub(self.process_started_at)
+    }
+
+    fn process_uptime(&self) -> serde_json::Value {
+        serde_json::json!({
+            "process_started_at": self.process_started_at,
+            "process_uptime_seconds": self.process_uptime_seconds(),
+            "now": unix_now(),
+        })
     }
 
     async fn debug_url(&self, url: String, mode: Option<&str>) -> io::Result<serde_json::Value> {
@@ -1250,13 +1275,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
     html,body{height:100%}
     body{font-family:system-ui,sans-serif;margin:0;padding:24px;background:var(--bg);color:var(--ink);line-height:1.4;box-sizing:border-box;overflow:hidden}
     h1{margin:0 0 6px;color:var(--brand2)}
-    nav{display:flex;justify-content:center;padding:0;margin:0 0 16px;background:transparent;border:0;box-shadow:none}
+    nav{position:relative;display:flex;align-items:center;justify-content:center;min-height:38px;padding:0;margin:0 0 16px;background:transparent;border:0;box-shadow:none}
     .nav-tabs{position:relative;display:inline-flex;gap:18px}
     .nav-indicator{position:absolute;top:0;left:0;height:100%;border-radius:9px;background:var(--brand);transition:transform .24s ease,width .24s ease;z-index:0}
     nav button{position:relative;z-index:1;margin:0;background:var(--soft);color:var(--brand2);transition:color .18s ease,background .18s ease}
     nav button:hover{background:#d7e7f4;color:var(--brand2)}
     nav button.active{background:transparent;color:#fff}
     nav button.active:hover{background:transparent;color:#fff}
+    .process-uptime{position:absolute;right:0;top:50%;transform:translateY(-50%);display:inline-flex;align-items:center;gap:6px;min-width:128px;justify-content:center;padding:6px 10px;border:1px solid var(--line);border-radius:7px;background:#f8fbfe;color:var(--muted);font-size:12px;font-weight:700;white-space:nowrap;box-sizing:border-box}
+    .process-uptime strong{color:var(--brand2)}
     fieldset,.panel{border:1px solid var(--line);border-radius:10px;margin:0 0 8px;padding:9px;background:var(--panel);box-shadow:0 1px 2px #10203312}
     legend{font-weight:700;color:var(--brand2)}
     .card-title{margin:8px 0 5px;font-size:15px;color:var(--brand2)}
@@ -1347,6 +1374,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     @media(max-width:1300px){.route-config-layout{grid-template-columns:1fr}.route-config-column{min-height:260px}}
     @media(max-width:1000px){.rules-workspace{grid-template-columns:1fr}}
     @media(max-width:1100px){.activity-grid,.route-rules-layout{grid-template-columns:1fr}.activity-grid{grid-template-rows:repeat(4,minmax(0,1fr))}.connections-layout .activity-grid{grid-template-rows:repeat(2,minmax(0,1fr))}}
+    @media(max-width:700px){nav{justify-content:flex-start;gap:10px}.process-uptime{position:static;transform:none;margin-left:auto;min-width:0}}
     @media(max-width:900px){.basic-layout{grid-template-columns:1fr}#clientConfig{height:auto;max-height:none}}
   </style>
 </head>
@@ -1359,6 +1387,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <button data-tab="routeConfig" onclick="show('routeConfig')">Route</button>
       <button data-tab="sys" onclick="show('sys')">Sys</button>
     </div>
+    <div id="processUptime" class="process-uptime" title="Process uptime"><strong>Uptime</strong><span id="processUptimeValue">-</span></div>
   </nav>
 
   <section id="basic" class="tab active">
@@ -1688,6 +1717,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         await waitForAdminReady();
         servicePlatform=null;
         await loadClientConfig();
+        await refreshProcessUptime();
         configPath.textContent=doneText;
       }catch(e){
         configPath.textContent='restart status unknown: '+e.message;
@@ -1740,6 +1770,25 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function copyText(text){if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(text);return}let ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.left='-9999px';document.body.appendChild(ta);ta.focus();ta.select();document.execCommand('copy');ta.remove()}
     document.addEventListener('click',async e=>{let td=e.target.closest('table.copyable-table td');if(!td||td.classList.contains('hint'))return;let text=td.innerText.trim();if(!text)return;try{await copyText(text);td.classList.add('copied');setTimeout(()=>td.classList.remove('copied'),450)}catch(err){console.warn(err)}})
     function fmtTime(ts){return ts?new Date(ts*1000).toLocaleString():''}
+    function fmtDuration(seconds){
+      let s=Math.max(0,Math.floor(Number(seconds)||0)),d=Math.floor(s/86400);
+      s-=d*86400;
+      let h=Math.floor(s/3600);s-=h*3600;
+      let m=Math.floor(s/60);s-=m*60;
+      let clock=String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
+      return d?d+'d '+clock:clock;
+    }
+    async function refreshProcessUptime(){
+      let valueEl=document.getElementById('processUptimeValue'), box=document.getElementById('processUptime');
+      try{
+        let s=await api('/api/sys/uptime?cache='+Date.now(),{cache:'no-store',timeoutMs:2500});
+        if(valueEl)valueEl.textContent=fmtDuration(s.process_uptime_seconds);
+        if(box)box.title=s.process_started_at?'Started '+fmtTime(s.process_started_at):'Process uptime';
+      }catch(e){
+        if(valueEl)valueEl.textContent='-';
+        if(box)box.title='Process uptime unavailable';
+      }
+    }
     function ms(v){let n=Number(v);return Number.isFinite(n)?(n*1000).toFixed(1):'-'}
     function deltaMs(end,start){let e=Number(end),s=Number(start);return Number.isFinite(e)&&Number.isFinite(s)?(Math.max(0,e-s)*1000).toFixed(1):'-'}
     function err(v){return v||'OK'}
@@ -1765,7 +1814,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function renderDns(){recentDnsRows=await api('/api/activity/dns');renderDnsTable()}
     async function renderRouteConflicts(){await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip')}
     function nftCountsHtml(s){let c=s.nft_set_counts||{};if(!c.checked)return '';if(c.error)return `<p><strong>nft set entries:</strong> <span class="status-warn">unavailable</span> <span class="hint">${esc(c.error)}</span></p>`;let rows=[{set:'direct4',entries:c.direct4},{set:'direct6',entries:c.direct6},{set:'proxy4',entries:c.proxy4},{set:'proxy6',entries:c.proxy6}];return `<p><strong>nft set entries:</strong> ${c.total??0} total, ${c.proxy_total??0} proxy, ${c.direct_total??0} direct</p>`+table(rows,[['Set',r=>r.set],['Entries',r=>r.entries??0]])}
-    async function renderSys(){let s=await api('/api/sys/status');let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p>${nftCountsHtml(s)}<p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body+`<h3 class="card-title">direct_ip.txt / proxy_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / proxy_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
+    async function renderSys(){let s=await api('/api/sys/status');let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);let uptime=`<p><strong>Process uptime:</strong> ${fmtDuration(s.process_uptime_seconds)}</p>`;let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=uptime+`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=uptime+`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p>${nftCountsHtml(s)}<p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body+`<h3 class="card-title">direct_ip.txt / proxy_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / proxy_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
     async function debugUrlCheck(mode){let [input,out]=debugEls(mode);let url=input.value.trim();if(!url){out.innerHTML='<p class="hint">Enter a URL first</p>';return}out.innerHTML='<p class="hint">Running debug, timeout 6s...</p>';let r=await api('/api/sys/debug-url',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url,mode})});out.innerHTML=debugCommand(r)+table([r],debugUrlColumns(mode))}
     async function debugIpCheck(){let query=debugIp.value.trim();if(!query){debugIpOut.innerHTML='<p class="hint">Enter an IP or CIDR first</p>';return}let r=await api('/api/sys/debug-ip',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query})});debugIpOut.innerHTML=table([r],[['Query',x=>x.query],['Valid',x=>x.valid?'yes':'no'],['proxy_ip.txt',x=>x.proxy_file?'yes':'no'],['proxy Matches',x=>(x.proxy_file_matches||[]).join('<br>')||'-'],['NFT Checked',x=>x.nft_checked?'yes':'no'],['NFT proxy',x=>x.nft_proxy?'yes':'no'],['NFT Matches',x=>(x.nft_matches||[]).join('<br>')||'-'],['Error',x=>err(x.error||x.nft_error)]])}
     async function queryDnsCache(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheOut.innerHTML='<p class="hint">Enter a domain</p>';return}let rows=await api('/api/dns/cache/query?domain='+encodeURIComponent(domain));let type=dnsQueryType.value;rows=rows.filter(r=>!type||r.query_type===type);dnsCacheOut.innerHTML=table(rows,[['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Results',r=>(r.results||[]).join('<br>')],['Expires',r=>fmtTime(r.expires_at)]])}
@@ -1776,6 +1825,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     document.querySelector("nav button[data-tab=\"basic\"]").classList.add('active');
     window.addEventListener('resize',updateNavIndicator);
     requestAnimationFrame(updateNavIndicator);
+    refreshProcessUptime();
+    setInterval(refreshProcessUptime,1000);
     loadClientConfig();
   </script>
 </body>
