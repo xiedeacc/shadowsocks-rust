@@ -38,6 +38,12 @@ use shadowsocks::{
 
 #[cfg(feature = "local-web-admin")]
 use crate::local::routing::RouteDecision;
+#[cfg(not(feature = "local-web-admin"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouteDecision {
+    Direct,
+    Proxy,
+}
 use crate::{
     acl::AccessControl,
     local::{
@@ -1242,6 +1248,9 @@ impl DnsClient {
         decision: RouteDecision,
         source_ip: Option<IpAddr>,
     ) {
+        #[cfg(not(feature = "local-web-admin"))]
+        let _ = (query, response, decision, source_ip);
+
         #[cfg(feature = "local-web-admin")]
         if let Some(routing_state) = self.context.routing_state()
             && query.query_class() == DNSClass::IN

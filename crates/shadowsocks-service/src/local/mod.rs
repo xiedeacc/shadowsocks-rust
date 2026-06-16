@@ -49,11 +49,11 @@ use self::{
     web_admin::{WebAdmin, WebAdminBuilder},
 };
 
-#[cfg(feature = "local-dns")]
+#[cfg(all(feature = "local-dns", feature = "local-web-admin"))]
 use shadowsocks::relay::socks5::Address;
-#[cfg(feature = "local-dns")]
+#[cfg(all(feature = "local-dns", feature = "local-web-admin"))]
 use self::dns::config::NameServerAddr;
-#[cfg(feature = "local-dns")]
+#[cfg(all(feature = "local-dns", feature = "local-web-admin"))]
 use crate::config::LocalConfig;
 
 pub mod context;
@@ -588,7 +588,7 @@ impl Server {
         // shutdown; procd SIGKILL-on-timeout, panics, and power loss all
         // skip it and would otherwise leave every DNS query redirected
         // to a port nothing is listening on (= no internet at all).
-        #[cfg(all(feature = "local-dns", target_os = "linux"))]
+        #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
         {
             let mode = config.route_rules.dns_intercept_mode.as_str();
             if mode != "firewall" && mode != "both" {
@@ -607,7 +607,7 @@ impl Server {
         // After this refactor `route_rules.{domestic,foreign}_dns` and
         // `route_rules.dns_listen_*` no longer exist in the JSON
         // schema — `locals[].dns` is the single source of truth.
-        #[cfg(feature = "local-dns")]
+        #[cfg(all(feature = "local-dns", feature = "local-web-admin"))]
         let primary_dns_listener = config
             .local
             .iter()
@@ -1105,7 +1105,7 @@ fn collect_dns_intercept_proxy_exempt_endpoints(config: &Config) -> Vec<(IpAddr,
 /// Returns the upstream resolver pair as `host:port` strings (matching
 /// the legacy `route_rules.{domestic,foreign}_dns` text format consumed
 /// by the rest of the routing layer) and the listener's bound address.
-#[cfg(feature = "local-dns")]
+#[cfg(all(feature = "local-dns", feature = "local-web-admin"))]
 fn derive_dns_runtime_state(local: &LocalConfig) -> DnsRuntimeState {
     fn name_server_addr_to_string(addr: &NameServerAddr) -> Option<String> {
         match addr {

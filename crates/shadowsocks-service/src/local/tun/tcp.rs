@@ -28,9 +28,10 @@ use smoltcp::{
 use spin::Mutex as SpinMutex;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::TcpStream,
     sync::{mpsc, oneshot},
 };
+#[cfg(feature = "local-web-admin")]
+use tokio::net::TcpStream;
 
 use crate::{
     local::{
@@ -671,6 +672,7 @@ async fn establish_client_tcp_redir(
     establish_tcp_tunnel(svr_cfg, &mut stream, &mut remote, peer_addr, addr).await
 }
 
+#[cfg_attr(not(feature = "local-web-admin"), allow(unused_mut))]
 async fn handle_redir_client(
     context: Arc<ServiceContext>,
     balancer: PingBalancer,
@@ -686,6 +688,7 @@ async fn handle_redir_client(
     {
         daddr = SocketAddr::new(IpAddr::from(v4), a.port());
     }
+    #[cfg(feature = "local-web-admin")]
     if daddr.port() == 53
         && let Some(routing_state) = context.routing_state()
         && let Some(target) = routing_state.dns_tun_intercept_target().await

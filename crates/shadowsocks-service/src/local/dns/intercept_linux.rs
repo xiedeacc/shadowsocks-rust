@@ -17,7 +17,15 @@ use std::{
 use ipnet::IpNet;
 use log::{info, warn};
 
+#[cfg(feature = "local-web-admin")]
 use crate::local::routing::RouteDecision;
+
+#[cfg(not(feature = "local-web-admin"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteDecision {
+    Direct,
+    Proxy,
+}
 
 const NFT_TABLE: &str = "ssrust_dns";
 const DIRECT4_SET: &str = "direct4";
