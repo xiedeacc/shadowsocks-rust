@@ -225,16 +225,6 @@ impl ServiceContext {
     /// Add a record to the reverse lookup cache
     #[cfg(feature = "local-dns")]
     pub async fn add_to_reverse_lookup_cache(&self, addr: IpAddr, forward: bool) {
-        #[cfg(feature = "local-web-admin")]
-        if let Some(routing_state) = self.routing_state.as_ref() {
-            let decision = if forward {
-                RouteDecision::Proxy
-            } else {
-                RouteDecision::Direct
-            };
-            let _ = routing_state.add_dns_results(decision, "", &[addr]).await;
-        }
-
         let is_exception = forward
             != match self.acl {
                 // Proxy everything by default

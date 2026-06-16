@@ -1056,7 +1056,7 @@ impl RoutingState {
             for ip in results {
                 match decision {
                     RouteDecision::Direct => {
-                        if !global_proxy || is_fixed_direct_ip(ip) {
+                        if direct_dns_result_needs_nft_sync(&inner, ip, global_proxy) {
                             nft_ips.push(*ip);
                         }
                     }
@@ -1091,9 +1091,9 @@ impl RoutingState {
                         if !target_exists {
                             inner.persistent.proxy_ip_exact.insert(*ip);
                             inner.persistent.proxy_ip.push(IpNet::from(*ip));
-                        }
-                        if !direct_exists {
-                            nft_ips.push(*ip);
+                            if !direct_exists {
+                                nft_ips.push(*ip);
+                            }
                         }
                     }
                 }
@@ -3284,6 +3284,14 @@ fn dns_proxy_ip_blocked_from_nft_by_direct_rule(inner: &RoutingInner, ip: &IpAdd
         || compiled_rules_match_ip(&inner.temporary.direct_ip_exact, &inner.temporary.direct_ip, ip)
 }
 
+fn direct_dns_result_needs_nft_sync(inner: &RoutingInner, ip: &IpAddr, global_proxy: bool) -> bool {
+    if global_proxy {
+        return true;
+    }
+    compiled_rules_match_ip(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip, ip)
+        || compiled_rules_match_ip(&inner.temporary.proxy_ip_exact, &inner.temporary.proxy_ip, ip)
+}
+
 #[cfg(all(target_os = "linux", feature = "local-dns"))]
 fn temporary_nft_route_nets(inner: &RoutingInner, rules: &RuleLists) -> (PathBuf, Vec<IpNet>, Vec<IpNet>) {
     let mut direct = if inner.sources.global_proxy {
@@ -4581,6 +4589,28 @@ mod tests {
 
         assert!(read_lines(dir.join(DIRECT_IP_FILE)).unwrap().is_empty());
         assert_eq!(state.route_ip(&ip).await, None);
+    }
+
+    #[tokio::test]
+    async fn direct_dns_results_sync_nft_only_when_needed() {
+        let dir = temp_rules_dir("dns-direct-nft-sync-needed");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_IP_FILE), &["203.0.113.10 a.example.com".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["direct.example".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &[]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+        let unrelated = "203.0.113.20".parse().unwrap();
+        let proxy_conflict = "203.0.113.10".parse().unwrap();
+        let inner = state.inner.read().await;
+
+        assert!(!direct_dns_result_needs_nft_sync(&inner, &unrelated, false));
+        assert!(direct_dns_result_needs_nft_sync(&inner, &proxy_conflict, false));
+        assert!(direct_dns_result_needs_nft_sync(&inner, &unrelated, true));
     }
 
     #[tokio::test]
