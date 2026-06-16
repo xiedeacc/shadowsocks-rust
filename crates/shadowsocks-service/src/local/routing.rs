@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use hickory_resolver::proto::op::Message;
+use hickory_resolver::proto::op::{Message, ResponseCode};
 use ipnet::IpNet;
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -1996,6 +1996,9 @@ impl RoutingState {
         message: Message,
         results: Vec<IpAddr>,
     ) {
+        if !dns_cache_message_is_cacheable(&message, &results) {
+            return;
+        }
         let mut inner = self.inner.write().await;
         let key = dns_cache_key(domain, query_type, resolver);
         let now = now();
@@ -2064,6 +2067,9 @@ impl RoutingState {
         message: Message,
         results: Vec<IpAddr>,
     ) -> bool {
+        if !dns_cache_message_is_cacheable(&message, &results) {
+            return false;
+        }
         let mut inner = self.inner.write().await;
         let key = dns_cache_key(domain, query_type, resolver);
         if let Some(entry) = inner.dns_cache.get_mut(&key) {
@@ -3478,6 +3484,10 @@ fn dns_cache_key(domain: &str, query_type: &str, resolver: RouteDecision) -> Dns
         query_type: query_type.to_ascii_uppercase(),
         resolver,
     }
+}
+
+fn dns_cache_message_is_cacheable(message: &Message, results: &[IpAddr]) -> bool {
+    message.metadata.response_code == ResponseCode::NoError && !results.is_empty()
 }
 
 fn parse_text_rules(text: &str) -> Vec<String> {
@@ -5175,6 +5185,50 @@ mod tests {
                 .is_none()
         );
         assert_eq!(state.dns_cache_stats().await.size, 1);
+    }
+
+    #[tokio::test]
+    async fn dns_cache_skips_empty_and_error_responses() {
+        let dir = temp_rules_dir("dns-cache-skip-empty-error");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+
+        let state = RoutingState::load(config).await.unwrap();
+        state
+            .dns_cache_insert(
+                "empty.example",
+                "A",
+                RouteDecision::Direct,
+                Message::query(),
+                Vec::new(),
+            )
+            .await;
+        assert_eq!(state.dns_cache_stats().await.size, 0);
+        assert!(
+            state
+                .dns_cache_lookup("empty.example", "A", RouteDecision::Direct)
+                .await
+                .is_none()
+        );
+
+        let mut servfail = Message::query();
+        servfail.metadata.response_code = ResponseCode::ServFail;
+        state
+            .dns_cache_insert(
+                "error.example",
+                "A",
+                RouteDecision::Direct,
+                servfail,
+                vec!["1.1.1.1".parse().unwrap()],
+            )
+            .await;
+        assert_eq!(state.dns_cache_stats().await.size, 0);
+        assert!(
+            state
+                .dns_cache_lookup("error.example", "A", RouteDecision::Direct)
+                .await
+                .is_none()
+        );
     }
 
     #[test]
