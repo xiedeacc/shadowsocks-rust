@@ -1,3 +1,5 @@
+本修改版集成了dns拦截、自动路由等功能，做到了真正的高性能、低延迟
+
 # shadowsocks
 
 [![License](https://img.shields.io/github/license/zonyitoo/shadowsocks-rust.svg)](https://github.com/zonyitoo/shadowsocks-rust)
