@@ -1,5 +1,4 @@
 {
-  "no_delay": true,
   "locals": [
     {
       "local_address": "0.0.0.0",
@@ -8,10 +7,17 @@
     },
     {
       "local_address": "0.0.0.0",
+      "local_port": 1082,
+      "protocol": "socks",
+      "record_proxy_ip": true
+    },
+    {
+      "local_address": "0.0.0.0",
       "local_port": 1081,
       "protocol": "http"
     },
     {
+      "disabled": false,
       "local_address": "0.0.0.0",
       "local_port": 12345,
       "protocol": "redir",
@@ -20,6 +26,7 @@
       "udp_redir": "tproxy"
     },
     {
+      "disabled": false,
       "local_address": "0.0.0.0",
       "local_port": 1053,
       "protocol": "dns",
@@ -31,34 +38,40 @@
       "client_cache_size": 64
     }
   ],
-  "web_admin": {
-    "listen": "127.0.0.1:9090"
-  },
+  "no_delay": true,
   "route_rules": {
+    "dns_cache_capacity": 100000,
+    "dns_cache_refresh_batch_size": 500,
+    "dns_cache_refresh_enabled": true,
+    "dns_cache_ttl_seconds": 604800,
+    "dns_intercept_mode": "both",
+    "dns_ipv4_only": true,
     "geoip_sources": [
       "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
     ],
+    "global_proxy": false,
     "proxy_domain_sources": [
       "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt"
     ],
-    "dns_cache_capacity": 100000,
-    "dns_cache_ttl_seconds": 604800,
-    "dns_cache_refresh_enabled": true,
-    "dns_cache_refresh_batch_size": 500,
-    "dns_intercept_mode": "both",
-    "dns_ipv4_only": true,
-    "proxy_local_output": true
+    "proxy_local_output": true,
+    "client_global_proxy_ips": [],
+    "client_direct_ips": [
+      "192.168.2.216"
+    ]
   },
   "servers": [
     {
-      "server": "x.x.x.x",
+      "server": "xxxx",
       "server_port": 443,
-      "password": "xxxx",
+      "password": "xxx",
       "timeout": 300,
       "method": "aes-256-gcm",
-      "mode": "tcp_and_udp",
       "plugin": "/usr/local/shadowsocks/bin/xray-plugin",
-      "plugin_opts": "tls;host=forsimple.xxx.net;path=/sspath;mux=8"
+      "plugin_opts": "tls;host=forsimple.xxx.net;path=/sspath;mux=1024"
     }
-  ]
+  ],
+  "web_admin": {
+    "listen": "192.168.2.126:9090"
+  }
 }
+
