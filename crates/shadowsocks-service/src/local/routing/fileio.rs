@@ -436,6 +436,36 @@ pub(super) fn rewrite_futu_ip_file(rules_dir: &Path) -> io::Result<()> {
     write_lines_atomic(&futu_path, &lines)
 }
 
+pub(super) fn add_futu_url_entry(rules_dir: &Path, entry: &str) -> io::Result<bool> {
+    let Some(entry) = normalize_futu_url_entry(entry) else {
+        return Ok(false);
+    };
+    let path = rules_dir.join(FUTU_URL_FILE);
+    let mut entries: std::collections::BTreeSet<String> = read_lines(&path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|line| normalize_futu_url_entry(&line))
+        .collect();
+    let changed = entries.insert(entry);
+    if changed {
+        let lines: Vec<String> = entries.into_iter().collect();
+        write_lines_atomic(&path, &lines)?;
+    }
+    Ok(changed)
+}
+
+pub(super) fn format_futu_url_entry(domain: &str, port: u16) -> Option<String> {
+    let domain = normalize_dns_domain(domain);
+    (!domain.is_empty()).then(|| format!("{domain}:{port}"))
+}
+
+fn normalize_futu_url_entry(entry: &str) -> Option<String> {
+    let entry = entry.split('#').next().unwrap_or_default().trim();
+    let (domain, port) = entry.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    format_futu_url_entry(domain, port)
+}
+
 /// Canonicalise a rule line (which may carry a trailing domain annotation) to a
 /// bare IP/CIDR string — a host address for `/32`/`/128`, the network form
 /// otherwise — so `1.2.3.4` and `1.2.3.4/32` dedup to one entry. `None` if the
@@ -444,4 +474,3 @@ pub(super) fn rewrite_futu_ip_file(rules_dir: &Path) -> io::Result<()> {
 fn canonical_ip_or_cidr(line: &str) -> Option<String> {
     parse_ip_net(line).map(|net| display_ip_net(&net))
 }
-

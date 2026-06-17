@@ -84,6 +84,10 @@ const PROXY_DOMAIN_FILE: &str = "proxy_domain.txt";
 /// `temp/`); on each new learned IP it is rewritten as the deduped union of its
 /// existing contents and the current `proxy_ip.temp`.
 const FUTU_IP_FILE: &str = "futu_ip.txt";
+/// Durable accumulation of Futu-learned domain targets from the special
+/// record_proxy_ip SOCKS listener. SOCKS exposes host:port rather than a full
+/// URL with scheme, so entries are stored as normalized `domain:port`.
+const FUTU_URL_FILE: &str = "futu_url.txt";
 const TEMP_DIRECT_IP_FILE: &str = "direct_ip.temp";
 const TEMP_DIRECT_DOMAIN_FILE: &str = "direct_domain.temp";
 const TEMP_PROXY_IP_FILE: &str = "proxy_ip.temp";
@@ -772,6 +776,7 @@ impl RoutingState {
         ensure_file(config.rules_dir.join(PROXY_IP_FILE))?;
         ensure_file(config.rules_dir.join(PROXY_DOMAIN_FILE))?;
         ensure_file(config.rules_dir.join(FUTU_IP_FILE))?;
+        ensure_file(config.rules_dir.join(FUTU_URL_FILE))?;
         ensure_file(temp_file_path(&config.rules_dir, TEMP_DIRECT_IP_FILE))?;
         ensure_file(temp_file_path(&config.rules_dir, TEMP_DIRECT_DOMAIN_FILE))?;
         ensure_file(temp_file_path(&config.rules_dir, TEMP_PROXY_IP_FILE))?;
@@ -1025,10 +1030,20 @@ impl RoutingState {
     }
 
     pub async fn add_temporary_proxy_target(&self, target: &Address) -> io::Result<bool> {
-        let Address::SocketAddress(socket_addr) = target else {
+        match target {
+            Address::SocketAddress(socket_addr) => self.add_temporary_proxy_ip(socket_addr.ip()).await,
+            Address::DomainNameAddress(domain, port) => self.add_futu_proxy_url(domain, *port).await,
+        }
+    }
+
+    async fn add_futu_proxy_url(&self, domain: &str, port: u16) -> io::Result<bool> {
+        let Some(entry) = format_futu_url_entry(domain, port) else {
             return Ok(false);
         };
-        self.add_temporary_proxy_ip(socket_addr.ip()).await
+        let rules_dir = self.inner.read().await.rules_dir.clone();
+        tokio::task::spawn_blocking(move || add_futu_url_entry(&rules_dir, &entry))
+            .await
+            .map_err(|err| io::Error::other(format!("futu url persist task failed: {err}")))?
     }
 
     pub async fn add_temporary_proxy_ip(&self, ip: IpAddr) -> io::Result<bool> {

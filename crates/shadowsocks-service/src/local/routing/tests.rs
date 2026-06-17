@@ -270,6 +270,25 @@
     }
 
     #[tokio::test]
+    async fn learned_socks_proxy_domain_is_saved_to_futu_url_only() {
+        let dir = temp_rules_dir("socks-learn-futu-url");
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+        let target = Address::DomainNameAddress("Api.FutuExample.COM.".to_owned(), 443);
+
+        assert!(state.add_temporary_proxy_target(&target).await.unwrap());
+        assert!(!state.add_temporary_proxy_target(&target).await.unwrap());
+
+        let futu_urls = read_lines(dir.join(FUTU_URL_FILE)).unwrap();
+        assert_eq!(futu_urls, vec!["api.futuexample.com:443".to_owned()]);
+        let proxy_temp = read_lines(temp_file_path(&dir, TEMP_PROXY_IP_FILE)).unwrap();
+        assert!(proxy_temp.is_empty());
+    }
+
+    #[tokio::test]
     async fn recent_connections_backfills_domain_from_dns_cache() {
         let dir = temp_rules_dir("record-domain-backfill");
         let mut config = RouteRulesConfig::default();
