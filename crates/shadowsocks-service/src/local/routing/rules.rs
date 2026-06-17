@@ -99,7 +99,7 @@ pub(super) fn ip_range_end(start: u128, bits: u8, prefix_len: u8) -> u128 {
 /// the geoip-CN table (thousands of CIDRs) that the DNS learning path probes for
 /// every newly learned proxy IP (audit #6). Rebuilt only when the source set
 /// changes, so the per-IP probe on the hot path is a binary search, not a scan.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct CidrRanges {
     v4: Vec<(u128, u128)>,
     v6: Vec<(u128, u128)>,
@@ -192,6 +192,10 @@ pub(super) fn display_ip_net(net: &IpNet) -> String {
 
 pub(super) fn compiled_rules_match_ip(exact: &HashSet<IpAddr>, nets: &[IpNet], ip: &IpAddr) -> bool {
     exact.contains(ip) || rules_match_ip(nets, ip)
+}
+
+pub(super) fn compiled_rules_match_ip_indexed(exact: &HashSet<IpAddr>, ranges: &CidrRanges, ip: &IpAddr) -> bool {
+    exact.contains(ip) || ranges.contains(ip)
 }
 
 pub(super) fn rules_match_domain(rules: &CompiledDomainRules, domain: &str) -> bool {
@@ -303,18 +307,25 @@ pub(super) fn domain_matches_rule(rule: &str, domain: &str) -> bool {
 pub(super) fn compile_rules(raw: &RuleLists) -> io::Result<CompiledRules> {
     let (direct_ip, direct_ip_exact, _) = compile_ip_rules(&raw.direct_ip, false);
     let (proxy_ip, proxy_ip_exact, proxy_ip_domainless_exact) = compile_ip_rules(&raw.proxy_ip, true);
+    let direct_ip_ranges = CidrRanges::build(&direct_ip);
+    let proxy_ip_ranges = CidrRanges::build(&proxy_ip);
     Ok(CompiledRules {
         direct_ip,
         direct_ip_exact,
+        direct_ip_ranges,
         direct_domain: compile_domain_rules(&raw.direct_domain)?,
         proxy_ip,
         proxy_ip_exact,
         proxy_ip_domainless_exact,
+        proxy_ip_ranges,
         proxy_domain: compile_domain_rules(&raw.proxy_domain)?,
     })
 }
 
-pub(super) fn compile_ip_rules(lines: &[String], track_domainless_exact: bool) -> (Vec<IpNet>, HashSet<IpAddr>, HashSet<IpAddr>) {
+pub(super) fn compile_ip_rules(
+    lines: &[String],
+    track_domainless_exact: bool,
+) -> (Vec<IpNet>, HashSet<IpAddr>, HashSet<IpAddr>) {
     let mut cidrs = Vec::new();
     let mut exact = HashSet::new();
     let mut domainless_exact = HashSet::new();
@@ -367,11 +378,15 @@ pub(super) fn compiled_rule_net_count(exact: &HashSet<IpAddr>, cidrs: &[IpNet]) 
 pub(super) fn nft_route_index_from_nets(direct: &[IpNet], proxy: &[IpNet]) -> NftRouteIndex {
     let (direct_ip, direct_ip_exact) = nft_route_index_split_nets(direct);
     let (proxy_ip, proxy_ip_exact) = nft_route_index_split_nets(proxy);
+    let direct_ip_ranges = CidrRanges::build(&direct_ip);
+    let proxy_ip_ranges = CidrRanges::build(&proxy_ip);
     NftRouteIndex {
         direct_ip,
         direct_ip_exact,
+        direct_ip_ranges,
         proxy_ip,
         proxy_ip_exact,
+        proxy_ip_ranges,
     }
 }
 
@@ -391,8 +406,8 @@ pub(super) fn nft_route_index_split_nets(nets: &[IpNet]) -> (Vec<IpNet>, HashSet
 
 pub(super) fn nft_route_index_matches(index: &NftRouteIndex, decision: RouteDecision, ip: &IpAddr) -> bool {
     match decision {
-        RouteDecision::Direct => compiled_rules_match_ip(&index.direct_ip_exact, &index.direct_ip, ip),
-        RouteDecision::Proxy => compiled_rules_match_ip(&index.proxy_ip_exact, &index.proxy_ip, ip),
+        RouteDecision::Direct => compiled_rules_match_ip_indexed(&index.direct_ip_exact, &index.direct_ip_ranges, ip),
+        RouteDecision::Proxy => compiled_rules_match_ip_indexed(&index.proxy_ip_exact, &index.proxy_ip_ranges, ip),
     }
 }
 

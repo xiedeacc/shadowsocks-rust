@@ -5,6 +5,7 @@
 //! types re-exported from the parent module via `use super::*`.
 
 use std::{
+    collections::HashSet,
     fs,
     io::{self, Write},
     net::IpAddr,
@@ -413,50 +414,64 @@ pub(super) fn read_varint(bytes: &mut &[u8]) -> io::Result<u64> {
     Err(io::Error::new(io::ErrorKind::InvalidData, "protobuf varint too long"))
 }
 
-/// Rewrite `data/futu_ip.txt` as the deduped union of its current contents and
-/// `data/temp/proxy_ip.temp` (into which the Futu learner has just appended the
-/// new destination). Tokens are canonicalised so a bare IP and its `/32` (or v6
-/// `/128`) collapse to one entry; the result is sorted and written atomically.
-/// Best-effort: the caller logs and ignores failures.
-pub(super) fn rewrite_futu_ip_file(rules_dir: &Path) -> io::Result<()> {
-    let futu_path = rules_dir.join(FUTU_IP_FILE);
-    let temp_proxy_path = temp_file_path(rules_dir, TEMP_PROXY_IP_FILE);
-
-    let mut canonical: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for path in [&futu_path, &temp_proxy_path] {
-        // Missing/unreadable sources contribute nothing (e.g. first run before
-        // futu_ip.txt exists).
-        for line in read_lines(path).unwrap_or_default() {
-            if let Some(value) = canonical_ip_or_cidr(&line) {
-                canonical.insert(value);
-            }
-        }
-    }
-    let lines: Vec<String> = canonical.into_iter().collect();
-    write_lines_atomic(&futu_path, &lines)
+pub(super) fn read_futu_ip_entries(rules_dir: &Path) -> io::Result<HashSet<String>> {
+    let path = rules_dir.join(FUTU_IP_FILE);
+    Ok(read_lines(&path)?
+        .into_iter()
+        .filter_map(|line| normalize_futu_ip_entry(&line))
+        .collect())
 }
 
-pub(super) fn add_futu_url_entry(rules_dir: &Path, entry: &str) -> io::Result<bool> {
-    let Some(entry) = normalize_futu_url_entry(entry) else {
-        return Ok(false);
-    };
+pub(super) fn write_futu_ip_file(rules_dir: &Path, rows: &[String]) -> io::Result<()> {
+    write_lines_atomic(rules_dir.join(FUTU_IP_FILE), rows)
+}
+
+pub(super) fn merge_futu_ip_into_proxy_temp(rules_dir: &Path, futu_ip_rows: &[String]) -> io::Result<()> {
+    if futu_ip_rows.is_empty() {
+        return Ok(());
+    }
+    let mut lists = read_temporary_rule_lists(rules_dir)?;
+    let (proxy_cidrs, proxy_exact, _) = compile_ip_rules(&lists.proxy_ip, false);
+    for row in futu_ip_rows {
+        let Some(net) = parse_ip_net(row) else {
+            continue;
+        };
+        let covered = match host_net_ip(&net) {
+            Some(ip) => compiled_rules_match_ip(&proxy_exact, &proxy_cidrs, &ip),
+            None => proxy_cidrs.contains(&net),
+        };
+        if !covered {
+            lists.proxy_ip.push(row.clone());
+        }
+    }
+    let lists = with_private_direct_rules(normalize_rule_lists(lists));
+    validate_temporary_rules(&lists)?;
+    write_temporary_rule_lists(rules_dir, &lists)
+}
+
+pub(super) fn read_futu_url_entries(rules_dir: &Path) -> io::Result<HashSet<String>> {
     let path = rules_dir.join(FUTU_URL_FILE);
-    let mut entries: std::collections::BTreeSet<String> = read_lines(&path)
-        .unwrap_or_default()
+    Ok(read_lines(&path)?
         .into_iter()
         .filter_map(|line| normalize_futu_url_entry(&line))
-        .collect();
-    let changed = entries.insert(entry);
-    if changed {
-        let lines: Vec<String> = entries.into_iter().collect();
-        write_lines_atomic(&path, &lines)?;
-    }
-    Ok(changed)
+        .collect())
+}
+
+pub(super) fn write_futu_url_file(rules_dir: &Path, rows: &[String]) -> io::Result<()> {
+    write_lines_atomic(rules_dir.join(FUTU_URL_FILE), rows)
 }
 
 pub(super) fn format_futu_url_entry(domain: &str, port: u16) -> Option<String> {
     let domain = normalize_dns_domain(domain);
     (!domain.is_empty()).then(|| format!("{domain}:{port}"))
+}
+
+pub(super) fn format_futu_ip_entry(ip: IpAddr) -> Option<String> {
+    (!is_fixed_direct_ip(&ip)).then(|| ip.to_string())
+}
+
+fn normalize_futu_ip_entry(entry: &str) -> Option<String> {
+    canonical_ip_or_cidr(entry)
 }
 
 fn normalize_futu_url_entry(entry: &str) -> Option<String> {

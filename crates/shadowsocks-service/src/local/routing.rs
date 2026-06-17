@@ -81,12 +81,13 @@ const PROXY_IP_FILE: &str = "proxy_ip.txt";
 const PROXY_DOMAIN_FILE: &str = "proxy_domain.txt";
 /// Durable accumulation of Futu-learned destination IPs/CIDRs (the special
 /// record_proxy_ip SOCKS listener, e.g. port 1082). Kept in `data/` (not
-/// `temp/`); on each new learned IP it is rewritten as the deduped union of its
-/// existing contents and the current `proxy_ip.temp`.
+/// `temp/`); periodically merged into `proxy_ip.temp` so the runtime temporary
+/// proxy list catches up in batches.
 const FUTU_IP_FILE: &str = "futu_ip.txt";
 /// Durable accumulation of Futu-learned domain targets from the special
 /// record_proxy_ip SOCKS listener. SOCKS exposes host:port rather than a full
-/// URL with scheme, so entries are stored as normalized `domain:port`.
+/// URL with scheme, so entries are stored in memory and periodically flushed as
+/// normalized `domain:port`.
 const FUTU_URL_FILE: &str = "futu_url.txt";
 const TEMP_DIRECT_IP_FILE: &str = "direct_ip.temp";
 const TEMP_DIRECT_DOMAIN_FILE: &str = "direct_domain.temp";
@@ -104,6 +105,7 @@ const MAX_EVENTS: usize = 4096;
 const RECORD_MAX_DURATION: Duration = Duration::from_secs(300);
 const RECORD_QUEUE_CAPACITY: usize = 8192;
 const PROXY_IP_PERSIST_DELAY: Duration = Duration::from_secs(30);
+const FUTU_RECORD_PERSIST_INTERVAL: Duration = Duration::from_secs(30);
 const DNS_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const DNS_CACHE_PERSIST_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DNS_CACHE_PRUNE_INTERVAL_SECONDS: u64 = 30 * 24 * 60 * 60;
@@ -534,10 +536,12 @@ impl Default for RuleUpdateProgress {
 struct CompiledRules {
     direct_ip: Vec<IpNet>,
     direct_ip_exact: HashSet<IpAddr>,
+    direct_ip_ranges: CidrRanges,
     direct_domain: CompiledDomainRules,
     proxy_ip: Vec<IpNet>,
     proxy_ip_exact: HashSet<IpAddr>,
     proxy_ip_domainless_exact: HashSet<IpAddr>,
+    proxy_ip_ranges: CidrRanges,
     proxy_domain: CompiledDomainRules,
 }
 
@@ -553,8 +557,10 @@ struct CompiledDomainRules {
 struct NftRouteIndex {
     direct_ip: Vec<IpNet>,
     direct_ip_exact: HashSet<IpAddr>,
+    direct_ip_ranges: CidrRanges,
     proxy_ip: Vec<IpNet>,
     proxy_ip_exact: HashSet<IpAddr>,
+    proxy_ip_ranges: CidrRanges,
 }
 
 #[derive(Debug)]
@@ -601,6 +607,13 @@ struct RoutingInner {
     dns_cache_dirty: bool,
     proxy_ip_dirty: bool,
     proxy_ip_persist_scheduled: bool,
+    futu_ip_entries: HashSet<String>,
+    futu_ip_dirty: bool,
+    futu_proxy_sync_dirty: bool,
+    futu_ip_generation: u64,
+    futu_url_entries: HashSet<String>,
+    futu_url_dirty: bool,
+    futu_url_generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -786,6 +799,8 @@ impl RoutingState {
 
         let sources = RoutingSources::from(&config);
         let loaded_dns_cache = read_dns_cache_file(&dns_cache_path, sources.dns_cache_capacity.max(1))?;
+        let futu_ip_entries = read_futu_ip_entries(&config.rules_dir)?;
+        let futu_url_entries = read_futu_url_entries(&config.rules_dir)?;
         let dns_cache_last_persist_at = file_modified(&dns_cache_path)?
             .and_then(system_time_unix_secs)
             .unwrap_or(0);
@@ -834,6 +849,13 @@ impl RoutingState {
             dns_cache_dirty: false,
             proxy_ip_dirty: false,
             proxy_ip_persist_scheduled: false,
+            futu_proxy_sync_dirty: !futu_ip_entries.is_empty(),
+            futu_ip_entries,
+            futu_ip_dirty: false,
+            futu_ip_generation: 0,
+            futu_url_entries,
+            futu_url_dirty: false,
+            futu_url_generation: 0,
         };
         rebuild_reverse_domains_from_dns_cache(&mut inner);
         rebuild_conflicts(&mut inner);
@@ -860,6 +882,7 @@ impl RoutingState {
         state.spawn_periodic_source_update();
         state.spawn_periodic_temporary_reload();
         state.spawn_periodic_dns_cache_persist();
+        state.spawn_periodic_futu_record_persist();
         #[cfg(all(target_os = "linux", feature = "local-dns"))]
         state.spawn_periodic_nft_index_sync();
         Ok(state)
@@ -1040,10 +1063,13 @@ impl RoutingState {
         let Some(entry) = format_futu_url_entry(domain, port) else {
             return Ok(false);
         };
-        let rules_dir = self.inner.read().await.rules_dir.clone();
-        tokio::task::spawn_blocking(move || add_futu_url_entry(&rules_dir, &entry))
-            .await
-            .map_err(|err| io::Error::other(format!("futu url persist task failed: {err}")))?
+        let mut inner = self.inner.write().await;
+        if !inner.futu_url_entries.insert(entry) {
+            return Ok(false);
+        }
+        inner.futu_url_dirty = true;
+        inner.futu_url_generation = inner.futu_url_generation.wrapping_add(1);
+        Ok(true)
     }
 
     pub async fn add_temporary_proxy_ip(&self, ip: IpAddr) -> io::Result<bool> {
@@ -1051,69 +1077,16 @@ impl RoutingState {
             return Ok(false);
         }
 
-        // Phase 1 (under the write lock): O(1)/near-O(1) dedup against the
-        // compiled temporary proxy set, then extend the in-memory rules. The
-        // previous implementation did an O(n) raw-line rescan, a full
-        // rebuild_conflicts() (geoip-sized sweep) AND a replace_route_nets()
-        // (full flush+rebuild of the entire nft set) per learned IP — all on the
-        // Futu connection hot path (audit H-4/SI-3). None of that is needed: the
-        // file write is moved off the lock below, conflicts only change with the
-        // rule files, and the nft set is updated incrementally.
-        let (rules_dir, rules_to_write) = {
-            let mut inner = self.inner.write().await;
-            if compiled_rules_match_ip(&inner.temporary.proxy_ip_exact, &inner.temporary.proxy_ip, &ip) {
-                return Ok(false);
-            }
-            let mut rules = inner.temporary_raw.clone();
-            rules.proxy_ip.push(ip.to_string());
-            let rules = with_private_direct_rules(normalize_rule_lists(rules));
-            validate_temporary_rules(&rules)?;
-            inner.temporary_raw = rules.clone();
-            inner.temporary = compile_rules(&inner.temporary_raw)?;
-            (inner.rules_dir.clone(), rules)
+        let Some(entry) = format_futu_ip_entry(ip) else {
+            return Ok(false);
         };
-
-        // Persist the temp rule files off the async worker (blocking std::fs),
-        // then refresh the fingerprint so the 2s file-watcher does not redundantly
-        // reload them. Awaited, so the file is on disk when this call returns
-        // (preserves the "learned IP is immediately saved" contract).
-        let write_dir = rules_dir.clone();
-        let write_result = tokio::task::spawn_blocking(move || -> io::Result<Vec<Option<u64>>> {
-            write_temporary_rule_lists(&write_dir, &rules_to_write)?;
-            // Also accumulate the learned Futu destination into data/futu_ip.txt
-            // (deduped union of futu_ip.txt + the just-written proxy_ip.temp).
-            // Best-effort: a failure here must not drop the proxy_ip.temp write.
-            if let Err(err) = rewrite_futu_ip_file(&write_dir) {
-                warn!("failed to update {}: {}", FUTU_IP_FILE, err);
-            }
-            temporary_files_fingerprint(&write_dir)
-        })
-        .await;
-        match write_result {
-            Ok(Ok(fingerprint)) => self.inner.write().await.temporary_fingerprint = fingerprint,
-            Ok(Err(err)) => return Err(err),
-            Err(err) => return Err(io::Error::other(format!("temp proxy persist task failed: {err}"))),
+        let mut inner = self.inner.write().await;
+        if !inner.futu_ip_entries.insert(entry) {
+            return Ok(false);
         }
-
-        // Incrementally add just this IP to the nft proxy set (one batched
-        // `nft -f` add), off the async worker — no full set rebuild.
-        #[cfg(all(target_os = "linux", feature = "local-dns"))]
-        {
-            let add_result = tokio::task::spawn_blocking(move || -> io::Result<()> {
-                crate::local::dns::intercept_linux::add_route_ips(RouteDecision::Proxy, &[ip])?;
-                // Drop any conntrack entry pinned to the old (direct) verdict so
-                // the next packet to this IP is re-evaluated against proxy4.
-                crate::local::dns::intercept_linux::flush_conntrack_dst(&[ip]);
-                Ok(())
-            })
-            .await;
-            match add_result {
-                Ok(Ok(())) => self.add_nft_route_index_ips(RouteDecision::Proxy, &[ip]).await,
-                Ok(Err(err)) => warn!("failed to add learned SOCKS proxy IP {} to nft: {}", ip, err),
-                Err(err) => warn!("failed to join nft add task for learned SOCKS proxy IP {}: {}", ip, err),
-            }
-        }
-
+        inner.futu_ip_dirty = true;
+        inner.futu_proxy_sync_dirty = true;
+        inner.futu_ip_generation = inner.futu_ip_generation.wrapping_add(1);
         Ok(true)
     }
 
@@ -1231,8 +1204,11 @@ impl RoutingState {
                         }
                     }
                     RouteDecision::Proxy => {
-                        let target_exists =
-                            compiled_rules_match_ip(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip, ip);
+                        let target_exists = compiled_rules_match_ip_indexed(
+                            &inner.persistent.proxy_ip_exact,
+                            &inner.persistent.proxy_ip_ranges,
+                            ip,
+                        );
                         if proxy_dns_result_needs_nft_sync(&inner, ip)
                             && !nft_route_index_matches(&inner.nft_route_index, RouteDecision::Proxy, ip)
                         {
@@ -1322,7 +1298,7 @@ impl RoutingState {
             let nft_start = Instant::now();
             let additions_for_nft = nft_ips.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<(), io::Error> {
-                let res = match decision {
+                match decision {
                     RouteDecision::Direct if global_proxy => {
                         crate::local::dns::intercept_linux::add_route_ips(RouteDecision::Direct, &additions_for_nft)
                     }
@@ -1332,17 +1308,7 @@ impl RoutingState {
                     RouteDecision::Proxy => {
                         crate::local::dns::intercept_linux::add_route_ips(decision, &additions_for_nft)
                     }
-                };
-                // The nft set membership for these IPs just changed. Any flow
-                // already pinned in conntrack (established before the change)
-                // keeps its old prerouting verdict, so a connection that went
-                // direct before the IP entered proxy4 would stay direct. Drop
-                // those conntrack entries so the next packet is re-evaluated
-                // against the updated sets.
-                if res.is_ok() {
-                    crate::local::dns::intercept_linux::flush_conntrack_dst(&additions_for_nft);
                 }
-                res
             })
             .await
             .unwrap_or_else(|join_err| Err(io::Error::other(format!("nft join error: {join_err}"))));
@@ -1374,6 +1340,7 @@ impl RoutingState {
                     }
                 }
             } else {
+                Self::schedule_conntrack_flush(nft_ips.clone());
                 let index_decision = match decision {
                     RouteDecision::Direct if global_proxy => Some(RouteDecision::Direct),
                     RouteDecision::Proxy => Some(RouteDecision::Proxy),
@@ -1400,6 +1367,38 @@ impl RoutingState {
             );
         }
         Ok(())
+    }
+
+    pub async fn dns_results_need_sync(&self, decision: RouteDecision, results: &[IpAddr]) -> bool {
+        if results.is_empty() {
+            return false;
+        }
+        let inner = self.inner.read().await;
+        let global_proxy = inner.sources.global_proxy;
+        if global_proxy && matches!(decision, RouteDecision::Proxy) {
+            return false;
+        }
+        results.iter().any(|ip| match decision {
+            RouteDecision::Direct => {
+                direct_dns_result_needs_nft_sync(&inner, ip, global_proxy)
+                    && !nft_route_index_matches(&inner.nft_route_index, RouteDecision::Direct, ip)
+            }
+            RouteDecision::Proxy => {
+                if proxy_dns_result_needs_nft_sync(&inner, ip)
+                    && !nft_route_index_matches(&inner.nft_route_index, RouteDecision::Proxy, ip)
+                {
+                    return true;
+                }
+                if !compiled_rules_match_ip_indexed(
+                    &inner.persistent.proxy_ip_exact,
+                    &inner.persistent.proxy_ip_ranges,
+                    ip,
+                ) {
+                    return true;
+                }
+                inner.persistent.proxy_ip_domainless_exact.contains(ip)
+            }
+        })
     }
 
     fn schedule_proxy_ip_persist(&self) {
@@ -1510,7 +1509,11 @@ impl RoutingState {
 
                 let line = format_proxy_ip_domain_line(&ip, &domain);
                 let mut changed = false;
-                let target_exists = compiled_rules_match_ip(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip, &ip);
+                let target_exists = compiled_rules_match_ip_indexed(
+                    &inner.persistent.proxy_ip_exact,
+                    &inner.persistent.proxy_ip_ranges,
+                    &ip,
+                );
                 if target_exists {
                     if inner.persistent.proxy_ip_domainless_exact.contains(&ip)
                         && let Some(idx) = inner
@@ -1612,6 +1615,83 @@ impl RoutingState {
                 }
             }
         });
+    }
+
+    fn spawn_periodic_futu_record_persist(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(FUTU_RECORD_PERSIST_INTERVAL);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if let Err(err) = state.persist_futu_records_now().await {
+                    warn!("failed to persist Futu record files: {}", err);
+                }
+            }
+        });
+    }
+
+    async fn persist_futu_records_now(&self) -> io::Result<bool> {
+        let (
+            rules_dir,
+            futu_ip_rows,
+            futu_ip_dirty,
+            futu_proxy_sync_dirty,
+            futu_ip_generation,
+            futu_url_rows,
+            futu_url_generation,
+        ) = {
+            let inner = self.inner.read().await;
+            if !inner.futu_ip_dirty && !inner.futu_proxy_sync_dirty && !inner.futu_url_dirty {
+                return Ok(false);
+            }
+            let mut futu_ip_rows = inner.futu_ip_entries.iter().cloned().collect::<Vec<_>>();
+            futu_ip_rows.sort_unstable();
+            let futu_url_rows = if inner.futu_url_dirty {
+                let mut rows = inner.futu_url_entries.iter().cloned().collect::<Vec<_>>();
+                rows.sort_unstable();
+                Some(rows)
+            } else {
+                None
+            };
+            (
+                inner.rules_dir.clone(),
+                futu_ip_rows,
+                inner.futu_ip_dirty,
+                inner.futu_proxy_sync_dirty,
+                inner.futu_ip_generation,
+                futu_url_rows,
+                inner.futu_url_generation,
+            )
+        };
+
+        let write_futu_url = futu_url_rows.is_some();
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            if futu_ip_dirty {
+                write_futu_ip_file(&rules_dir, &futu_ip_rows)?;
+            }
+            if futu_proxy_sync_dirty {
+                merge_futu_ip_into_proxy_temp(&rules_dir, &futu_ip_rows)?;
+            }
+            if let Some(rows) = futu_url_rows {
+                write_futu_url_file(&rules_dir, &rows)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|err| io::Error::other(format!("futu record persist task failed: {err}")))??;
+
+        let mut inner = self.inner.write().await;
+        if futu_ip_dirty && inner.futu_ip_generation == futu_ip_generation {
+            inner.futu_ip_dirty = false;
+        }
+        if futu_proxy_sync_dirty && inner.futu_ip_generation == futu_ip_generation {
+            inner.futu_proxy_sync_dirty = false;
+        }
+        if write_futu_url && inner.futu_url_generation == futu_url_generation {
+            inner.futu_url_dirty = false;
+        }
+        Ok(true)
     }
 
     #[cfg(all(target_os = "linux", feature = "local-dns"))]
@@ -2162,6 +2242,16 @@ impl RoutingState {
             RouteDecision::Direct => inner.nft_route_index.direct_ip_exact.extend(ips.iter().copied()),
             RouteDecision::Proxy => inner.nft_route_index.proxy_ip_exact.extend(ips.iter().copied()),
         }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "local-dns"))]
+    fn schedule_conntrack_flush(ips: Vec<IpAddr>) {
+        if ips.is_empty() {
+            return;
+        }
+        tokio::task::spawn_blocking(move || {
+            crate::local::dns::intercept_linux::flush_conntrack_dst(&ips);
+        });
     }
 
     pub async fn record_connection(
@@ -2759,8 +2849,10 @@ fn route_ip_inner(inner: &RoutingInner, ip: &IpAddr) -> Option<RouteDecision> {
         });
     }
 
-    let temp_direct = compiled_rules_match_ip(&inner.temporary.direct_ip_exact, &inner.temporary.direct_ip, ip);
-    let temp_proxy = compiled_rules_match_ip(&inner.temporary.proxy_ip_exact, &inner.temporary.proxy_ip, ip);
+    let temp_direct =
+        compiled_rules_match_ip_indexed(&inner.temporary.direct_ip_exact, &inner.temporary.direct_ip_ranges, ip);
+    let temp_proxy =
+        compiled_rules_match_ip_indexed(&inner.temporary.proxy_ip_exact, &inner.temporary.proxy_ip_ranges, ip);
     if temp_direct && temp_proxy {
         return Some(RouteDecision::Direct);
     }
@@ -2771,8 +2863,10 @@ fn route_ip_inner(inner: &RoutingInner, ip: &IpAddr) -> Option<RouteDecision> {
         return Some(RouteDecision::Proxy);
     }
 
-    let direct = compiled_rules_match_ip(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip, ip);
-    let proxy = compiled_rules_match_ip(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip, ip);
+    let direct =
+        compiled_rules_match_ip_indexed(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip_ranges, ip);
+    let proxy =
+        compiled_rules_match_ip_indexed(&inner.persistent.proxy_ip_exact, &inner.persistent.proxy_ip_ranges, ip);
     if direct && proxy {
         return Some(RouteDecision::Direct);
     }
@@ -2893,7 +2987,7 @@ fn rebuild_ip_conflicts(inner: &mut RoutingInner) {
 fn index_new_proxy_ip_conflicts(inner: &mut RoutingInner, new_proxy_ips: &[IpAddr]) {
     for ip in new_proxy_ips {
         let value = ip.to_string();
-        if compiled_rules_match_ip(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip, ip) {
+        if compiled_rules_match_ip_indexed(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip_ranges, ip) {
             push_ip_conflict_if_absent(
                 &mut inner.ip_conflicts,
                 &value,
@@ -3406,8 +3500,8 @@ fn proxy_conntrack_flush_ips(inner: &RoutingInner) -> Vec<IpAddr> {
 }
 
 fn dns_proxy_ip_blocked_from_nft_by_direct_rule(inner: &RoutingInner, ip: &IpAddr) -> bool {
-    compiled_rules_match_ip(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip, ip)
-        || compiled_rules_match_ip(&inner.temporary.direct_ip_exact, &inner.temporary.direct_ip, ip)
+    compiled_rules_match_ip_indexed(&inner.persistent.direct_ip_exact, &inner.persistent.direct_ip_ranges, ip)
+        || compiled_rules_match_ip_indexed(&inner.temporary.direct_ip_exact, &inner.temporary.direct_ip_ranges, ip)
 }
 
 fn proxy_dns_result_needs_nft_sync(inner: &RoutingInner, ip: &IpAddr) -> bool {

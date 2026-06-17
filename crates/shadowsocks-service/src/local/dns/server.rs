@@ -1372,7 +1372,7 @@ impl DnsClient {
                         "dns route cache hit {} {:?}: resolver={:?}, results={:?}",
                         domain, query.query_type(), decision, ips
                     );
-                    if matches!(decision, RouteDecision::Proxy) && !ips.is_empty() {
+                    if routing_state.dns_results_need_sync(decision, &ips).await {
                         let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
                     }
                     routing_state

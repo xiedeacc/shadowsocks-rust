@@ -264,9 +264,17 @@
         assert!(!state.add_temporary_proxy_ip(ip).await.unwrap());
 
         let snapshot = state.snapshot().await;
-        assert!(snapshot.temporary.proxy_ip.iter().any(|rule| rule == "203.0.113.77"));
+        assert!(!snapshot.temporary.proxy_ip.iter().any(|rule| rule == "203.0.113.77"));
+        let proxy_temp = read_lines(temp_file_path(&dir, TEMP_PROXY_IP_FILE)).unwrap();
+        assert!(!proxy_temp.iter().any(|rule| rule == "203.0.113.77"));
+
+        assert!(read_lines(dir.join(FUTU_IP_FILE)).unwrap().is_empty());
+        assert!(state.persist_futu_records_now().await.unwrap());
+        let futu_ips = read_lines(dir.join(FUTU_IP_FILE)).unwrap();
+        assert!(futu_ips.iter().any(|rule| rule == "203.0.113.77"));
         let proxy_temp = read_lines(temp_file_path(&dir, TEMP_PROXY_IP_FILE)).unwrap();
         assert!(proxy_temp.iter().any(|rule| rule == "203.0.113.77"));
+        assert!(!state.persist_futu_records_now().await.unwrap());
     }
 
     #[tokio::test]
@@ -282,10 +290,14 @@
         assert!(state.add_temporary_proxy_target(&target).await.unwrap());
         assert!(!state.add_temporary_proxy_target(&target).await.unwrap());
 
-        let futu_urls = read_lines(dir.join(FUTU_URL_FILE)).unwrap();
-        assert_eq!(futu_urls, vec!["api.futuexample.com:443".to_owned()]);
+        assert!(read_lines(dir.join(FUTU_URL_FILE)).unwrap().is_empty());
         let proxy_temp = read_lines(temp_file_path(&dir, TEMP_PROXY_IP_FILE)).unwrap();
         assert!(proxy_temp.is_empty());
+
+        assert!(state.persist_futu_records_now().await.unwrap());
+        let futu_urls = read_lines(dir.join(FUTU_URL_FILE)).unwrap();
+        assert_eq!(futu_urls, vec!["api.futuexample.com:443".to_owned()]);
+        assert!(!state.persist_futu_records_now().await.unwrap());
     }
 
     #[tokio::test]
@@ -921,6 +933,47 @@
         ));
         assert!(!dns_proxy_ip_blocked_from_nft_by_direct_rule(&inner, &ip));
         assert!(proxy_dns_result_needs_nft_sync(&inner, &ip));
+    }
+
+    #[tokio::test]
+    async fn cached_proxy_dns_result_skips_sync_when_already_indexed() {
+        let dir = temp_rules_dir("dns-cache-hit-proxy-no-sync");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_IP_FILE), &["203.0.113.10 a.example.com".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["example.com".to_owned()]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+        let ip = "203.0.113.10".parse().unwrap();
+
+        assert!(state.dns_results_need_sync(RouteDecision::Proxy, &[ip]).await);
+        state.inner.write().await.nft_route_index = nft_route_index_from_nets(&[], &[IpNet::from(ip)]);
+        assert!(!state.dns_results_need_sync(RouteDecision::Proxy, &[ip]).await);
+    }
+
+    #[tokio::test]
+    async fn cached_direct_dns_result_syncs_global_proxy_exception_until_indexed() {
+        let dir = temp_rules_dir("dns-cache-hit-direct-global-sync");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["direct.example".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &[]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.global_proxy = true;
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+        let ip = "203.0.113.20".parse().unwrap();
+
+        assert!(state.dns_results_need_sync(RouteDecision::Direct, &[ip]).await);
+        state.inner.write().await.nft_route_index = nft_route_index_from_nets(&[IpNet::from(ip)], &[]);
+        assert!(!state.dns_results_need_sync(RouteDecision::Direct, &[ip]).await);
     }
 
     #[cfg(all(target_os = "linux", feature = "local-dns"))]
@@ -1567,35 +1620,34 @@
     }
 
     #[test]
-    fn futu_ip_file_merges_and_dedups() {
+    fn futu_ip_file_is_merged_into_temporary_proxy_list() {
         let dir = temp_rules_dir("futu-ip-merge");
-        // Existing futu_ip.txt: a CIDR and a bare host.
         write_lines_atomic(
             dir.join(FUTU_IP_FILE),
-            &["1.14.192.0/18".to_owned(), "203.0.113.7".to_owned()],
-        )
-        .unwrap();
-        // proxy_ip.temp: the same host as a /32 (must dedup), a domain-annotated
-        // entry (annotation must be stripped), and a fresh CIDR.
-        write_lines_atomic(
-            temp_file_path(&dir, TEMP_PROXY_IP_FILE),
             &[
-                "203.0.113.7/32".to_owned(),
-                "198.51.100.9 futu.example".to_owned(),
-                "101.32.0.0/16".to_owned(),
+                "1.14.192.0/18".to_owned(),
+                "203.0.113.7".to_owned(),
+                "198.51.100.9/32".to_owned(),
             ],
         )
         .unwrap();
+        write_lines_atomic(
+            temp_file_path(&dir, TEMP_PROXY_IP_FILE),
+            &["203.0.113.7/32".to_owned(), "101.32.0.0/16".to_owned()],
+        )
+        .unwrap();
 
-        rewrite_futu_ip_file(&dir).unwrap();
+        let mut rows = read_futu_ip_entries(&dir).unwrap().into_iter().collect::<Vec<_>>();
+        rows.sort();
+        merge_futu_ip_into_proxy_temp(&dir, &rows).unwrap();
 
-        let mut got = read_lines(dir.join(FUTU_IP_FILE)).unwrap();
+        let mut got = read_lines(temp_file_path(&dir, TEMP_PROXY_IP_FILE)).unwrap();
         got.sort();
         let mut want = vec![
             "1.14.192.0/18".to_owned(),
             "101.32.0.0/16".to_owned(),
             "198.51.100.9".to_owned(),
-            "203.0.113.7".to_owned(),
+            "203.0.113.7/32".to_owned(),
         ];
         want.sort();
         assert_eq!(got, want);
