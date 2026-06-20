@@ -572,6 +572,15 @@ struct RoutingInner {
     temporary: CompiledRules,
     persistent: CompiledRules,
     nft_route_index: NftRouteIndex,
+    /// Bumped every time `nft_route_index` is authoritatively reset (the 5s
+    /// firewall sync, or a temporary-rule rebuild). The DNS hot path captures
+    /// this before it drops the routing lock for the (off-lock) `nft` add and
+    /// re-checks it before extending the index, so a reset that raced the add
+    /// discards the stale extend instead of resurrecting a phantom entry — an
+    /// index IP that the live `proxy4` set no longer contains. A phantom would
+    /// make `dns_results_need_sync` skip re-adding the IP forever, silently
+    /// breaking redir for that destination until a manual flush.
+    nft_route_index_epoch: u64,
     geoip_cn: Vec<IpNet>,
     // LPM index over `geoip_cn` for O(log n) membership on the learning hot path
     // (audit #6). Kept in sync wherever `geoip_cn` is assigned.
@@ -824,6 +833,7 @@ impl RoutingState {
             temporary,
             persistent,
             nft_route_index: NftRouteIndex::default(),
+            nft_route_index_epoch: 0,
             geoip_cn_ranges: CidrRanges::build(&geoip_cn),
             geoip_cn,
             geoip_modified,
@@ -1182,7 +1192,7 @@ impl RoutingState {
         ADD_DNS_RESULTS_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
 
         let mut schedule_proxy_persist = false;
-        let (nft_ips, global_proxy) = {
+        let (nft_ips, global_proxy, index_epoch) = {
             let mut inner = self.inner.write().await;
             let global_proxy = inner.sources.global_proxy;
             if global_proxy && matches!(decision, RouteDecision::Proxy) {
@@ -1273,7 +1283,12 @@ impl RoutingState {
             // keeps the routing write lock off the geoip-sized sweep + file write
             // on the DNS hot path (audit PERF-2 / H-4).
             index_new_proxy_ip_conflicts(&mut inner, &new_proxy_ips);
-            (nft_ips, global_proxy)
+            // Capture the index epoch under the same lock that selected `nft_ips`.
+            // If an authoritative reset bumps it before we re-acquire the lock to
+            // record the index extend, that extend is discarded (see
+            // `add_nft_route_index_ips`).
+            let index_epoch = inner.nft_route_index_epoch;
+            (nft_ips, global_proxy, index_epoch)
         };
         if !nft_ips.is_empty() {
             // Per-resolution diagnostic on the DNS hot path — debug, not warn,
@@ -1347,7 +1362,7 @@ impl RoutingState {
                     RouteDecision::Direct => None,
                 };
                 if let Some(index_decision) = index_decision {
-                    self.add_nft_route_index_ips(index_decision, &nft_ips).await;
+                    self.add_nft_route_index_ips(index_decision, &nft_ips, index_epoch).await;
                 }
             }
         }
@@ -1731,6 +1746,7 @@ impl RoutingState {
         let mut inner = self.inner.write().await;
         if inner.nft_route_index != index {
             inner.nft_route_index = index;
+            inner.nft_route_index_epoch = inner.nft_route_index_epoch.wrapping_add(1);
         }
         Ok(())
     }
@@ -2230,14 +2246,32 @@ impl RoutingState {
 
     #[cfg(all(target_os = "linux", feature = "local-dns"))]
     async fn set_nft_route_index_from_nets(&self, direct: &[IpNet], proxy: &[IpNet]) {
-        self.inner.write().await.nft_route_index = nft_route_index_from_nets(direct, proxy);
+        let mut inner = self.inner.write().await;
+        inner.nft_route_index = nft_route_index_from_nets(direct, proxy);
+        inner.nft_route_index_epoch = inner.nft_route_index_epoch.wrapping_add(1);
     }
 
-    async fn add_nft_route_index_ips(&self, decision: RouteDecision, ips: &[IpAddr]) {
+    /// Extend the in-memory index after a successful (off-lock) `nft` add.
+    /// `expected_epoch` is the index epoch captured while the IPs were selected;
+    /// if it no longer matches, an authoritative reset (5s sync or rule rebuild)
+    /// ran while our `nft` add was in flight, so the extend is dropped — adding
+    /// these IPs now could record an entry the live `proxy4` set no longer has.
+    /// The next resolution (or the 5s sync) reconciles correctly.
+    async fn add_nft_route_index_ips(&self, decision: RouteDecision, ips: &[IpAddr], expected_epoch: u64) {
         if ips.is_empty() {
             return;
         }
         let mut inner = self.inner.write().await;
+        if inner.nft_route_index_epoch != expected_epoch {
+            debug!(
+                "dropping raced nft index extend ({:?}, {} ips): epoch {} -> {}",
+                decision,
+                ips.len(),
+                expected_epoch,
+                inner.nft_route_index_epoch
+            );
+            return;
+        }
         match decision {
             RouteDecision::Direct => inner.nft_route_index.direct_ip_exact.extend(ips.iter().copied()),
             RouteDecision::Proxy => inner.nft_route_index.proxy_ip_exact.extend(ips.iter().copied()),

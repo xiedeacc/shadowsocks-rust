@@ -74,6 +74,7 @@ impl WebAdmin {
             server_filters,
             debug_lock: Mutex::new(()),
             process_started_at: self.process_started_at,
+            nft_ruleset_cache: Mutex::new(None),
         });
 
         loop {
@@ -108,6 +109,10 @@ struct WebAdminHandler {
     server_filters: Arc<HashSet<IpAddr>>,
     debug_lock: Mutex<()>,
     process_started_at: u64,
+    /// Memoized `nft list ruleset` output `(text, generated_at_unix)`. The
+    /// command is run lazily on the first request and only re-run when the
+    /// admin clicks Refresh; every other reader serves this cache.
+    nft_ruleset_cache: Mutex<Option<(String, u64)>>,
 }
 
 impl WebAdminHandler {
@@ -330,6 +335,10 @@ impl WebAdminHandler {
             (Method::GET, "/api/sys/status") => Ok(json_response(StatusCode::OK, &self.sys_status().await)),
             (Method::GET, "/api/sys/uptime") => Ok(json_response(StatusCode::OK, &self.process_uptime())),
             (Method::GET, "/api/sys/platform") => Ok(json_response(StatusCode::OK, &platform_info())),
+            (Method::GET, "/api/nft/ruleset") => {
+                let refresh = req.uri().query().is_some_and(query_has_refresh);
+                Ok(json_response(StatusCode::OK, &self.nft_ruleset(refresh).await))
+            }
             (Method::POST, "/api/sys/debug-url") => {
                 let payload: DebugUrlPayload = read_json(req).await?;
                 Ok(json_response(
@@ -398,6 +407,46 @@ impl WebAdminHandler {
             "process_started_at": self.process_started_at,
             "process_uptime_seconds": self.process_uptime_seconds(),
             "now": unix_now(),
+        })
+    }
+
+    /// Serve the cached `nft list ruleset`. The command runs only on the first
+    /// request or when `refresh` is set (the admin's Refresh button); all other
+    /// reads return the in-memory snapshot.
+    async fn nft_ruleset(&self, refresh: bool) -> serde_json::Value {
+        if !refresh {
+            let guard = self.nft_ruleset_cache.lock().await;
+            if let Some((text, generated_at)) = guard.as_ref() {
+                return serde_json::json!({
+                    "ruleset": text,
+                    "generated_at": generated_at,
+                    "cached": true,
+                });
+            }
+        }
+        let text = match tokio::task::spawn_blocking(nft_list_ruleset).await {
+            Ok(Ok(text)) => text,
+            Ok(Err(err)) => {
+                // On failure keep serving the last good snapshot (if any) so a
+                // transient nft hiccup doesn't blank the panel.
+                let guard = self.nft_ruleset_cache.lock().await;
+                return serde_json::json!({
+                    "error": err.to_string(),
+                    "ruleset": guard.as_ref().map(|(text, _)| text.clone()).unwrap_or_default(),
+                    "generated_at": guard.as_ref().map(|(_, generated_at)| *generated_at),
+                    "cached": guard.is_some(),
+                });
+            }
+            Err(join_err) => {
+                return serde_json::json!({ "error": format!("nft task failed: {join_err}") });
+            }
+        };
+        let generated_at = unix_now();
+        *self.nft_ruleset_cache.lock().await = Some((text.clone(), generated_at));
+        serde_json::json!({
+            "ruleset": text,
+            "generated_at": generated_at,
+            "cached": false,
         })
     }
 
@@ -724,7 +773,45 @@ fn platform_info() -> serde_json::Value {
         "target_os": std::env::consts::OS,
         "transparent_backend": transparent_backend(),
         "service_name": service_name(),
+        "git_commit": git_commit(),
     })
+}
+
+/// Short git commit the binary was built from (embedded by build.rs).
+fn git_commit() -> &'static str {
+    match option_env!("SSRUST_GIT_COMMIT") {
+        Some(commit) if !commit.is_empty() => commit,
+        _ => "unknown",
+    }
+}
+
+fn query_has_refresh(query: &str) -> bool {
+    query
+        .split('&')
+        .any(|pair| matches!(pair, "refresh=1" | "refresh=true" | "refresh"))
+}
+
+#[cfg(target_os = "linux")]
+fn nft_list_ruleset() -> io::Result<String> {
+    let output = Command::new("nft")
+        .args(["list", "ruleset"])
+        .stdin(Stdio::null())
+        .output()?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(io::Error::other(format!(
+            "nft list ruleset exited with {}: {}",
+            output.status,
+            stderr.trim()
+        )))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn nft_list_ruleset() -> io::Result<String> {
+    Err(io::Error::other("nft list ruleset is only available on Linux"))
 }
 
 fn service_name() -> &'static str {
@@ -1387,11 +1474,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .connections-layout{height:100%;min-height:0;flex:1;overflow:hidden;display:flex;flex-direction:column;gap:2px}
     .connections-layout .activity-toolbar{margin:0;flex:0 0 auto}
     .connections-layout .activity-grid{flex:0 0 clamp(360px,58vh,600px);grid-template-rows:minmax(0,1fr);min-height:360px}
-    .basic-layout{display:grid;grid-template-columns:minmax(380px,540px) 1fr;gap:18px;align-items:stretch;height:calc(100% - 46px);min-height:0}
+    .basic-layout{display:grid;grid-template-columns:minmax(340px,460px) minmax(0,1fr) minmax(0,1fr);gap:18px;align-items:stretch;height:calc(100% - 46px);min-height:0}
     .basic-form-panel{overflow:auto;min-height:0}
     .basic-json-panel{display:flex;flex-direction:column;min-height:0}
     .basic-json-panel textarea{flex:1}
+    .basic-nft-panel{display:flex;flex-direction:column;min-height:0}
+    .basic-nft-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+    .basic-nft-head .card-title{margin:8px 0 5px}
+    .basic-nft-head button{margin:0}
+    .nft-ruleset{flex:1;min-height:0;margin:0;overflow:auto;padding:9px;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:0 1px 2px #10203312;font-family:ui-monospace,monospace;font-size:12px;white-space:pre;color:var(--ink)}
     .basic-actions{margin-top:8px}
+    .binary-commit{text-align:center;color:var(--muted);font-size:12px;margin-top:6px;font-family:ui-monospace,monospace}
     .route-toolbar{text-align:center;margin:8px 0 0}
     .route-toolbar .hint{margin:4px 0 0}
     .route-toolbar .progress-box{margin:8px auto 0;width:min(760px,100%);box-sizing:border-box}
@@ -1450,7 +1543,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     @media(max-width:1000px){.rules-workspace{grid-template-columns:1fr}}
     @media(max-width:1100px){.activity-grid,.route-rules-layout{grid-template-columns:1fr}.activity-grid{grid-template-rows:repeat(4,minmax(0,1fr))}.connections-layout .activity-grid{grid-template-rows:repeat(2,minmax(0,1fr))}}
     @media(max-width:700px){nav{justify-content:flex-start;gap:10px}.process-uptime{position:static;transform:none;margin-left:auto;min-width:0}}
-    @media(max-width:900px){.basic-layout{grid-template-columns:1fr}#clientConfig{height:auto;max-height:none}}
+    @media(max-width:1200px){.basic-layout{grid-template-columns:minmax(320px,420px) minmax(0,1fr);grid-auto-rows:minmax(0,1fr)}.basic-nft-panel{grid-column:1 / -1}}
+    @media(max-width:900px){.basic-layout{grid-template-columns:1fr}#clientConfig{height:auto;max-height:none}.basic-nft-panel{grid-column:auto}}
   </style>
 </head>
 <body>
@@ -1531,12 +1625,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <h3 class="card-title">Generated JSON</h3>
         <textarea id="clientConfig"></textarea>
       </div>
+      <div class="basic-nft-panel">
+        <div class="basic-nft-head">
+          <h3 class="card-title">nft list ruleset</h3>
+          <button type="button" id="nftRulesetRefresh" onclick="loadNftRuleset(true)">Refresh</button>
+        </div>
+        <pre id="nftRuleset" class="nft-ruleset"></pre>
+      </div>
     </div>
     <div class="basic-actions">
       <button id="reloadButton" onclick="loadClientConfig()">Reload</button>
       <button id="saveButton" onclick="saveClientConfig()">Save</button>
       <button id="restartButton" onclick="restartService()">Restart</button>
     </div>
+    <div id="binaryCommit" class="binary-commit"></div>
   </section>
 
   <section id="connections" class="tab">
@@ -1829,6 +1931,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function updateClientJson(){clientConfig.value=JSON.stringify(buildClientConfig(),null,2)}
     async function loadClientConfig(){
       await platform();
+      setBinaryCommit();
       let r=await api('/api/client-config'); currentConfigPath=r.path; configPath.textContent=r.path;
       try{currentRawConfig=r.parsed||(r.content?JSON.parse(r.content):{})}catch(e){currentRawConfig={locals:[],servers:[]}}
       currentRawConfig.locals=currentRawConfig.locals||[];
@@ -1836,6 +1939,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
       currentRawConfig.route_rules=currentRawConfig.route_rules||{};
       try{dhcpClients=await api('/api/lan/dhcp-clients?cache='+Date.now(),{cache:'no-store'})}catch(e){dhcpClients=[]}
       renderBasic();
+    }
+    function setBinaryCommit(){let el=document.getElementById('binaryCommit');if(el)el.textContent='build commit '+((servicePlatform&&servicePlatform.git_commit)||'unknown')}
+    let nftRulesetLoaded=false;
+    async function loadNftRuleset(force){
+      let pre=document.getElementById('nftRuleset');if(!pre)return;
+      if(nftRulesetLoaded&&!force)return;
+      let btn=document.getElementById('nftRulesetRefresh');if(btn)btn.disabled=true;
+      if(force||!pre.textContent)pre.textContent='loading...';
+      try{
+        let r=await api('/api/nft/ruleset'+(force?'?refresh=1':''));
+        pre.textContent=r.ruleset||r.error||'(empty)';
+        nftRulesetLoaded=true;
+      }catch(e){pre.textContent='error: '+e.message}
+      finally{if(btn)btn.disabled=false}
     }
     function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms))}
     function setRestartControls(running){restartInProgress=running;restartButton.disabled=running;saveButton.disabled=running;reloadButton.disabled=running;restartButton.textContent=running?'Restarting...':'Restart'}
@@ -1973,6 +2090,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     refreshProcessUptime();
     setInterval(refreshProcessUptime,1000);
     loadClientConfig();
+    loadNftRuleset(false);
   </script>
 </body>
 </html>"#;
