@@ -512,10 +512,15 @@ install_remote() {
 		if [ '$NO_START' = 0 ]; then
 			for service in $STOP_CONFLICTING_SERVICES; do
 				if [ \"\$service\" != '$SERVICE_NAME' ] && [ -x \"/etc/init.d/\$service\" ]; then
-					\"/etc/init.d/\$service\" stop 2>/dev/null || true
+					echo \"[switch] disabling+stopping conflicting service: \$service\"
 					\"/etc/init.d/\$service\" disable 2>/dev/null || true
+					\"/etc/init.d/\$service\" stop 2>/dev/null || true
 				fi
 			done
+			# Kill any leftover non-master sslocal that procd may not have reaped,
+			# so it can't keep holding the redir ports / racing on the next boot.
+			for pid in \$(pgrep -f '$REMOTE_BIN_DIR/sslocal ' 2>/dev/null); do kill \"\$pid\" 2>/dev/null || true; done
+			echo \"[switch] enabling+starting $SERVICE_NAME\"
 			/etc/init.d/$SERVICE_NAME enable
 			/etc/init.d/$SERVICE_NAME restart
 			sleep 2

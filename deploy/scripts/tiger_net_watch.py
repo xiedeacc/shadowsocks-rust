@@ -38,11 +38,12 @@ GATEWAY = os.environ.get("GATEWAY", "192.168.0.1")
 SERVER_IFACES = os.environ.get("SERVER_IFACES", "enp5s0,wlp4s0").split(",")
 PRIMARY_IFACE = os.environ.get("PRIMARY_IFACE", "enp5s0")
 
-# Foreign targets reachable through the tunnel; 翻墙 is "down" only if ALL fail.
-FOREIGN_URLS = os.environ.get(
-    "FOREIGN_URLS",
-    "https://www.google.com/generate_204,https://github.com/,https://www.youtube.com/",
-).split(",")
+# Foreign target reachable only through the tunnel; if it fails, 翻墙 is down.
+FOREIGN_URLS = os.environ.get("FOREIGN_URLS", "https://www.google.com/generate_204").split(",")
+
+# Direct (non-proxied, domestic) sanity target(s): if these fail too, the whole
+# uplink is down rather than just 翻墙.
+DIRECT_URLS = os.environ.get("DIRECT_URLS", "https://www.baidu.com").split(",")
 
 INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "15"))
 TIMEOUT_SECONDS = int(os.environ.get("TIMEOUT_SECONDS", "8"))
@@ -156,7 +157,7 @@ def main() -> int:
     open(FAIL_FILE, "w", encoding="utf-8").close()
     emit(
         f"{now_str()} START server={SSSERVER_HOST}:{SSSERVER_PORT} via={SERVER_IFACES} "
-        f"primary={PRIMARY_IFACE} foreign={FOREIGN_URLS} interval={INTERVAL_SECONDS}s"
+        f"primary={PRIMARY_IFACE} fanqiang={FOREIGN_URLS} direct={DIRECT_URLS} interval={INTERVAL_SECONDS}s"
     )
 
     down = False
@@ -171,7 +172,10 @@ def main() -> int:
         fanqiang_ok = any(ok for _, ok in fan)
         fdetail = " ".join(f"{n}={'OK' if ok else 'FAIL'}" for n, ok in fan)
 
-        status = f"server[{sdetail}] fanqiang[{fdetail}] router[{router_gauge()}]"
+        dirr = [(u, curl_ok(u)) for u in DIRECT_URLS]
+        ddetail = " ".join(f"{n}={'OK' if ok else 'FAIL'}" for n, ok in dirr)
+
+        status = f"server[{sdetail}] fanqiang[{fdetail}] direct[{ddetail}] router[{router_gauge()}]"
 
         reasons = []
         if not primary_ok:
