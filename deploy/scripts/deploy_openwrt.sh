@@ -18,6 +18,8 @@ SERVICE_NAME="${SERVICE_NAME:-shadowsocks-rust}"
 NFT_HELPER_NAME="${NFT_HELPER_NAME:-ssrust-redir-nft.sh}"
 NFT_TEMPLATE_NAME="${NFT_TEMPLATE_NAME:-ssrust-redir.nft}"
 NFT_TEMPLATE_PATH="${NFT_TEMPLATE_PATH:-$ROOT_DIR/deploy/openwrt/conf/$NFT_TEMPLATE_NAME}"
+# Installed on the router under conf/ (matching deploy/openwrt/conf/ in the repo).
+REMOTE_NFT_TEMPLATE="${REMOTE_NFT_TEMPLATE:-$REMOTE_DIR/conf/$NFT_TEMPLATE_NAME}"
 # Master runs as /etc/init.d/shadowsocks-rust; the config_dns service
 # (/etc/init.d/shadowsocks) is stopped+disabled first so they don't fight over
 # the redir ports and the shared `inet ssrust_redir` nft table.
@@ -319,7 +321,7 @@ set -eu
 
 CONF='$REMOTE_CONFIG'
 NFT_TABLE='$NFT_TABLE'
-NFT_TEMPLATE='$REMOTE_BIN_DIR/$NFT_TEMPLATE_NAME'
+NFT_TEMPLATE='$REMOTE_NFT_TEMPLATE'
 REDIR_PORT='$DEFAULT_REDIR_PORT'
 DNS_PORT='$DEFAULT_DNS_PORT'
 SS_SERVER_IP='$DEFAULT_SS_SERVER_IP'
@@ -502,13 +504,14 @@ install_remote() {
 		chmod 644 '$REMOTE_CONFIG'
 		cp -f '$REMOTE_TMP/$SSLOCAL_BIN' '$REMOTE_BIN_DIR/$SSLOCAL_BIN'
 		cp -f '$REMOTE_TMP/$NFT_HELPER_NAME' '$REMOTE_BIN_DIR/$NFT_HELPER_NAME'
-		cp -f '$REMOTE_TMP/$NFT_TEMPLATE_NAME' '$REMOTE_BIN_DIR/$NFT_TEMPLATE_NAME'
+		cp -f '$REMOTE_TMP/$NFT_TEMPLATE_NAME' '$REMOTE_NFT_TEMPLATE'
+		rm -f '$REMOTE_BIN_DIR/$NFT_TEMPLATE_NAME'
 		if [ -f '/etc/init.d/$SERVICE_NAME' ] && [ ! -f '/etc/init.d/$SERVICE_NAME.codex-backup' ]; then
 			cp -f '/etc/init.d/$SERVICE_NAME' '/etc/init.d/$SERVICE_NAME.codex-backup'
 		fi
 		cp -f '$REMOTE_TMP/$SERVICE_NAME.init' '/etc/init.d/$SERVICE_NAME'
 		chmod 755 '$REMOTE_BIN_DIR/$SSLOCAL_BIN' '$REMOTE_BIN_DIR/$NFT_HELPER_NAME' '/etc/init.d/$SERVICE_NAME'
-		chmod 644 '$REMOTE_BIN_DIR/$NFT_TEMPLATE_NAME'
+		chmod 644 '$REMOTE_NFT_TEMPLATE'
 		if [ '$NO_START' = 0 ]; then
 			for service in $STOP_CONFLICTING_SERVICES; do
 				if [ \"\$service\" != '$SERVICE_NAME' ] && [ -x \"/etc/init.d/\$service\" ]; then
