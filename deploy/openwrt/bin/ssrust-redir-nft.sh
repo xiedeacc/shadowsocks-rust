@@ -1,20 +1,20 @@
 #!/bin/sh
 # Renders deploy/openwrt/conf/ssrust-redir.nft (the static redir table) and
 # applies it on OpenWrt, plus the tproxy policy routing. Installed by
-# deploy/scripts/deploy_openwrt.sh, which substitutes the placeholder markers
-# below with deploy-time values. Invoked by /etc/init.d/shadowsocks-rust on
+# deploy/scripts/deploy_openwrt.sh, which substitutes the @@...@@ markers below
+# with deploy-time values. Invoked by /etc/init.d/shadowsocks-rust on
 # start/stop/restart/status.
 set -eu
 
-CONF='@@CONF@@'
-NFT_TABLE='@@NFT_TABLE@@'
-NFT_TEMPLATE='@@NFT_TEMPLATE@@'
-REDIR_PORT='@@REDIR_PORT@@'
-DNS_PORT='@@DNS_PORT@@'
-SS_SERVER_IP='@@SS_SERVER_IP@@'
-TPROXY_MARK='@@TPROXY_MARK@@'
-OUTBOUND_MARK='@@OUTBOUND_MARK@@'
-TPROXY_TABLE='@@TPROXY_TABLE@@'
+CONF='/usr/local/shadowsocks/conf/shadowsocks-client-master.json'
+NFT_TABLE='ssrust_redir'
+NFT_TEMPLATE='/usr/local/shadowsocks/conf/ssrust-redir.nft'
+REDIR_PORT='12345'
+DNS_PORT='1053'
+SS_SERVER_IP='54.179.191.126'
+TPROXY_MARK='0x1'
+OUTBOUND_MARK='0xff'
+TPROXY_TABLE='100'
 
 json_first() {
 	local expr value
@@ -82,8 +82,8 @@ render_rules() {
 }
 
 install_rules() {
-	load_config
 	cleanup
+	load_config
 
 	modprobe nft_tproxy 2>/dev/null || true
 	modprobe nf_tproxy_ipv4 2>/dev/null || true
