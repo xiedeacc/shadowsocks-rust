@@ -265,9 +265,6 @@ scp_cmd "$OPENWRT_DIR/bin/sslocal" "$HOST:$REMOTE_TMP/sslocal"
 if [[ -f "$OPENWRT_DIR/bin/ssrust-watchdog.sh" ]]; then
 	scp_cmd "$OPENWRT_DIR/bin/ssrust-watchdog.sh" "$HOST:$REMOTE_TMP/ssrust-watchdog.sh"
 fi
-if [[ -f "$OPENWRT_DIR/conf/ssrust-redir.nft" ]]; then
-	scp_cmd "$OPENWRT_DIR/conf/ssrust-redir.nft" "$HOST:$REMOTE_TMP/ssrust-redir.nft"
-fi
 REMOTE_HAS_XRAY_PLUGIN="$(ssh_cmd "test -x '$REMOTE_DIR/bin/xray-plugin' && printf yes || printf no")"
 if [[ "$REMOTE_HAS_XRAY_PLUGIN" = yes ]]; then
 	printf 'Remote xray-plugin already exists at %s/bin/xray-plugin; skipping copy.\n' "$REMOTE_DIR"
@@ -310,14 +307,9 @@ else
 	echo \"missing \$REMOTE_DIR/conf/shadowsocks-client.json\" >&2
 	exit 1
 fi
-if [ -f \"\$REMOTE_TMP/ssrust-redir.nft\" ]; then
-	cp -f \"\$REMOTE_TMP/ssrust-redir.nft\" \"\$REMOTE_DIR/conf/ssrust-redir.nft\"
-	chmod 644 \"\$REMOTE_DIR/conf/ssrust-redir.nft\"
-fi
 find \"\$REMOTE_TMP\" -maxdepth 1 -type f \\
 	! -name sslocal \\
 	! -name ssrust-watchdog.sh \\
-	! -name ssrust-redir.nft \\
 	! -name shadowsocks-client.json \\
 	! -name \"\$SERVICE_NAME.init\" \\
 	! -name install.sh \\
