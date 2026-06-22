@@ -833,7 +833,7 @@ fn system_status() -> serde_json::Value {
         Ok(output) if output.status.success() => {
             let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
             let table_ok = Command::new("nft")
-                .args(["list", "table", "inet", "ssrust_dns"])
+                .args(["list", "table", "inet", "ssrust_redir"])
                 .status()
                 .is_ok_and(|status| status.success());
             serde_json::json!({

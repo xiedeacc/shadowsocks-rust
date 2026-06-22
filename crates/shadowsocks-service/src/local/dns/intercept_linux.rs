@@ -30,7 +30,9 @@ pub enum RouteDecision {
     Proxy,
 }
 
-const NFT_TABLE: &str = "ssrust_dns";
+const NFT_TABLE: &str = "ssrust_redir";
+const RESERVED4_SET: &str = "reserved4";
+const RESERVED6_SET: &str = "reserved6";
 const DIRECT4_SET: &str = "direct4";
 const DIRECT6_SET: &str = "direct6";
 const PROXY4_SET: &str = "proxy4";
@@ -39,29 +41,54 @@ const CLIENT_PROXY4_SET: &str = "client_proxy4";
 const CLIENT_PROXY6_SET: &str = "client_proxy6";
 const CLIENT_DIRECT4_SET: &str = "client_direct4";
 const CLIENT_DIRECT6_SET: &str = "client_direct6";
+const DNS_PREROUTING_CHAIN: &str = "prerouting_dns";
+const DNS_OUTPUT_CHAIN: &str = "output_dns";
+const TCP_PREROUTING_CHAIN: &str = "prerouting_tcp_redir";
+const TCP_OUTPUT_CHAIN: &str = "output_tcp_redir";
 const TPROXY_PREROUTING_CHAIN: &str = "prerouting_tproxy";
-const TPROXY_OUTPUT_CHAIN: &str = "output_tproxy";
-const TPROXY_MARK: &str = "0x5355";
+const TPROXY_OUTPUT_CHAIN: &str = "output_udp_mark";
+const TPROXY_MARK: &str = "0x1";
 const TPROXY_TABLE: &str = "100";
 /// Dedicated fwmark applied to sslocal's OWN outbound sockets so the output
 /// redirect/tproxy chains can exempt them by identity (`meta mark <mark> return`)
 /// instead of by the SS server IP — which goes stale for a domain-name server
 /// whose address rotates (audit H-5). Distinct from `TPROXY_MARK` so no
 /// policy-routing `ip rule` matches it.
-pub const LOCAL_OUTPUT_EXEMPT_MARK_DEFAULT: u32 = 0x5356;
-const FIXED_DIRECT4_RULES: [&str; 10] = [
+pub const LOCAL_OUTPUT_EXEMPT_MARK_DEFAULT: u32 = 0xff;
+const FIXED_DIRECT4_RULES: [&str; 18] = [
     "0.0.0.0/8",
     "10.0.0.0/8",
     "100.64.0.0/10",
     "127.0.0.0/8",
     "169.254.0.0/16",
     "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.31.196.0/24",
+    "192.52.193.0/24",
+    "192.88.99.0/24",
     "192.168.0.0/16",
+    "192.175.48.0/24",
     "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
     "224.0.0.0/4",
     "240.0.0.0/4",
 ];
-const FIXED_DIRECT6_RULES: [&str; 5] = ["::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"];
+const FIXED_DIRECT6_RULES: [&str; 12] = [
+    "::/128",
+    "::1/128",
+    "::ffff:0:0/96",
+    "64:ff9b::/96",
+    "64:ff9b:1::/48",
+    "100::/64",
+    "2001::/23",
+    "2001:db8::/32",
+    "2002::/16",
+    "fc00::/7",
+    "fe80::/10",
+    "ff00::/8",
+];
 
 static NFT_SETS_READY: AtomicBool = AtomicBool::new(false);
 
@@ -69,7 +96,7 @@ static NFT_SETS_READY: AtomicBool = AtomicBool::new(false);
 /// down even on an abnormal exit. `DnsInterceptGuard::drop` only runs on a
 /// graceful shutdown; the release profile builds with `panic = "abort"`, so a
 /// panic SIGABRTs the process *without* unwinding and Drop never fires. Left
-/// alone, the `inet ssrust_dns` table would survive with its `dport 53 redirect`
+/// alone, the `inet ssrust_redir` table would survive with its `dport 53 redirect`
 /// / tproxy rules pointing at a now-dead listener — black-holing the whole LAN's
 /// DNS. The panic hook below restores the pristine firewall before the abort.
 #[derive(Clone)]
@@ -158,7 +185,7 @@ impl Drop for DnsInterceptGuard {
     }
 }
 
-/// Best-effort removal of any leftover `inet ssrust_dns` nft table from a
+/// Best-effort removal of any leftover `inet ssrust_redir` nft table from a
 /// previous run. Called at startup when the current config does NOT enable
 /// firewall-mode DNS interception, so that a SIGKILL'd / panicked previous
 /// process can't leave the host in a half-redirected state where every DNS
@@ -742,6 +769,21 @@ fn write_add_elements(file: &mut File, decision: RouteDecision, nets: &[IpNet]) 
     Ok(())
 }
 
+fn add_nft_base_chain(
+    chain: &'static str,
+    chain_type: &'static str,
+    hook: &'static str,
+    priority: &'static str,
+) -> io::Result<()> {
+    command(
+        "nft",
+        &[
+            "add", "chain", "inet", NFT_TABLE, chain, "{", "type", chain_type, "hook", hook, "priority", priority,
+            ";", "}",
+        ],
+    )
+}
+
 fn setup_nft(
     port: u16,
     redir_port: Option<u16>,
@@ -760,45 +802,12 @@ fn setup_nft(
     NFT_SETS_READY.store(true, Ordering::Relaxed);
     add_fixed_direct_set_elements()?;
     add_client_ip_set_elements(client_ip_rules)?;
-    command(
-        "nft",
-        &[
-            "add",
-            "chain",
-            "inet",
-            NFT_TABLE,
-            "prerouting",
-            "{",
-            "type",
-            "nat",
-            "hook",
-            "prerouting",
-            "priority",
-            "dstnat",
-            ";",
-            "}",
-        ],
-    )?;
-    command(
-        "nft",
-        &[
-            "add", "chain", "inet", NFT_TABLE, "output", "{", "type", "nat", "hook", "output", "priority", "dstnat",
-            ";", "}",
-        ],
-    )?;
-    // H-5: exempt sslocal's OWN outbound (carrying `local_output_exempt_mark`)
-    // from the output redirect chain by identity, BEFORE any redirect rule.
-    // This prevents the proxy transport to the SS server from being re-captured
-    // into sslocal's own redir listener (an infinite loop) even when the server
-    // is a domain whose IP rotated — the per-IP `return` exemption can go stale,
-    // an identity mark cannot.
-    if let Some(mark) = local_output_exempt_mark {
-        let mark_arg = format!("{mark:#x}");
-        command(
-            "nft",
-            &["add", "rule", "inet", NFT_TABLE, "output", "meta", "mark", &mark_arg, "return"],
-        )?;
-    }
+    add_nft_base_chain(DNS_PREROUTING_CHAIN, "nat", "prerouting", "-101")?;
+    add_nft_base_chain(DNS_OUTPUT_CHAIN, "nat", "output", "-101")?;
+    add_nft_base_chain(TCP_PREROUTING_CHAIN, "nat", "prerouting", "dstnat")?;
+    add_nft_base_chain(TCP_OUTPUT_CHAIN, "nat", "output", "dstnat")?;
+
+    add_proxy_endpoint_return_rules(DNS_PREROUTING_CHAIN, "tcp", proxy_exempt_endpoints)?;
     for proto in ["udp", "tcp"] {
         command(
             "nft",
@@ -807,7 +816,7 @@ fn setup_nft(
                 "rule",
                 "inet",
                 NFT_TABLE,
-                "prerouting",
+                DNS_PREROUTING_CHAIN,
                 proto,
                 "dport",
                 "53",
@@ -819,9 +828,9 @@ fn setup_nft(
         if proto == "tcp"
             && let Some(redir_port) = redir_port
         {
-            add_proxy_endpoint_return_rules("prerouting", "tcp", proxy_exempt_endpoints)?;
+            add_proxy_endpoint_return_rules(TCP_PREROUTING_CHAIN, "tcp", proxy_exempt_endpoints)?;
             add_nft_tcp_redir_rule(
-                "prerouting",
+                TCP_PREROUTING_CHAIN,
                 "ip",
                 "@proxy4",
                 "@direct4",
@@ -835,7 +844,7 @@ fn setup_nft(
             // black-hole LAN IPv6 to a dead socket. Skip the v6 proxy rule then.
             if !dns_ipv4_only {
                 add_nft_tcp_redir_rule(
-                    "prerouting",
+                    TCP_PREROUTING_CHAIN,
                     "ip6",
                     "@proxy6",
                     "@direct6",
@@ -857,7 +866,7 @@ fn setup_nft(
                     "rule",
                     "inet",
                     NFT_TABLE,
-                    "output",
+                    DNS_OUTPUT_CHAIN,
                     family_expr,
                     "daddr",
                     &ip.to_string(),
@@ -868,40 +877,41 @@ fn setup_nft(
                 ],
             )?;
         }
-        add_output_local_dns_return_rule(proto)?;
-        command(
-            "nft",
-            &[
-                "add",
-                "rule",
-                "inet",
-                NFT_TABLE,
-                "output",
-                proto,
-                "dport",
-                "53",
-                "redirect",
-                "to",
-                &format!(":{port}"),
-            ],
-        )?;
+        add_output_loopback_dns_redirect_rule(proto, port)?;
         if proxy_local_output
             && proto == "tcp"
             && let Some(redir_port) = redir_port
         {
-            add_proxy_endpoint_return_rules("output", "tcp", proxy_exempt_endpoints)?;
+            if let Some(mark) = local_output_exempt_mark {
+                let mark_arg = format!("{mark:#x}");
+                command(
+                    "nft",
+                    &["add", "rule", "inet", NFT_TABLE, TCP_OUTPUT_CHAIN, "meta", "mark", &mark_arg, "return"],
+                )?;
+            }
+            add_output_loopback_return_rule(TCP_OUTPUT_CHAIN)?;
+            add_proxy_endpoint_return_rules(TCP_OUTPUT_CHAIN, "tcp", proxy_exempt_endpoints)?;
 
             // OUTPUT is required for local-machine transparent proxy: packets
             // generated on the box itself never traverse PREROUTING. Fixed
             // direct ranges and server endpoint returns above must stay before
             // redirect rules so router management/LAN traffic and the proxy
             // transport itself cannot loop back into sslocal.
-            add_nft_tcp_redir_rule("output", "ip", "@proxy4", "@direct4", redir_port, global_proxy, None)?;
+            add_nft_tcp_redir_rule(TCP_OUTPUT_CHAIN, "ip", "@proxy4", "@direct4", redir_port, global_proxy, None)?;
             if !dns_ipv4_only {
-                add_nft_tcp_redir_rule("output", "ip6", "@proxy6", "@direct6", redir_port, global_proxy, None)?;
+                add_nft_tcp_redir_rule(TCP_OUTPUT_CHAIN, "ip6", "@proxy6", "@direct6", redir_port, global_proxy, None)?;
             }
         }
     }
+    if let Some(mark) = local_output_exempt_mark {
+        let mark_arg = format!("{mark:#x}");
+        command(
+            "nft",
+            &["add", "rule", "inet", NFT_TABLE, DNS_OUTPUT_CHAIN, "meta", "mark", &mark_arg, "return"],
+        )?;
+    }
+    add_output_loopback_return_rule(DNS_OUTPUT_CHAIN)?;
+    add_proxy_endpoint_return_rules(DNS_OUTPUT_CHAIN, "tcp", proxy_exempt_endpoints)?;
     let udp_tproxy = if let Some(redir_port) = redir_port {
         match setup_nft_udp_tproxy(
             redir_port,
@@ -958,29 +968,25 @@ fn add_nft_tcp_redir_rule(
 
 fn add_proxy_endpoint_return_rules(
     chain: &'static str,
-    proto: &'static str,
+    _proto: &'static str,
     proxy_exempt_endpoints: &[(IpAddr, u16)],
 ) -> io::Result<()> {
-    for (ip, exempt_port) in proxy_exempt_endpoints {
+    let mut exempt_ips = proxy_exempt_endpoints
+        .iter()
+        .map(|(ip, _)| *ip)
+        .collect::<Vec<_>>();
+    exempt_ips.sort();
+    exempt_ips.dedup();
+    for ip in exempt_ips {
         let family_expr = match ip {
             IpAddr::V4(..) => "ip",
             IpAddr::V6(..) => "ip6",
         };
+        let ip = ip.to_string();
         command(
             "nft",
             &[
-                "add",
-                "rule",
-                "inet",
-                NFT_TABLE,
-                chain,
-                family_expr,
-                "daddr",
-                &ip.to_string(),
-                proto,
-                "dport",
-                &exempt_port.to_string(),
-                "return",
+                "add", "rule", "inet", NFT_TABLE, chain, family_expr, "daddr", &ip, "counter", "return",
             ],
         )?;
     }
@@ -1008,7 +1014,7 @@ fn add_nft_client_direct_return_rule(
     )
 }
 
-fn add_output_local_dns_return_rule(proto: &'static str) -> io::Result<()> {
+fn add_output_loopback_dns_redirect_rule(proto: &'static str, port: u16) -> io::Result<()> {
     command(
         "nft",
         &[
@@ -1016,26 +1022,35 @@ fn add_output_local_dns_return_rule(proto: &'static str) -> io::Result<()> {
             "rule",
             "inet",
             NFT_TABLE,
-            "output",
+            DNS_OUTPUT_CHAIN,
             "ip",
             "daddr",
-            "!=",
             "127.0.0.0/8",
-            "fib",
-            "daddr",
-            "type",
-            "local",
             proto,
             "dport",
             "53",
-            "return",
+            "redirect",
+            "to",
+            &format!(":{port}"),
+        ],
+    )
+}
+
+fn add_output_loopback_return_rule(chain: &'static str) -> io::Result<()> {
+    command("nft", &["add", "rule", "inet", NFT_TABLE, chain, "oifname", "lo", "return"])
+}
+
+fn add_fib_local_broadcast_return_rules(chain: &'static str) -> io::Result<()> {
+    command(
+        "nft",
+        &[
+            "add", "rule", "inet", NFT_TABLE, chain, "fib", "daddr", "type", "local", "return",
         ],
     )?;
     command(
         "nft",
         &[
-            "add", "rule", "inet", NFT_TABLE, "output", "ip6", "daddr", "!=", "::1", "fib", "daddr", "type",
-            "local", proto, "dport", "53", "return",
+            "add", "rule", "inet", NFT_TABLE, chain, "fib", "daddr", "type", "broadcast", "return",
         ],
     )
 }
@@ -1080,32 +1095,31 @@ fn add_fixed_direct_return_rules(
     family_expr: &'static str,
     proto: &'static str,
 ) -> io::Result<()> {
-    let rules = match family_expr {
-        "ip" => &FIXED_DIRECT4_RULES[..],
-        "ip6" => &FIXED_DIRECT6_RULES[..],
+    let set_name = match family_expr {
+        "ip" => RESERVED4_SET,
+        "ip6" => RESERVED6_SET,
         _ => return Ok(()),
     };
-    for rule in rules {
-        command(
-            "nft",
-            &[
-                "add",
-                "rule",
-                "inet",
-                NFT_TABLE,
-                chain,
-                family_expr,
-                "daddr",
-                rule,
-                proto,
-                "dport",
-                "!=",
-                "53",
-                "return",
-            ],
-        )?;
-    }
-    Ok(())
+    let set_ref = format!("@{set_name}");
+    command(
+        "nft",
+        &[
+            "add",
+            "rule",
+            "inet",
+            NFT_TABLE,
+            chain,
+            family_expr,
+            "daddr",
+            &set_ref,
+            proto,
+            "dport",
+            "!=",
+            "53",
+            "return",
+        ],
+    )?;
+    add_fib_local_broadcast_return_rules(chain)
 }
 
 fn setup_nft_udp_tproxy(
@@ -1118,43 +1132,24 @@ fn setup_nft_udp_tproxy(
     dns_ipv4_only: bool,
 ) -> io::Result<()> {
     setup_tproxy_policy_routing()?;
-    command(
-        "nft",
-        &[
-            "add",
-            "chain",
-            "inet",
-            NFT_TABLE,
-            TPROXY_PREROUTING_CHAIN,
-            "{",
-            "type",
-            "filter",
-            "hook",
-            "prerouting",
-            "priority",
-            "mangle",
-            ";",
-            "}",
-        ],
-    )?;
+    add_nft_base_chain(TPROXY_PREROUTING_CHAIN, "filter", "prerouting", "mangle")?;
     if proxy_local_output {
+        add_nft_base_chain(TPROXY_OUTPUT_CHAIN, "route", "output", "mangle")?;
+    }
+    if let Some(mark) = local_output_exempt_mark {
+        let mark_arg = format!("{mark:#x}");
         command(
             "nft",
             &[
                 "add",
-                "chain",
+                "rule",
                 "inet",
                 NFT_TABLE,
-                TPROXY_OUTPUT_CHAIN,
-                "{",
-                "type",
-                "route",
-                "hook",
-                "output",
-                "priority",
-                "mangle",
-                ";",
-                "}",
+                TPROXY_PREROUTING_CHAIN,
+                "meta",
+                "mark",
+                &mark_arg,
+                "return",
             ],
         )?;
     }
@@ -1204,6 +1199,7 @@ fn setup_nft_udp_tproxy(
                 &["add", "rule", "inet", NFT_TABLE, TPROXY_OUTPUT_CHAIN, "meta", "mark", &mark_arg, "return"],
             )?;
         }
+        add_output_loopback_return_rule(TPROXY_OUTPUT_CHAIN)?;
         add_proxy_endpoint_return_rules(TPROXY_OUTPUT_CHAIN, "udp", proxy_exempt_endpoints)?;
         add_nft_udp_tproxy_output_rule("ip", "@proxy4", "@direct4", global_proxy)?;
         if !dns_ipv4_only {
@@ -1335,7 +1331,10 @@ fn add_nft_udp_tproxy_output_rule(
 
 fn setup_tproxy_policy_routing() -> io::Result<()> {
     cleanup_tproxy_policy_routing();
-    command("ip", &["rule", "add", "fwmark", TPROXY_MARK, "table", TPROXY_TABLE])?;
+    command(
+        "ip",
+        &["rule", "add", "fwmark", TPROXY_MARK, "table", TPROXY_TABLE, "priority", "100"],
+    )?;
     command(
         "ip",
         &["route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", TPROXY_TABLE],
@@ -1400,12 +1399,15 @@ fn ensure_nft_sets_slow() -> io::Result<()> {
         command("nft", &["add", "table", "inet", NFT_TABLE])?;
     }
     add_nft_sets()?;
+    let _ = add_fixed_direct_set_elements();
     NFT_SETS_READY.store(true, Ordering::Relaxed);
     Ok(())
 }
 
 fn add_nft_sets() -> io::Result<()> {
     for (name, kind) in [
+        (RESERVED4_SET, "ipv4_addr"),
+        (RESERVED6_SET, "ipv6_addr"),
         (DIRECT4_SET, "ipv4_addr"),
         (DIRECT6_SET, "ipv6_addr"),
         (PROXY4_SET, "ipv4_addr"),
@@ -1476,6 +1478,8 @@ fn client_set_name(decision: RouteDecision, family_expr: &str) -> Option<&'stati
 
 fn add_fixed_direct_set_elements() -> io::Result<()> {
     let mut script = String::new();
+    write_add_literal_elements(&mut script, RESERVED4_SET, &FIXED_DIRECT4_RULES);
+    write_add_literal_elements(&mut script, RESERVED6_SET, &FIXED_DIRECT6_RULES);
     write_add_literal_elements(&mut script, DIRECT4_SET, &FIXED_DIRECT4_RULES);
     write_add_literal_elements(&mut script, DIRECT6_SET, &FIXED_DIRECT6_RULES);
     nft_apply_script(&script)

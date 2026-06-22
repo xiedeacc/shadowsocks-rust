@@ -26,7 +26,7 @@ deploy_openwrt.sh — cross-build sslocal and push it to the OpenWrt router.
 
 Flags:
   --cleanup    SSH to the router, stop /etc/init.d/shadowsocks,
-               flush the inet ssrust_dns nft table + iptables remnants,
+               flush the inet ssrust_redir nft table + iptables remnants,
                then exit without rebuilding/redeploying.
 
 Env knobs:
@@ -67,7 +67,7 @@ scp_cmd() {
 # Best-effort cleanup of leftover sslocal firewall state on the router:
 #   * stop /etc/init.d/shadowsocks so it can't recreate the table
 #     while we're flushing,
-#   * delete `inet ssrust_dns` (the only nft table sslocal ever creates),
+#   * delete `inet ssrust_redir`,
 #   * delete any iptables nat rules redirecting dport 53 to localhost
 #     (the iptables fallback path uses these).
 # Idempotent; missing services / tables / rules are silently ignored.
@@ -78,16 +78,16 @@ cleanup_remote_firewall() {
 			/etc/init.d/$SERVICE_NAME stop 2>/dev/null || true
 		fi
 		if command -v nft >/dev/null 2>&1; then
-			if nft list table inet ssrust_dns >/dev/null 2>&1; then
-				echo '[cleanup] deleting nft table inet ssrust_dns'
-				nft delete table inet ssrust_dns || true
+			if nft list table inet ssrust_redir >/dev/null 2>&1; then
+				echo '[cleanup] deleting nft table inet ssrust_redir'
+				nft delete table inet ssrust_redir || true
 			else
-				echo '[cleanup] no stale nft table inet ssrust_dns'
+				echo '[cleanup] no stale nft table inet ssrust_redir'
 			fi
 		fi
 		if command -v ip >/dev/null 2>&1; then
-			while ip rule del fwmark 0x5355 table 100 2>/dev/null; do
-				echo '[cleanup] deleted tproxy ip rule fwmark 0x5355 table 100'
+			while ip rule del fwmark 0x1 table 100 2>/dev/null; do
+				echo '[cleanup] deleted tproxy ip rule fwmark 0x1 table 100'
 			done
 			ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
 			ip -6 route del local ::/0 dev lo table 100 2>/dev/null || true
@@ -281,6 +281,9 @@ scp_cmd "$OPENWRT_DIR/bin/sslocal" "$HOST:$REMOTE_TMP/sslocal"
 if [[ -f "$OPENWRT_DIR/bin/ssrust-watchdog.sh" ]]; then
 	scp_cmd "$OPENWRT_DIR/bin/ssrust-watchdog.sh" "$HOST:$REMOTE_TMP/ssrust-watchdog.sh"
 fi
+if [[ -f "$OPENWRT_DIR/conf/ssrust-redir.nft" ]]; then
+	scp_cmd "$OPENWRT_DIR/conf/ssrust-redir.nft" "$HOST:$REMOTE_TMP/ssrust-redir.nft"
+fi
 REMOTE_HAS_XRAY_PLUGIN="$(ssh_cmd "test -x '$REMOTE_DIR/bin/xray-plugin' && printf yes || printf no")"
 if [[ "$REMOTE_HAS_XRAY_PLUGIN" = yes ]]; then
 	printf 'Remote xray-plugin already exists at %s/bin/xray-plugin; skipping copy.\n' "$REMOTE_DIR"
@@ -316,9 +319,14 @@ if [ ! -s \"\$REMOTE_DIR/conf/shadowsocks-client.json\" ]; then
 	cp -f \"\$REMOTE_TMP/shadowsocks-client.json\" \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
 fi
 chmod 644 \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
+if [ -f \"\$REMOTE_TMP/ssrust-redir.nft\" ]; then
+	cp -f \"\$REMOTE_TMP/ssrust-redir.nft\" \"\$REMOTE_DIR/conf/ssrust-redir.nft\"
+	chmod 644 \"\$REMOTE_DIR/conf/ssrust-redir.nft\"
+fi
 find \"\$REMOTE_TMP\" -maxdepth 1 -type f \\
 	! -name sslocal \\
 	! -name ssrust-watchdog.sh \\
+	! -name ssrust-redir.nft \\
 	! -name shadowsocks-client.json \\
 	! -name \"\$SERVICE_NAME.init\" \\
 	! -name install.sh \\

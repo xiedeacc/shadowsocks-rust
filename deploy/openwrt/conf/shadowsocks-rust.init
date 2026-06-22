@@ -8,8 +8,8 @@ NAME=shadowsocks-rust
 PROG=/usr/local/shadowsocks/bin/sslocal
 CONF=/usr/local/shadowsocks/conf/shadowsocks-client.json
 WATCHDOG=/usr/local/shadowsocks/bin/ssrust-watchdog.sh
-NFT_TABLE=ssrust_dns
-TPROXY_MARK=0x5355
+NFT_TABLE=ssrust_redir
+TPROXY_MARK=0x1
 TPROXY_TABLE=100
 
 dns_redirect_ports() {
@@ -67,7 +67,7 @@ start_service() {
 
 	# Firewall watchdog instance. If the main sslocal process disappears
 	# (SIGKILL, OOM, panic under panic=abort, or procd giving up after the
-	# respawn budget is exhausted) while the `inet ssrust_dns` redirect/tproxy
+	# respawn budget is exhausted) while the `inet ssrust_redir` redirect/tproxy
 	# table is still installed, every LAN DNS query (and, under global_proxy,
 	# all LAN traffic) is steered at a dead port = whole-LAN outage. The
 	# in-process Drop and the panic hook cover graceful exit and panics; this

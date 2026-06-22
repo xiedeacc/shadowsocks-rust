@@ -1,7 +1,7 @@
 #!/bin/sh
 # ssrust firewall watchdog.
 #
-# The custom sslocal installs an `inet ssrust_dns` nftables table that redirects
+# The custom sslocal installs an `inet ssrust_redir` nftables table that redirects
 # DNS (dport 53 -> :1053) and transparently proxies traffic (-> redir/tproxy
 # port). On a graceful shutdown sslocal's Drop handler removes that table, and a
 # panic hook removes it on panic=abort. But a SIGKILL / OOM / power loss, or
@@ -16,8 +16,8 @@
 # instance by /etc/init.d/shadowsocks-rust and is stopped together with the
 # service, so it only acts while the service is meant to be running.
 
-NFT_TABLE=ssrust_dns
-TPROXY_MARK=0x5355
+NFT_TABLE=ssrust_redir
+TPROXY_MARK=0x1
 TPROXY_TABLE=100
 PROG=/usr/local/shadowsocks/bin/sslocal
 INTERVAL=5

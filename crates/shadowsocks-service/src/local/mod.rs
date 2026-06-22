@@ -613,7 +613,7 @@ impl Server {
         // cases the old guard missed: a prior run SIGKILL'd/panicked in firewall
         // mode whose `setup_nft` rebuild never happens this run because there is
         // no enabled DNS listener (or it falls back to a different backend).
-        // Without this, the orphan `inet ssrust_dns` redirect table keeps
+        // Without this, the orphan `inet ssrust_redir` redirect table keeps
         // black-holing DNS. `setup_nft` also deletes+recreates the table, so the
         // extra delete here is harmless. Drop-based cleanup only fires on a
         // graceful shutdown; SIGKILL / panic=abort / power loss skip it, so this

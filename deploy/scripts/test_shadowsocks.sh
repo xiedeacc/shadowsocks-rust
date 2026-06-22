@@ -229,7 +229,7 @@ seconds_to_ms() {
 
 target_firewall_status() {
 	local script
-	script="if command -v nft >/dev/null 2>&1 && nft list table inet ssrust_dns >/dev/null 2>&1; then
+	script="if command -v nft >/dev/null 2>&1 && nft list table inet ssrust_redir >/dev/null 2>&1; then
 	printf 'nft\n';
 elif command -v iptables >/dev/null 2>&1 && iptables -t nat -L OUTPUT -n 2>/dev/null | grep -Eq 'dpt:53.*(REDIRECT|DNAT)'; then
 	printf 'iptables-dns-only\n';
@@ -404,7 +404,7 @@ elif [[ "$DNS_INTERCEPT_MODE" != "firewall" && "$DNS_INTERCEPT_MODE" != "both" ]
 	REDIR_REASON="route_rules.dns_intercept_mode is ${DNS_INTERCEPT_MODE:-unset}"
 elif [[ "$FIREWALL_STATUS" != "nft" ]]; then
 	REDIR_READY=0
-	REDIR_REASON="transparent nft table ssrust_dns is $FIREWALL_STATUS"
+	REDIR_REASON="transparent nft table ssrust_redir is $FIREWALL_STATUS"
 fi
 
 failure_count=0
