@@ -231,8 +231,6 @@ target_firewall_status() {
 	local script
 	script="if command -v nft >/dev/null 2>&1 && nft list table inet ssrust_redir >/dev/null 2>&1; then
 	printf 'nft\n';
-elif command -v iptables >/dev/null 2>&1 && iptables -t nat -L OUTPUT -n 2>/dev/null | grep -Eq 'dpt:53.*(REDIRECT|DNAT)'; then
-	printf 'iptables-dns-only\n';
 else
 	printf 'missing\n';
 fi"

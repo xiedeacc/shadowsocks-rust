@@ -102,7 +102,6 @@ static NFT_SETS_READY: AtomicBool = AtomicBool::new(false);
 #[derive(Clone)]
 enum EmergencyTeardown {
     Nft { udp_tproxy: bool },
-    Iptables { port: u16, exempt_ips: Vec<IpAddr> },
 }
 
 static EMERGENCY_TEARDOWN: Mutex<Option<EmergencyTeardown>> = Mutex::new(None);
@@ -144,9 +143,6 @@ fn run_emergency_teardown() {
                 cleanup_tproxy_policy_routing();
             }
         }
-        Some(EmergencyTeardown::Iptables { port, exempt_ips }) => {
-            cleanup_iptables(port, &exempt_ips);
-        }
         None => {}
     }
 }
@@ -163,7 +159,6 @@ pub struct ClientIpRules {
 
 enum Backend {
     Nft { udp_tproxy: bool },
-    Iptables { port: u16, exempt_ips: Vec<IpAddr> },
 }
 
 impl Drop for DnsInterceptGuard {
@@ -178,9 +173,6 @@ impl Drop for DnsInterceptGuard {
                     cleanup_tproxy_policy_routing();
                 }
             }
-            Backend::Iptables { port, ref exempt_ips } => {
-                cleanup_iptables(port, exempt_ips);
-            }
         }
     }
 }
@@ -192,7 +184,7 @@ impl Drop for DnsInterceptGuard {
 /// query is steered at a port nothing is listening on.
 ///
 /// Silent if the table doesn't exist or `nft` isn't installed.
-pub fn cleanup_stale_nft_table(iptables_dns_ports: &[u16]) {
+pub fn cleanup_stale_nft_table() {
     // Probe first so the common "nothing to clean" case logs nothing.
     let status = Command::new("nft")
         .args(["list", "table", "inet", NFT_TABLE])
@@ -211,12 +203,6 @@ pub fn cleanup_stale_nft_table(iptables_dns_ports: &[u16]) {
         _ => {}
     }
     cleanup_tproxy_policy_routing();
-    // Also drop any DNS-redirect rules left by a previous run that used the
-    // iptables fallback backend; otherwise a stale `dport 53 REDIRECT` could
-    // coexist with the freshly installed nft redirect and double-steer DNS.
-    for &port in iptables_dns_ports {
-        cleanup_iptables(port, &[]);
-    }
 }
 
 pub fn setup_firewall_redirect(
@@ -252,23 +238,14 @@ pub fn setup_firewall_redirect(
             })
         }
         Err(nft_err) => {
+            // nft is the only supported backend. Scrub any half-installed nft
+            // state and propagate the error rather than falling back to iptables.
             warn!("failed to install nftables DNS interception rules: {}", nft_err);
             cleanup_nft_tproxy_chains();
             cleanup_tproxy_policy_routing();
             NFT_SETS_READY.store(false, Ordering::Relaxed);
             let _ = command("nft", &["delete", "table", "inet", NFT_TABLE]);
-            setup_iptables(port, dns_exempt_ips)?;
-            info!("installed iptables DNS interception rules on local port {}", port);
-            arm_emergency_teardown(EmergencyTeardown::Iptables {
-                port,
-                exempt_ips: dns_exempt_ips.to_vec(),
-            });
-            Ok(DnsInterceptGuard {
-                backend: Backend::Iptables {
-                    port,
-                    exempt_ips: dns_exempt_ips.to_vec(),
-                },
-            })
+            Err(nft_err)
         }
     }
 }
@@ -1497,124 +1474,6 @@ fn write_add_literal_elements(script: &mut String, set_name: &str, rules: &[&str
         let _ = script.write_str(rule);
     }
     let _ = script.write_str(" }\n");
-}
-
-fn setup_iptables(port: u16, dns_exempt_ips: &[IpAddr]) -> io::Result<()> {
-    cleanup_iptables(port, dns_exempt_ips);
-    for proto in ["udp", "tcp"] {
-        command(
-            "iptables",
-            &[
-                "-t",
-                "nat",
-                "-A",
-                "PREROUTING",
-                "-p",
-                proto,
-                "--dport",
-                "53",
-                "-j",
-                "REDIRECT",
-                "--to-ports",
-                &port.to_string(),
-            ],
-        )?;
-        for ip in dns_exempt_ips {
-            command(
-                "iptables",
-                &[
-                    "-t",
-                    "nat",
-                    "-A",
-                    "OUTPUT",
-                    "-p",
-                    proto,
-                    "-d",
-                    &ip.to_string(),
-                    "--dport",
-                    "53",
-                    "-j",
-                    "RETURN",
-                ],
-            )?;
-        }
-        command(
-            "iptables",
-            &[
-                "-t",
-                "nat",
-                "-A",
-                "OUTPUT",
-                "-p",
-                proto,
-                "--dport",
-                "53",
-                "-j",
-                "REDIRECT",
-                "--to-ports",
-                &port.to_string(),
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn cleanup_iptables(port: u16, dns_exempt_ips: &[IpAddr]) {
-    for proto in ["udp", "tcp"] {
-        let _ = command(
-            "iptables",
-            &[
-                "-t",
-                "nat",
-                "-D",
-                "PREROUTING",
-                "-p",
-                proto,
-                "--dport",
-                "53",
-                "-j",
-                "REDIRECT",
-                "--to-ports",
-                &port.to_string(),
-            ],
-        );
-        for ip in dns_exempt_ips {
-            let _ = command(
-                "iptables",
-                &[
-                    "-t",
-                    "nat",
-                    "-D",
-                    "OUTPUT",
-                    "-p",
-                    proto,
-                    "-d",
-                    &ip.to_string(),
-                    "--dport",
-                    "53",
-                    "-j",
-                    "RETURN",
-                ],
-            );
-        }
-        let _ = command(
-            "iptables",
-            &[
-                "-t",
-                "nat",
-                "-D",
-                "OUTPUT",
-                "-p",
-                proto,
-                "--dport",
-                "53",
-                "-j",
-                "REDIRECT",
-                "--to-ports",
-                &port.to_string(),
-            ],
-        );
-    }
 }
 
 fn command(program: &str, args: &[&str]) -> io::Result<()> {

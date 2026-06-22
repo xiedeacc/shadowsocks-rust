@@ -12,36 +12,10 @@ NFT_TABLE=ssrust_redir
 TPROXY_MARK=0x1
 TPROXY_TABLE=100
 
-dns_redirect_ports() {
-	local ports parsed port
-	ports="1053"
-	if command -v jsonfilter >/dev/null 2>&1 && [ -s "$CONF" ]; then
-		parsed="$(jsonfilter -i "$CONF" -e '@.locals[@.protocol="dns"].local_port' 2>/dev/null || true)"
-		for port in $parsed; do
-			case "$port" in
-				''|*[!0-9]*) ;;
-				*) ports="$ports $port" ;;
-			esac
-		done
-	fi
-	printf '%s\n' $ports | sort -n -u
-}
-
-cleanup_iptables_dns_redirect() {
-	local chain proto port
-	command -v iptables >/dev/null 2>&1 || return 0
-	for port in $(dns_redirect_ports); do
-		for chain in PREROUTING OUTPUT; do
-			for proto in udp tcp; do
-				while iptables -t nat -D "$chain" -p "$proto" --dport 53 -j REDIRECT --to-ports "$port" 2>/dev/null; do
-					:
-				done
-			done
-		done
-	done
-}
-
 cleanup_firewall() {
+	# nft-only. The whole redirect/tproxy/DNS-redirect firewall lives in the
+	# single `inet ssrust_redir` table, so deleting it (plus the tproxy policy
+	# routing) is the complete teardown.
 	if command -v nft >/dev/null 2>&1; then
 		nft delete table inet "$NFT_TABLE" 2>/dev/null || true
 	fi
@@ -52,7 +26,6 @@ cleanup_firewall() {
 		ip route del local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" 2>/dev/null || true
 		ip -6 route del local ::/0 dev lo table "$TPROXY_TABLE" 2>/dev/null || true
 	fi
-	cleanup_iptables_dns_redirect
 }
 
 start_service() {

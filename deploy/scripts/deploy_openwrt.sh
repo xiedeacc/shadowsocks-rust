@@ -26,7 +26,7 @@ deploy_openwrt.sh — cross-build sslocal and push it to the OpenWrt router.
 
 Flags:
   --cleanup    SSH to the router, stop /etc/init.d/shadowsocks,
-               flush the inet ssrust_redir nft table + iptables remnants,
+               flush the inet ssrust_redir nft table,
                then exit without rebuilding/redeploying.
 
 Env knobs:
@@ -67,10 +67,9 @@ scp_cmd() {
 # Best-effort cleanup of leftover sslocal firewall state on the router:
 #   * stop /etc/init.d/shadowsocks so it can't recreate the table
 #     while we're flushing,
-#   * delete `inet ssrust_redir`,
-#   * delete any iptables nat rules redirecting dport 53 to localhost
-#     (the iptables fallback path uses these).
-# Idempotent; missing services / tables / rules are silently ignored.
+#   * delete `inet ssrust_redir` (the single nft table holds the entire
+#     redirect/tproxy/DNS-redirect firewall).
+# Idempotent; missing services / tables are silently ignored.
 cleanup_remote_firewall() {
 	ssh_cmd "set -e
 		if [ -x /etc/init.d/$SERVICE_NAME ]; then
@@ -91,26 +90,6 @@ cleanup_remote_firewall() {
 			done
 			ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
 			ip -6 route del local ::/0 dev lo table 100 2>/dev/null || true
-		fi
-		if command -v iptables >/dev/null 2>&1; then
-			ports='1053'
-			if command -v jsonfilter >/dev/null 2>&1 && [ -s '$REMOTE_DIR/conf/shadowsocks-client.json' ]; then
-				for port in \$(jsonfilter -i '$REMOTE_DIR/conf/shadowsocks-client.json' -e '@.locals[@.protocol=\"dns\"].local_port' 2>/dev/null || true); do
-					case \"\$port\" in
-						''|*[!0-9]*) ;;
-						*) ports=\"\$ports \$port\" ;;
-					esac
-				done
-			fi
-			for port in \$ports; do
-				for chain in PREROUTING OUTPUT; do
-					for proto in udp tcp; do
-						while iptables -t nat -D \$chain -p \$proto --dport 53 -j REDIRECT --to-ports \$port 2>/dev/null; do
-							echo \"[cleanup] removed iptables \$chain \$proto dport 53 redirect to \$port\"
-						done
-					done
-				done
-			done
 		fi
 		echo '[cleanup] done'
 	"

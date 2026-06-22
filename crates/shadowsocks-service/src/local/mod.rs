@@ -621,16 +621,7 @@ impl Server {
         // net for those paths.
         #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
         {
-            let mut dns_scrub_ports: Vec<u16> = config
-                .local
-                .iter()
-                .filter(|local| !local.config.disabled && matches!(local.config.protocol, ProtocolType::Dns))
-                .filter_map(|local| local.config.addr.as_ref().map(|addr| addr.port()))
-                .collect();
-            if !dns_scrub_ports.contains(&1053) {
-                dns_scrub_ports.push(1053);
-            }
-            self::dns::intercept_linux::cleanup_stale_nft_table(&dns_scrub_ports);
+            self::dns::intercept_linux::cleanup_stale_nft_table();
         }
 
         // Derive runtime DNS endpoints (domestic / foreign upstreams +

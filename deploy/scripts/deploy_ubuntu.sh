@@ -37,7 +37,7 @@ while [[ $# -gt 0 ]]; do
 			CLEANUP_ONLY=1; shift ;;
 		-h|--help)
 			sed -n '2,/^set -euo pipefail/p' "$0"
-			printf '\nFlags:\n  --cleanup    stop services and wipe the inet ssrust_redir nft table + iptables remnants, then exit.\n'
+			printf '\nFlags:\n  --cleanup    stop services and wipe the inet ssrust_redir nft table, then exit.\n'
 			exit 0 ;;
 		*) printf 'unknown arg: %s\n' "$1" >&2; exit 2 ;;
 	esac
@@ -52,10 +52,9 @@ fi
 log() { printf '[deploy] %s\n' "$*"; }
 
 # Best-effort wipe of any firewall remnants left behind by a previous
-# sslocal run (table inet ssrust_redir + the legacy iptables DNS-redirect
-# rules). Safe to run any number of times; missing tables / rules are
-# silently ignored. We stop the services first so the running process
-# cannot recreate the table mid-flush.
+# sslocal run (the single nft table inet ssrust_redir). Safe to run any
+# number of times; a missing table is silently ignored. We stop the
+# services first so the running process cannot recreate the table mid-flush.
 cleanup_firewall_state() {
 	log "stopping services before firewall cleanup"
 	"${SUDO[@]}" systemctl stop "$SERVICE_NAME.service"       >/dev/null 2>&1 || true
@@ -69,24 +68,6 @@ cleanup_firewall_state() {
 		fi
 	else
 		log "nft not installed; skipping nftables cleanup"
-	fi
-
-	# iptables fallback path: remove every rule referencing 127.0.0.1:5353
-	# (or whatever DNS port the previous run picked up). Match by jump
-	# target prefix DNAT/REDIRECT + dport 53 in the nat OUTPUT/PREROUTING
-	# chains. Silent if iptables is absent or no rule matches.
-	if command -v iptables >/dev/null 2>&1; then
-		for chain in OUTPUT PREROUTING; do
-			while "${SUDO[@]}" iptables -t nat -L "$chain" -n --line-numbers 2>/dev/null \
-				| awk '/dpt:53/ && (/REDIRECT|DNAT/) {print $1; exit}' \
-				| grep -q .; do
-				line=$("${SUDO[@]}" iptables -t nat -L "$chain" -n --line-numbers 2>/dev/null \
-					| awk '/dpt:53/ && (/REDIRECT|DNAT/) {print $1; exit}')
-				[[ -z "$line" ]] && break
-				log "iptables -t nat -D $chain $line"
-				"${SUDO[@]}" iptables -t nat -D "$chain" "$line" || break
-			done
-		done
 	fi
 }
 
