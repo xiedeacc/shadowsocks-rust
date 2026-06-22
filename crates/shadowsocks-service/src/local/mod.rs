@@ -617,7 +617,7 @@ impl Server {
         // black-holing DNS. `setup_nft` also deletes+recreates the table, so the
         // extra delete here is harmless. Drop-based cleanup only fires on a
         // graceful shutdown; SIGKILL / panic=abort / power loss skip it, so this
-        // startup scrub plus the init `cleanup_firewall`/watchdog are the safety
+        // startup scrub plus the init/web-admin restart cleanup is the safety
         // net for those paths.
         #[cfg(all(feature = "local-dns", feature = "local-web-admin", target_os = "linux"))]
         {

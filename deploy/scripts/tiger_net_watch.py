@@ -10,9 +10,10 @@ Two complementary checks each cycle:
      wlp4s0 -> 192.168.0.1 -> server              (direct, bypasses openwrt -- like the phone)
    NOTE: the server IP is EXEMPT from redir, so this is a DIRECT connect, not the proxy path.
 
-2. 翻墙 (proxy path) -- plain default-route curl (NO --interface; SO_BINDTODEVICE on curl
-   breaks routing here and yields false failures) to foreign sites that should be reachable
-   only through the tunnel.
+2. 翻墙/direct URL checks -- curl is explicitly bound to PRIMARY_IFACE and disables
+   proxy environment variables. This host can also run a local upstream sslocal and
+   has a Wi-Fi default route, so plain curl would be contaminated by wlp4s0 or a
+   local proxy and could report false OKs while enp5s0 is actually broken.
 
 On trouble (all foreign sites fail, OR the server canary fails on the primary interface) it
 SSHes the router for a full snapshot. Requires root for SO_BINDTODEVICE.
@@ -22,27 +23,45 @@ resolved foreign names via the ::1 nameserver -> dnsmasq -> upstream 192.168.0.1
 e.g. google -> 157.240.x). Fixed by pointing dnsmasq at sslocal:1053 split-DNS.
 """
 import datetime as dt
+import random
 import os
 import re
 import socket
 import subprocess
 import time
+from urllib.parse import urlsplit
 
+
+PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+)
+for key in PROXY_ENV_KEYS:
+    os.environ.pop(key, None)
 
 SSSERVER_HOST = os.environ.get("SSSERVER_HOST", "54.179.191.126")
 SSSERVER_PORT = int(os.environ.get("SSSERVER_PORT", "443"))
 SS_PLUGIN_HOST = os.environ.get("SS_PLUGIN_HOST", "forsimple.youkechat.net")
 GATEWAY = os.environ.get("GATEWAY", "192.168.0.1")
+PRIMARY_DNS_SERVER = os.environ.get("PRIMARY_DNS_SERVER", "192.168.2.1")
 
 # Server-canary interfaces; the PRIMARY one (through openwrt) gates the failure state.
 SERVER_IFACES = os.environ.get("SERVER_IFACES", "enp5s0,wlp4s0").split(",")
 PRIMARY_IFACE = os.environ.get("PRIMARY_IFACE", "enp5s0")
 
-# Foreign targets reachable through the tunnel; 翻墙 is "down" only if ALL fail.
+# URL targets must go through the primary wired path. fanqiang/direct are considered
+# down independently when all targets in that list fail.
 FOREIGN_URLS = os.environ.get(
     "FOREIGN_URLS",
-    "https://www.google.com/generate_204,https://github.com/,https://www.youtube.com/",
+    "https://www.google.com/generate_204",
 ).split(",")
+DIRECT_URLS = os.environ.get("DIRECT_URLS", "https://www.baidu.com/").split(",")
 
 INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "15"))
 TIMEOUT_SECONDS = int(os.environ.get("TIMEOUT_SECONDS", "8"))
@@ -52,6 +71,7 @@ SSH_TARGET = os.environ.get("SSH_TARGET", "root@openwrt")
 
 SO_BINDTODEVICE = 25
 SSH_BASE = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", SSH_TARGET]
+NO_PROXY_ENV = os.environ.copy()
 
 ROUTER_GAUGE = (
     'echo udp=$(grep -cE "udp.*%(s)s.*dport=443" /proc/net/nf_conntrack) '
@@ -79,7 +99,7 @@ logread 2>/dev/null | grep -iE 'sslocal|xray' | grep -iE 'error|fail|reset|refus
 
 
 CST = dt.timezone(dt.timedelta(hours=8))
-USE_COLOR = os.environ.get("NO_COLOR") is None
+USE_COLOR = os.environ.get("TIGER_NET_WATCH_COLOR", "1") != "0"
 _GREEN, _RED, _RESET = "\033[1;92m", "\033[1;91m", "\033[0m"
 
 
@@ -95,11 +115,16 @@ def colorize(line: str) -> str:
     return line
 
 
-def emit(line: str) -> None:
+def append_line(path: str, line: str) -> None:
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+
+def emit(line: str, record_fail_file: bool = True) -> None:
     colored = colorize(line)
     print(colored, flush=True)
-    with open(FAIL_FILE, "a", encoding="utf-8") as handle:
-        handle.write(colored + "\n")
+    if record_fail_file:
+        append_line(FAIL_FILE, line)
 
 
 def server_ok(ifname: str) -> bool:
@@ -119,11 +144,117 @@ def server_ok(ifname: str) -> bool:
             pass
 
 
-def curl_ok(url: str) -> bool:
-    """Plain default-route curl (no interface binding)."""
-    args = ["curl", "-k", "-s", "-o", "/dev/null", "-m", str(TIMEOUT_SECONDS), "-w", "%{http_code}", url]
+def _read_dns_name(packet: bytes, offset: int) -> tuple[str, int]:
+    labels = []
+    jumped = False
+    next_offset = offset
+    seen = set()
+    while True:
+        if offset >= len(packet):
+            raise ValueError("dns name exceeds packet")
+        length = packet[offset]
+        if length & 0xC0 == 0xC0:
+            if offset + 1 >= len(packet):
+                raise ValueError("truncated dns pointer")
+            pointer = ((length & 0x3F) << 8) | packet[offset + 1]
+            if pointer in seen:
+                raise ValueError("dns pointer loop")
+            seen.add(pointer)
+            if not jumped:
+                next_offset = offset + 2
+                jumped = True
+            offset = pointer
+            continue
+        if length == 0:
+            if not jumped:
+                next_offset = offset + 1
+            break
+        offset += 1
+        labels.append(packet[offset : offset + length].decode("ascii", "ignore"))
+        offset += length
+    return ".".join(labels), next_offset
+
+
+def resolve_a_via_primary_dns(host: str, ifname: str = PRIMARY_IFACE) -> str | None:
+    query_id = random.randrange(0, 65536)
+    qname = b"".join(bytes([len(label)]) + label.encode("ascii") for label in host.rstrip(".").split(".")) + b"\0"
+    packet = (
+        query_id.to_bytes(2, "big")
+        + b"\x01\x00"
+        + b"\x00\x01"
+        + b"\x00\x00"
+        + b"\x00\x00"
+        + b"\x00\x00"
+        + qname
+        + b"\x00\x01\x00\x01"
+    )
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(TIMEOUT_SECONDS)
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=TIMEOUT_SECONDS + 3)
+        sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, (ifname + "\0").encode())
+        sock.sendto(packet, (PRIMARY_DNS_SERVER, 53))
+        data, _ = sock.recvfrom(1500)
+    except Exception:
+        return None
+    finally:
+        sock.close()
+
+    if len(data) < 12 or int.from_bytes(data[:2], "big") != query_id:
+        return None
+    qdcount = int.from_bytes(data[4:6], "big")
+    ancount = int.from_bytes(data[6:8], "big")
+    offset = 12
+    try:
+        for _ in range(qdcount):
+            _, offset = _read_dns_name(data, offset)
+            offset += 4
+        for _ in range(ancount):
+            _, offset = _read_dns_name(data, offset)
+            rtype = int.from_bytes(data[offset : offset + 2], "big")
+            rclass = int.from_bytes(data[offset + 2 : offset + 4], "big")
+            rdlength = int.from_bytes(data[offset + 8 : offset + 10], "big")
+            offset += 10
+            rdata = data[offset : offset + rdlength]
+            offset += rdlength
+            if rtype == 1 and rclass == 1 and rdlength == 4:
+                return socket.inet_ntoa(rdata)
+    except Exception:
+        return None
+    return None
+
+
+def curl_ok(url: str, ifname: str = PRIMARY_IFACE) -> bool:
+    """curl bound to the primary interface, bypassing proxy env vars and host DNS."""
+    parsed = urlsplit(url)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    resolved_ip = resolve_a_via_primary_dns(host, ifname) if host else None
+    if host and not resolved_ip:
+        return False
+    args = [
+        "curl",
+        "--interface",
+        ifname,
+        "--noproxy",
+        "*",
+    ]
+    if host and resolved_ip:
+        args += ["--resolve", f"{host}:{port}:{resolved_ip}"]
+    args += [
+        "-k",
+        "-s",
+        "-o",
+        "/dev/null",
+        "--connect-timeout",
+        str(TIMEOUT_SECONDS),
+        "-m",
+        str(TIMEOUT_SECONDS),
+        "-w",
+        "%{http_code}",
+        url,
+    ]
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=TIMEOUT_SECONDS + 3, env=NO_PROXY_ENV)
         return proc.returncode == 0
     except Exception:
         return False
@@ -156,7 +287,8 @@ def main() -> int:
     open(FAIL_FILE, "w", encoding="utf-8").close()
     emit(
         f"{now_str()} START server={SSSERVER_HOST}:{SSSERVER_PORT} via={SERVER_IFACES} "
-        f"primary={PRIMARY_IFACE} foreign={FOREIGN_URLS} interval={INTERVAL_SECONDS}s"
+        f"primary={PRIMARY_IFACE} foreign={FOREIGN_URLS} direct={DIRECT_URLS} "
+        f"proxy_env=cleared interval={INTERVAL_SECONDS}s"
     )
 
     down = False
@@ -167,17 +299,22 @@ def main() -> int:
         sdetail = " ".join(f"{ifc}={'OK' if ok else 'FAIL'}" for ifc, ok in srv.items())
         primary_ok = srv.get(PRIMARY_IFACE, True)
 
-        fan = [(u, curl_ok(u)) for u in FOREIGN_URLS]
+        fan = [(u, curl_ok(u, PRIMARY_IFACE)) for u in FOREIGN_URLS]
         fanqiang_ok = any(ok for _, ok in fan)
         fdetail = " ".join(f"{n}={'OK' if ok else 'FAIL'}" for n, ok in fan)
+        direct = [(u, curl_ok(u, PRIMARY_IFACE)) for u in DIRECT_URLS]
+        direct_ok = any(ok for _, ok in direct)
+        ddetail = " ".join(f"{n}={'OK' if ok else 'FAIL'}" for n, ok in direct)
 
-        status = f"server[{sdetail}] fanqiang[{fdetail}] router[{router_gauge()}]"
+        status = f"server[{sdetail}] fanqiang[{fdetail}] direct[{ddetail}] router[{router_gauge()}]"
 
         reasons = []
         if not primary_ok:
             reasons.append(f"server-{PRIMARY_IFACE}-fail")
         if not fanqiang_ok:
             reasons.append("fanqiang-all-fail")
+        if not direct_ok:
+            reasons.append("direct-all-fail")
 
         if reasons:
             snap = capture_snapshot(",".join(reasons))
@@ -190,7 +327,7 @@ def main() -> int:
                 emit(f"{now_str()} RECOVER after {dur:.0f}s | {status}")
                 down, down_since = False, None
             else:
-                print(colorize(f"{now_str()} OK {status}"), flush=True)
+                emit(f"{now_str()} OK {status}", record_fail_file=False)
 
         time.sleep(INTERVAL_SECONDS)
 

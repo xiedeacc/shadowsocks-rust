@@ -749,6 +749,7 @@ fn restart_service_after_response() {
         }
         #[cfg(not(windows))]
         {
+            cleanup_redir_firewall_before_restart();
             let openwrt_init = ["/etc/init.d/shadowsocks", "/etc/init.d/shadowsocks-rust"]
                 .iter()
                 .map(Path::new)
@@ -766,6 +767,33 @@ fn restart_service_after_response() {
             }
         }
     });
+}
+
+#[cfg(not(windows))]
+fn cleanup_redir_firewall_before_restart() {
+    let _ = Command::new("nft")
+        .args(["delete", "table", "inet", "ssrust_redir"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    while Command::new("ip")
+        .args(["rule", "del", "fwmark", "0x1", "table", "100"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+    {}
+    let _ = Command::new("ip")
+        .args(["route", "del", "local", "0.0.0.0/0", "dev", "lo", "table", "100"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = Command::new("ip")
+        .args(["-6", "route", "del", "local", "::/0", "dev", "lo", "table", "100"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn platform_info() -> serde_json::Value {

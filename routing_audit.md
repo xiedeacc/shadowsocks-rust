@@ -252,7 +252,7 @@ LAN 段（`192.168.0.0/16`，含网关 `192.168.2.1` 与 SSH `10022`）、loopba
 ### P0 —— 不破坏可达性的安全兜底（对应 C-1 / H-1）
 - [ ] 在 `init` 增加 `stop_service()`，显式调用 `cleanup_firewall`（修复纯 `stop`/respawn 耗尽后残留）。
 - [ ] 增加进程级兜底拆除：`panic hook` + `libc::atexit` + 捕获 `SIGTERM/SIGABRT/SIGSEGV` 时执行 `nft delete table inet ssrust_dns` 与 tproxy 清理；或为 release 改 `panic="unwind"` 并在顶层 catch 后拆除。
-- [ ] 加一个极轻的 watchdog（procd `respawn` 给出 `term_timeout`，或一条 cron）：检测「无 sslocal 进程但 `ssrust_dns` 存在」时删表。
+- [x] watchdog 方案已移除；改由启动、init stop/restart、web-admin restart 在切换前清理 `ssrust_redir`。
 - [ ] 可选：让 :53 redirect「失败开放」——监听未就绪/不可达时降级为 `accept` 而非黑洞。
 - *验收*：模拟 `kill -9` 与崩溃循环，确认 LAN DNS 在数秒内恢复且 SSH 始终可达。
 
@@ -305,7 +305,7 @@ router$ curl https://www.baidu.com    → 200 / 0.14s
 
 | 编号 | 状态 | 落点 |
 |---|---|---|
-| C-1 procd 重启耗尽残留 | ✅ | init 新增 `stop_service()` + 独立看门狗实例 `ssrust-watchdog.sh`；启动无条件清理 |
+| C-1 procd 重启耗尽残留 | ✅ | init `stop_service()` + 启动/web-admin restart 无条件清理 `ssrust_redir` |
 | H-1 panic=abort 跳过 Drop | ✅ | `intercept_linux.rs` 新增 EmergencyTeardown 注册表 + panic hook（abort 前删表+清 tproxy） |
 | TD-3/CW-4 启动残留清理 | ✅ | `cleanup_stale_nft_table` 改无条件执行 + 清残留 iptables 重定向 |
 | TD-4/DI-1 启动黑洞窗口 | ✅ | 防火墙改在 DNS 监听**绑定后**安装 |
