@@ -354,12 +354,27 @@ for removed_service in sslocal-watch sslocal-probe; do
 	rm -f \"/etc/init.d/\$removed_service\" /etc/rc.d/*\"\$removed_service\"* \"\$REMOTE_DIR/bin/\$removed_service.sh\"
 done
 
-for legacy_service in shadowsocks-rust; do
-	if [ \"\$SERVICE_NAME\" != \"\$legacy_service\" ] && [ -x \"/etc/init.d/\$legacy_service\" ]; then
-		\"/etc/init.d/\$legacy_service\" stop || true
-		\"/etc/init.d/\$legacy_service\" disable || true
+detect_sslocal_process() {
+	if pgrep -f '(^|/)sslocal-master([[:space:]]|$)' >/dev/null 2>&1 || ps w 2>/dev/null | grep -q '[s]slocal-master'; then
+		printf 'sslocal-master'
+		return 0
 	fi
-done
+	if pgrep -f '(^|/)sslocal([[:space:]]|$)' >/dev/null 2>&1 || ps w 2>/dev/null | grep -q '[s]slocal '; then
+		printf 'sslocal'
+		return 0
+	fi
+	return 1
+}
+
+running_local=\"\$(detect_sslocal_process || true)\"
+if [ -n \"\$running_local\" ]; then
+	echo \"[deploy] detected running local process: \$running_local\"
+fi
+if [ \"\$SERVICE_NAME\" = shadowsocks ] && [ \"\$running_local\" = sslocal-master ] && [ -x /etc/init.d/shadowsocks-rust ]; then
+	echo '[deploy] sslocal-master belongs to shadowsocks-rust; switching to /etc/init.d/shadowsocks'
+	/etc/init.d/shadowsocks-rust disable || true
+	/etc/init.d/shadowsocks-rust stop || true
+fi
 
 if command -v apk >/dev/null 2>&1 && ! lsmod | grep -q '^nft_tproxy'; then
 	apk update || true
@@ -372,7 +387,14 @@ if [ \"\$DISABLE_LEGACY\" = 1 ] && [ \"\$SERVICE_NAME\" != shadowsocks ] && [ -x
 fi
 
 /etc/init.d/\$SERVICE_NAME enable
-/etc/init.d/\$SERVICE_NAME restart
+if [ \"\$running_local\" = sslocal-master ]; then
+	# Was running the upstream-master build (handed off above: shadowsocks-rust
+	# disabled+stopped), so shadowsocks isn't up yet -> plain start.
+	/etc/init.d/\$SERVICE_NAME start
+else
+	# Already on shadowsocks (or nothing running) -> restart to load the new build.
+	/etc/init.d/\$SERVICE_NAME restart
+fi
 sleep 2
 /etc/init.d/\$SERVICE_NAME status || true
 
