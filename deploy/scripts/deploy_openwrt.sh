@@ -16,6 +16,7 @@ LOCAL_CONFIG="${LOCAL_CONFIG:-$ROOT_DIR/deploy/openwrt/conf/shadowsocks-client-m
 REMOTE_TMP="${REMOTE_TMP:-/tmp/ssrust-master-deploy}"
 SERVICE_NAME="${SERVICE_NAME:-shadowsocks-rust}"
 NFT_HELPER_NAME="${NFT_HELPER_NAME:-ssrust-redir-nft.sh}"
+NFT_HELPER_PATH="${NFT_HELPER_PATH:-$ROOT_DIR/deploy/openwrt/bin/$NFT_HELPER_NAME}"
 NFT_TEMPLATE_NAME="${NFT_TEMPLATE_NAME:-ssrust-redir.nft}"
 NFT_TEMPLATE_PATH="${NFT_TEMPLATE_PATH:-$ROOT_DIR/deploy/openwrt/conf/$NFT_TEMPLATE_NAME}"
 # Installed on the router under conf/ (matching deploy/openwrt/conf/ in the repo).
@@ -286,6 +287,11 @@ build_sslocal() {
 		printf 'Missing nft template: %s\n' "$NFT_TEMPLATE_PATH" >&2
 		exit 1
 	fi
+
+	if [[ ! -s "$NFT_HELPER_PATH" ]]; then
+		printf 'Missing nft helper: %s\n' "$NFT_HELPER_PATH" >&2
+		exit 1
+	fi
 }
 
 cleanup_remote() {
@@ -315,125 +321,24 @@ write_remote_files() {
 	fi
 	scp_cmd "$LOCAL_CONFIG" "$HOST:$REMOTE_TMP/$(basename "$REMOTE_CONFIG")"
 
-	ssh_cmd "cat > '$REMOTE_TMP/$NFT_HELPER_NAME' <<'EOS'
-#!/bin/sh
-set -eu
-
-CONF='$REMOTE_CONFIG'
-NFT_TABLE='$NFT_TABLE'
-NFT_TEMPLATE='$REMOTE_NFT_TEMPLATE'
-REDIR_PORT='$DEFAULT_REDIR_PORT'
-DNS_PORT='$DEFAULT_DNS_PORT'
-SS_SERVER_IP='$DEFAULT_SS_SERVER_IP'
-TPROXY_MARK='$TPROXY_MARK'
-OUTBOUND_MARK='$OUTBOUND_MARK_HEX'
-TPROXY_TABLE='$TPROXY_TABLE'
-
-json_first() {
-	local expr value
-	expr=\"\$1\"
-	command -v jsonfilter >/dev/null 2>&1 || return 0
-	[ -s \"\$CONF\" ] || return 0
-	value=\"\$(jsonfilter -i \"\$CONF\" -e \"\$expr\" 2>/dev/null | sed -n '1p' || true)\"
-	printf '%s' \"\$value\"
-}
-
-is_ipv4() {
-	case \"\$1\" in
-		*.*) return 0 ;;
-		*) return 1 ;;
-	esac
-}
-
-require_ipv4() {
-	local name value
-	name=\"\$1\"
-	value=\"\$2\"
-	if ! is_ipv4 \"\$value\"; then
-		echo \"\$name must be an IPv4 address for this nft template: \$value\" >&2
-		exit 1
-	fi
-}
-
-load_config() {
-	local value
-	value=\"\$(json_first '@.locals[@.protocol=\"redir\"].local_port')\"
-	case \"\$value\" in ''|*[!0-9]*) ;; *) REDIR_PORT=\"\$value\" ;; esac
-
-	value=\"\$(json_first '@.locals[@.protocol=\"dns\"].local_port')\"
-	case \"\$value\" in ''|*[!0-9]*) ;; *) DNS_PORT=\"\$value\" ;; esac
-
-	value=\"\$(json_first '@.servers[0].server')\"
-	[ -n \"\$value\" ] && SS_SERVER_IP=\"\$value\"
-
-	require_ipv4 'ssserver address' \"\$SS_SERVER_IP\"
-}
-
-cleanup() {
-	nft delete table inet \"\$NFT_TABLE\" 2>/dev/null || true
-	while ip rule del fwmark \"\$TPROXY_MARK\" table \"\$TPROXY_TABLE\" 2>/dev/null; do :; done
-	ip route del local 0.0.0.0/0 dev lo table \"\$TPROXY_TABLE\" 2>/dev/null || true
-	ip -6 route del local ::/0 dev lo table \"\$TPROXY_TABLE\" 2>/dev/null || true
-}
-
-render_rules() {
-	local output
-	if [ ! -s \"\$NFT_TEMPLATE\" ]; then
-		echo \"missing nft template: \$NFT_TEMPLATE\" >&2
-		exit 1
-	fi
-	output=\"/tmp/\$NFT_TABLE.rendered.\$\$.nft\"
-	sed \\
-		-e \"s#__NFT_TABLE__#\$NFT_TABLE#g\" \\
-		-e \"s#__REDIR_PORT__#\$REDIR_PORT#g\" \\
-		-e \"s#__DNS_PORT__#\$DNS_PORT#g\" \\
-		-e \"s#__SS_SERVER_IP__#\$SS_SERVER_IP#g\" \\
-		-e \"s#__TPROXY_MARK__#\$TPROXY_MARK#g\" \\
-		-e \"s#__OUTBOUND_MARK__#\$OUTBOUND_MARK#g\" \\
-		\"\$NFT_TEMPLATE\" > \"\$output\"
-	printf '%s' \"\$output\"
-}
-
-install_rules() {
-	load_config
-	cleanup
-
-	modprobe nft_tproxy 2>/dev/null || true
-	modprobe nf_tproxy_ipv4 2>/dev/null || true
-	modprobe nf_tproxy_ipv6 2>/dev/null || true
-
-	ip rule add fwmark \"\$TPROXY_MARK\" table \"\$TPROXY_TABLE\" priority 100 2>/dev/null || true
-	ip route replace local 0.0.0.0/0 dev lo table \"\$TPROXY_TABLE\"
-	ip -6 rule add fwmark \"\$TPROXY_MARK\" table \"\$TPROXY_TABLE\" priority 100 2>/dev/null || true
-	ip -6 route replace local ::/0 dev lo table \"\$TPROXY_TABLE\" 2>/dev/null || true
-
-	rules_file=\"\$(render_rules)\"
-	nft -f \"\$rules_file\"
-	rm -f \"\$rules_file\"
-
-	echo \"installed nft table \$NFT_TABLE: redir=\$REDIR_PORT dns=\$DNS_PORT server_ip=\$SS_SERVER_IP\"
-}
-
-case \"\${1:-start}\" in
-	start)
-		install_rules
-		;;
-	stop|cleanup)
-		cleanup
-		;;
-	restart)
-		install_rules
-		;;
-	status)
-		nft list table inet \"\$NFT_TABLE\"
-		;;
-	*)
-		echo \"usage: \$0 {start|stop|restart|status}\" >&2
-		exit 2
-		;;
-esac
-EOS
-chmod 755 '$REMOTE_TMP/$NFT_HELPER_NAME'"
+	# Render the tracked nft helper (deploy/openwrt/bin/ssrust-redir-nft.sh) and
+	# stage it. The @@...@@ markers are deploy-time values; the helper's own
+	# __...__ markers (for the nft template) are left untouched.
+	local rendered_helper
+	rendered_helper="$(mktemp)"
+	sed \
+		-e "s#@@CONF@@#$REMOTE_CONFIG#g" \
+		-e "s#@@NFT_TABLE@@#$NFT_TABLE#g" \
+		-e "s#@@NFT_TEMPLATE@@#$REMOTE_NFT_TEMPLATE#g" \
+		-e "s#@@REDIR_PORT@@#$DEFAULT_REDIR_PORT#g" \
+		-e "s#@@DNS_PORT@@#$DEFAULT_DNS_PORT#g" \
+		-e "s#@@SS_SERVER_IP@@#$DEFAULT_SS_SERVER_IP#g" \
+		-e "s#@@TPROXY_MARK@@#$TPROXY_MARK#g" \
+		-e "s#@@OUTBOUND_MARK@@#$OUTBOUND_MARK_HEX#g" \
+		-e "s#@@TPROXY_TABLE@@#$TPROXY_TABLE#g" \
+		"$NFT_HELPER_PATH" > "$rendered_helper"
+	scp_cmd "$rendered_helper" "$HOST:$REMOTE_TMP/$NFT_HELPER_NAME"
+	rm -f "$rendered_helper"
 
 	ssh_cmd "cat > '$REMOTE_TMP/$SERVICE_NAME.init' <<'EOS'
 #!/bin/sh /etc/rc.common
