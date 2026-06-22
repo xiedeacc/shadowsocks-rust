@@ -266,9 +266,14 @@ cargo build \
 mkdir -p "$OPENWRT_DIR/bin" "$OPENWRT_DIR/conf" "$OPENWRT_DIR/data" "$OPENWRT_DIR/logs"
 install -m 755 "$ROOT_DIR/target/$TARGET_TRIPLE/release/sslocal" "$OPENWRT_DIR/bin/sslocal"
 
-if [[ ! -s "$OPENWRT_DIR/conf/shadowsocks-client.json" ]]; then
-	printf 'Missing %s\n' "$OPENWRT_DIR/conf/shadowsocks-client.json" >&2
-	exit 1
+LOCAL_CLIENT_CONFIG="$OPENWRT_DIR/conf/shadowsocks-client.json"
+if [[ ! -s "$LOCAL_CLIENT_CONFIG" ]]; then
+	if ssh_cmd "test -s '$REMOTE_DIR/conf/shadowsocks-client.json'"; then
+		printf 'Local client config missing; keeping existing remote %s/conf/shadowsocks-client.json.\n' "$REMOTE_DIR"
+	else
+		printf 'Missing local %s and remote %s/conf/shadowsocks-client.json\n' "$LOCAL_CLIENT_CONFIG" "$REMOTE_DIR" >&2
+		exit 1
+	fi
 fi
 
 DATA_SOURCE_DIR="$OPENWRT_DIR/data"
@@ -290,7 +295,9 @@ if [[ "$REMOTE_HAS_XRAY_PLUGIN" = yes ]]; then
 elif [[ -x "$OPENWRT_DIR/bin/xray-plugin" ]]; then
 	scp_cmd "$OPENWRT_DIR/bin/xray-plugin" "$HOST:$REMOTE_TMP/xray-plugin"
 fi
-scp_cmd "$OPENWRT_DIR/conf/shadowsocks-client.json" "$HOST:$REMOTE_TMP/shadowsocks-client.json"
+if [[ -s "$LOCAL_CLIENT_CONFIG" ]]; then
+	scp_cmd "$LOCAL_CLIENT_CONFIG" "$HOST:$REMOTE_TMP/shadowsocks-client.json"
+fi
 scp_cmd "$OPENWRT_DIR/conf/shadowsocks-rust.init" "$HOST:$REMOTE_TMP/$SERVICE_NAME.init"
 
 if [[ -d "$DATA_SOURCE_DIR" ]]; then
@@ -315,10 +322,15 @@ if [ -f \"\$REMOTE_TMP/ssrust-watchdog.sh\" ]; then
 	cp -f \"\$REMOTE_TMP/ssrust-watchdog.sh\" \"\$REMOTE_DIR/bin/ssrust-watchdog.sh\"
 	chmod 755 \"\$REMOTE_DIR/bin/ssrust-watchdog.sh\"
 fi
-if [ ! -s \"\$REMOTE_DIR/conf/shadowsocks-client.json\" ]; then
+if [ ! -s \"\$REMOTE_DIR/conf/shadowsocks-client.json\" ] && [ -s \"\$REMOTE_TMP/shadowsocks-client.json\" ]; then
 	cp -f \"\$REMOTE_TMP/shadowsocks-client.json\" \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
 fi
-chmod 644 \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
+if [ -s \"\$REMOTE_DIR/conf/shadowsocks-client.json\" ]; then
+	chmod 644 \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
+else
+	echo \"missing \$REMOTE_DIR/conf/shadowsocks-client.json\" >&2
+	exit 1
+fi
 if [ -f \"\$REMOTE_TMP/ssrust-redir.nft\" ]; then
 	cp -f \"\$REMOTE_TMP/ssrust-redir.nft\" \"\$REMOTE_DIR/conf/ssrust-redir.nft\"
 	chmod 644 \"\$REMOTE_DIR/conf/ssrust-redir.nft\"
