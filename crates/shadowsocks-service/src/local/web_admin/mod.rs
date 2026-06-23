@@ -1742,7 +1742,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .connections-layout{height:100%;min-height:0;flex:1;overflow:hidden;display:flex;flex-direction:column;gap:2px}
     .connections-layout .activity-toolbar{margin:0;flex:0 0 auto}
     .connections-layout .activity-grid{flex:0 0 clamp(360px,58vh,600px);grid-template-rows:minmax(0,1fr);min-height:360px}
-    .basic-layout{--basic-control-width:clamp(370px,calc(21vw + 40px),470px);display:grid;grid-template-columns:var(--basic-control-width) var(--basic-control-width) minmax(0,1fr);gap:18px;align-items:start;height:calc(100% - 46px);min-height:0}
+    .basic-layout{--basic-control-width:clamp(370px,calc(21vw + 40px),470px);display:grid;grid-template-columns:var(--basic-control-width) var(--basic-control-width) minmax(0,1fr);gap:18px;align-items:start;height:calc(100% - 70px);min-height:0}
     .basic-form-panel,.basic-side-panel{min-height:0;height:var(--basic-sync-height,auto);box-sizing:border-box}
     .basic-form-panel{overflow:visible}
     #serverPanel{display:flex;flex-direction:column;justify-content:space-between;overflow:visible}
@@ -1761,6 +1761,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .nft-ruleset{flex:1;min-height:0;margin:0;overflow:auto;padding:9px;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:0 1px 2px #10203312;font-family:ui-monospace,monospace;font-size:12px;white-space:pre;color:var(--ink)}
     .basic-actions{display:flex;justify-content:center;gap:8px;margin-top:8px}
     .basic-actions button{margin:0}
+    .config-path{text-align:center;margin:8px 0 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .binary-commit{text-align:center;color:var(--muted);font-size:12px;margin-top:6px;font-family:ui-monospace,monospace}
     .route-toolbar{text-align:center;margin:8px 0 0}
     .route-toolbar .hint{margin:4px 0 0}
@@ -1837,7 +1838,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
   </nav>
 
   <section id="basic" class="tab active">
-    <p class="hint" id="configPath"></p>
     <div class="basic-layout">
       <div id="basicFormPanel" class="basic-form-panel">
         <div class="config-group">
@@ -1904,6 +1904,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <textarea id="clientConfig"></textarea>
       </div>
     </div>
+    <p class="hint config-path" id="configPath"></p>
     <div class="basic-actions">
       <button id="reloadButton" onclick="loadClientConfig()">Reload</button>
       <button id="saveButton" onclick="saveClientConfig()">Save</button>
