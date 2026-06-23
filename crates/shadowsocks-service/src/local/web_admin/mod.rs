@@ -177,6 +177,17 @@ impl WebAdminHandler {
             }
             (Method::PUT, "/api/client-config") => {
                 let payload: ClientConfigPayload = read_json(req).await?;
+                let existing = match fs::read_to_string(&self.config_path) {
+                    Ok(content) => content,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+                    Err(err) => return Err(err),
+                };
+                if existing == payload.content {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({ "ok": true, "restart": false, "unchanged": true }),
+                    ));
+                }
                 if let Some(parent) = self.config_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -307,6 +318,7 @@ impl WebAdminHandler {
                 StatusCode::OK,
                 &self.routing_state.domain_conflicts().await,
             )),
+            (Method::GET, "/api/lan/addresses") => Ok(json_response(StatusCode::OK, &lan_addresses())),
             (Method::GET, "/api/lan/dhcp-clients") => Ok(json_response(StatusCode::OK, &dhcp_clients())),
             (Method::GET, "/api/activity/connections") => Ok(json_response(
                 StatusCode::OK,
@@ -701,6 +713,12 @@ struct DhcpClient {
     source: &'static str,
 }
 
+#[derive(serde::Serialize)]
+struct LanAddress {
+    address: IpAddr,
+    source: &'static str,
+}
+
 struct DebugCurlResult {
     command: String,
     response_received: bool,
@@ -750,11 +768,8 @@ fn restart_service_after_response() {
         #[cfg(not(windows))]
         {
             cleanup_redir_firewall_before_restart();
-            let openwrt_init = ["/etc/init.d/shadowsocks", "/etc/init.d/shadowsocks-rust"]
-                .iter()
-                .map(Path::new)
-                .find(|path| path.exists());
-            let restart = if let Some(openwrt_init) = openwrt_init {
+            let openwrt_init = Path::new("/etc/init.d/shadowsocks");
+            let restart = if openwrt_init.exists() {
                 Command::new(openwrt_init).arg("restart").status()
             } else {
                 Command::new("systemctl")
@@ -802,6 +817,7 @@ fn platform_info() -> serde_json::Value {
         "transparent_backend": transparent_backend(),
         "service_name": service_name(),
         "git_commit": git_commit(),
+        "git_commit_time_bj": git_commit_time_bj(),
     })
 }
 
@@ -809,6 +825,14 @@ fn platform_info() -> serde_json::Value {
 fn git_commit() -> &'static str {
     match option_env!("SSRUST_GIT_COMMIT") {
         Some(commit) if !commit.is_empty() => commit,
+        _ => "unknown",
+    }
+}
+
+/// Commit time for the embedded git commit.
+fn git_commit_time_bj() -> &'static str {
+    match option_env!("SSRUST_GIT_COMMIT_TIME_BJ") {
+        Some(time) if !time.is_empty() => time,
         _ => "unknown",
     }
 }
@@ -985,6 +1009,101 @@ fn is_lan_admin_peer(ip: IpAddr) -> bool {
 
 fn dhcp_clients() -> Vec<DhcpClient> {
     read_dhcp_leases(Path::new("/tmp/dhcp.leases")).unwrap_or_default()
+}
+
+fn lan_addresses() -> Vec<LanAddress> {
+    let mut seen = HashSet::new();
+    let mut addresses = Vec::new();
+    collect_openwrt_lan_addresses(&mut seen, &mut addresses);
+    if addresses.is_empty() {
+        collect_linux_lan_device_addresses(&mut seen, &mut addresses);
+    }
+    addresses.sort_by_key(|addr| addr.address);
+    addresses
+}
+
+fn collect_openwrt_lan_addresses(seen: &mut HashSet<IpAddr>, addresses: &mut Vec<LanAddress>) {
+    let Ok(output) = Command::new("ubus")
+        .args(["-S", "call", "network.interface.lan", "status"])
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return;
+    };
+    for key in ["ipv4-address", "ipv6-address"] {
+        if let Some(values) = status.get(key).and_then(|value| value.as_array()) {
+            for value in values {
+                if let Some(ip) = value.get("address").and_then(|value| value.as_str()).and_then(parse_lan_bind_ip) {
+                    push_lan_address(seen, addresses, ip, "lan");
+                }
+            }
+        }
+    }
+    if let Some(values) = status.get("ipv6-prefix-assignment").and_then(|value| value.as_array()) {
+        for value in values {
+            if let Some(ip) = value
+                .get("local-address")
+                .and_then(|value| value.get("address"))
+                .and_then(|value| value.as_str())
+                .and_then(parse_lan_bind_ip)
+            {
+                push_lan_address(seen, addresses, ip, "lan");
+            }
+        }
+    }
+}
+
+fn collect_linux_lan_device_addresses(seen: &mut HashSet<IpAddr>, addresses: &mut Vec<LanAddress>) {
+    for dev in ["br-lan", "lan"] {
+        let Ok(output) = Command::new("ip").args(["-j", "addr", "show", "dev", dev]).output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let Ok(ifaces) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+            continue;
+        };
+        let Some(ifaces) = ifaces.as_array() else {
+            continue;
+        };
+        for iface in ifaces {
+            let Some(values) = iface.get("addr_info").and_then(|value| value.as_array()) else {
+                continue;
+            };
+            for value in values {
+                if value.get("scope").and_then(|value| value.as_str()) == Some("link") {
+                    continue;
+                }
+                if let Some(ip) = value.get("local").and_then(|value| value.as_str()).and_then(parse_lan_bind_ip) {
+                    push_lan_address(seen, addresses, ip, "lan");
+                }
+            }
+        }
+        if !addresses.is_empty() {
+            break;
+        }
+    }
+}
+
+fn parse_lan_bind_ip(value: &str) -> Option<IpAddr> {
+    let ip = value.parse::<IpAddr>().ok()?;
+    match ip {
+        IpAddr::V4(ip) if ip.is_loopback() || ip.is_unspecified() => None,
+        IpAddr::V6(ip) if ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xffc0) == 0xfe80 => None,
+        _ => Some(ip),
+    }
+}
+
+fn push_lan_address(seen: &mut HashSet<IpAddr>, addresses: &mut Vec<LanAddress>, address: IpAddr, source: &'static str) {
+    if seen.insert(address) {
+        addresses.push(LanAddress { address, source });
+    }
 }
 
 fn read_dhcp_leases(path: &Path) -> io::Result<Vec<DhcpClient>> {
@@ -1502,15 +1621,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .connections-layout{height:100%;min-height:0;flex:1;overflow:hidden;display:flex;flex-direction:column;gap:2px}
     .connections-layout .activity-toolbar{margin:0;flex:0 0 auto}
     .connections-layout .activity-grid{flex:0 0 clamp(360px,58vh,600px);grid-template-rows:minmax(0,1fr);min-height:360px}
-    .basic-layout{display:grid;grid-template-columns:minmax(330px,430px) minmax(330px,430px) minmax(0,1fr);gap:18px;align-items:stretch;height:calc(100% - 46px);min-height:0}
-    .basic-form-panel,.basic-side-panel{overflow:auto;min-height:0}
-    .basic-json-panel{display:flex;flex-direction:column;min-height:0}
-    .basic-json-panel textarea{flex:1}
+    .basic-layout{--basic-control-width:clamp(350px,calc(21vw + 20px),450px);display:grid;grid-template-columns:var(--basic-control-width) var(--basic-control-width) minmax(0,1fr);gap:18px;align-items:start;height:calc(100% - 46px);min-height:0}
+    .basic-form-panel,.basic-side-panel{min-height:0;height:var(--basic-sync-height,auto);box-sizing:border-box}
+    .basic-form-panel{overflow:visible}
+    #serverPanel{display:flex;flex-direction:column;justify-content:space-between;overflow:visible}
+    .config-group{min-width:0}
+    .basic-json-panel{display:flex;flex-direction:column;min-height:0;height:var(--basic-sync-height,auto);box-sizing:border-box}
+    .basic-json-panel textarea{flex:1 1 auto;height:auto}
     .server-block{position:relative}
     .server-head{display:flex;align-items:center;gap:8px;margin-bottom:5px}
     .server-head strong{color:var(--brand2);font-size:13px}
-    .server-actions{display:flex;justify-content:flex-end}
-    .server-actions button{margin:0}
     .modal-backdrop{display:none;position:fixed;inset:0;z-index:100;background:#10203399;padding:24px;box-sizing:border-box}
     .modal-backdrop.open{display:flex;align-items:stretch;justify-content:center}
     .modal-panel{display:flex;flex-direction:column;width:min(1200px,100%);min-height:0;background:var(--panel);border-radius:10px;border:1px solid var(--line);box-shadow:0 18px 40px #10203355;padding:12px}
@@ -1518,7 +1638,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .modal-head .card-title{margin:0}
     .modal-head button{margin:0}
     .nft-ruleset{flex:1;min-height:0;margin:0;overflow:auto;padding:9px;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:0 1px 2px #10203312;font-family:ui-monospace,monospace;font-size:12px;white-space:pre;color:var(--ink)}
-    .basic-actions{margin-top:8px}
+    .basic-actions{display:flex;justify-content:center;gap:8px;margin-top:8px}
+    .basic-actions button{margin:0}
     .binary-commit{text-align:center;color:var(--muted);font-size:12px;margin-top:6px;font-family:ui-monospace,monospace}
     .route-toolbar{text-align:center;margin:8px 0 0}
     .route-toolbar .hint{margin:4px 0 0}
@@ -1543,7 +1664,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .sys-layout{min-height:0;flex:1;overflow:auto}
     .status-ok{color:#18864b;font-weight:700}
     .status-warn{color:#b15d00;font-weight:700}
-    .form-line{display:grid;grid-template-columns:150px 1fr;gap:10px;align-items:center;margin:4px 0}
+    .form-line{display:grid;grid-template-columns:150px 1fr;gap:5px;align-items:center;margin:4px 0}
     .form-line label{margin:0;font-size:13px}
     .form-line input[type=checkbox]{width:16px;height:16px;margin:0;justify-self:start}
     .client-select{position:relative;min-height:32px}
@@ -1578,7 +1699,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     @media(max-width:1000px){.rules-workspace{grid-template-columns:1fr}}
     @media(max-width:1100px){.activity-grid,.route-rules-layout{grid-template-columns:1fr}.activity-grid{grid-template-rows:repeat(4,minmax(0,1fr))}.connections-layout .activity-grid{grid-template-rows:repeat(2,minmax(0,1fr))}}
     @media(max-width:700px){nav{justify-content:flex-start;gap:10px}.process-uptime{position:static;transform:none;margin-left:auto;min-width:0}}
-    @media(max-width:1200px){.basic-layout{grid-template-columns:minmax(320px,420px) minmax(0,1fr);grid-auto-rows:minmax(0,1fr)}.basic-json-panel{grid-column:1 / -1}}
+    @media(max-width:1200px){.basic-layout{--basic-control-width:minmax(340px,440px);grid-template-columns:var(--basic-control-width) var(--basic-control-width);grid-auto-rows:minmax(0,1fr)}.basic-json-panel{grid-column:1 / -1}}
     @media(max-width:900px){.basic-layout{grid-template-columns:1fr}#clientConfig{height:auto;max-height:none}.basic-json-panel{grid-column:auto}}
   </style>
 </head>
@@ -1597,56 +1718,67 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <section id="basic" class="tab active">
     <p class="hint" id="configPath"></p>
     <div class="basic-layout">
-      <div class="basic-form-panel">
-        <h3 class="card-title">SOCKS Local</h3>
-        <fieldset>
-          <div class="form-line"><label>Bind Address</label><select id="socksBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
-          <div class="form-line"><label>Port</label><input id="socksPort" type="number" min="1" max="65535"></div>
-        </fieldset>
-        <h3 class="card-title">Futu SOCKS Local</h3>
-        <fieldset>
-          <div class="form-line"><label>Bind Address</label><select id="futuSocksBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
-          <div class="form-line"><label>Port</label><input id="futuSocksPort" type="number" min="1" max="65535" value="1082"></div>
-        </fieldset>
-        <h3 class="card-title">HTTP Local</h3>
-        <fieldset>
-          <div class="form-line"><label>Bind Address</label><select id="httpBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
-          <div class="form-line"><label>Port</label><input id="httpPort" type="number" min="1" max="65535"></div>
-        </fieldset>
-        <h3 class="card-title">DNS Listener</h3>
-        <fieldset>
-          <div class="form-line"><label>Enable DNS</label><input id="dnsEnable" type="checkbox"></div>
-          <div class="form-line"><label>Bind Address</label><select id="dnsBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
-          <div class="form-line"><label>Port</label><input id="dnsPort" type="number" min="1" max="65535"></div>
-          <div class="form-line"><label>Domestic DNS</label><input id="dnsDomestic" placeholder="223.5.5.5:53"></div>
-          <div class="form-line"><label>Foreign DNS</label><input id="dnsForeign" placeholder="8.8.8.8:53"></div>
-          <div class="form-line"><label>Cache Capacity</label><input id="dnsCacheCapacity" type="number" min="1"></div>
-          <div class="form-line"><label>Cache TTL Seconds</label><input id="dnsCacheTtl" type="number" min="1"></div>
-          <div class="form-line"><label>Async Refresh</label><input id="dnsCacheRefreshEnabled" type="checkbox"></div>
-          <div class="form-line"><label>Refresh Batch Size</label><input id="dnsCacheRefreshBatch" type="number" min="1"></div>
-          <div class="form-line"><label>Intercept Mode</label><select id="dnsInterceptMode"><option>off</option><option>firewall</option><option>tun</option><option>both</option></select></div>
-          <div class="form-line"><label title="Strip AAAA records from DNS responses. Avoids browser happy-eyeballs delay on hosts without working public IPv6.">Address Family</label><select id="dnsIpv4Only"><option value="true">IPv4 only (recommended)</option><option value="false">IPv4 + IPv6</option></select></div>
-        </fieldset>
+      <div id="basicFormPanel" class="basic-form-panel">
+        <div class="config-group">
+          <h3 class="card-title">SOCKS Local</h3>
+          <fieldset>
+            <div class="form-line"><label>Bind Address</label><select id="socksBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
+            <div class="form-line"><label>Port</label><input id="socksPort" type="number" min="1" max="65535"></div>
+          </fieldset>
+        </div>
+        <div class="config-group">
+          <h3 class="card-title">Futu SOCKS Local</h3>
+          <fieldset>
+            <div class="form-line"><label>Bind Address</label><select id="futuSocksBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
+            <div class="form-line"><label>Port</label><input id="futuSocksPort" type="number" min="1" max="65535" value="1082"></div>
+          </fieldset>
+        </div>
+        <div class="config-group">
+          <h3 class="card-title">HTTP Local</h3>
+          <fieldset>
+            <div class="form-line"><label>Bind Address</label><select id="httpBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
+            <div class="form-line"><label>Port</label><input id="httpPort" type="number" min="1" max="65535"></div>
+          </fieldset>
+        </div>
+        <div class="config-group">
+          <h3 class="card-title">DNS Listener</h3>
+          <fieldset>
+            <div class="form-line"><label>Enable DNS</label><input id="dnsEnable" type="checkbox"></div>
+            <div class="form-line"><label>Bind Address</label><select id="dnsBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
+            <div class="form-line"><label>Port</label><input id="dnsPort" type="number" min="1" max="65535"></div>
+            <div class="form-line"><label>Domestic DNS</label><input id="dnsDomestic" placeholder="223.5.5.5:53"></div>
+            <div class="form-line"><label>Foreign DNS</label><input id="dnsForeign" placeholder="8.8.8.8:53"></div>
+            <div class="form-line"><label>Cache Capacity</label><input id="dnsCacheCapacity" type="number" min="1"></div>
+            <div class="form-line"><label>Cache TTL Seconds</label><input id="dnsCacheTtl" type="number" min="1"></div>
+            <div class="form-line"><label>Async Refresh</label><input id="dnsCacheRefreshEnabled" type="checkbox"></div>
+            <div class="form-line"><label>Refresh Batch Size</label><input id="dnsCacheRefreshBatch" type="number" min="1"></div>
+            <div class="form-line"><label>Intercept Mode</label><select id="dnsInterceptMode"><option>off</option><option>firewall</option><option>tun</option><option>both</option></select></div>
+            <div class="form-line"><label title="Strip AAAA records from DNS responses. Avoids browser happy-eyeballs delay on hosts without working public IPv6.">Address Family</label><select id="dnsIpv4Only"><option value="true">IPv4 only (recommended)</option><option value="false">IPv4 + IPv6</option></select></div>
+          </fieldset>
+        </div>
       </div>
-      <div class="basic-side-panel">
-        <h3 class="card-title">Transparent Proxy</h3>
-        <fieldset>
-          <div class="form-line"><label>Enable Redir</label><input id="redirEnable" type="checkbox"></div>
-          <div class="form-line"><label>Global Proxy</label><input id="globalProxy" type="checkbox"></div>
-          <div class="form-line"><label>Global Proxy Client</label><div id="clientGlobalProxyList" class="client-list"></div></div>
-          <div class="form-line"><label>Direct Client</label><div id="clientDirectList" class="client-list"></div></div>
-          <div class="form-line"><label>Bind Address</label><select id="redirBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
-          <div class="form-line"><label>Port</label><input id="redirPort" type="number" min="1" max="65535"></div>
-          <div class="form-line"><label>Mode</label><select id="redirMode"><option>tcp_only</option><option>tcp_and_udp</option></select></div>
-          <div class="form-line tun-field"><label>TUN Name</label><input id="tunName" placeholder="shadowsocks-tun"></div>
-          <div class="form-line tun-field"><label>TUN Address</label><input id="tunAddress" placeholder="10.255.0.1/24"></div>
-          <div class="form-line tun-field"><label>TUN Destination</label><input id="tunDestination" placeholder="10.255.0.2/24"></div>
-        </fieldset>
-        <h3 class="card-title">Server</h3>
-        <div id="serverList"></div>
-        <div class="server-actions"><button type="button" onclick="addServerForm()">Add Server</button></div>
+      <div id="serverPanel" class="basic-side-panel">
+        <div class="config-group">
+          <h3 class="card-title">Transparent Proxy</h3>
+          <fieldset>
+            <div class="form-line"><label>Enable Redir</label><input id="redirEnable" type="checkbox"></div>
+            <div class="form-line"><label>Global Proxy</label><input id="globalProxy" type="checkbox"></div>
+            <div class="form-line"><label>Global Proxy Client</label><div id="clientGlobalProxyList" class="client-list"></div></div>
+            <div class="form-line"><label>Direct Client</label><div id="clientDirectList" class="client-list"></div></div>
+            <div class="form-line"><label>Bind Address</label><select id="redirBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
+            <div class="form-line"><label>Port</label><input id="redirPort" type="number" min="1" max="65535"></div>
+            <input id="redirMode" type="hidden">
+            <div class="form-line tun-field"><label>TUN Name</label><input id="tunName" placeholder="shadowsocks-tun"></div>
+            <div class="form-line tun-field"><label>TUN Address</label><input id="tunAddress" placeholder="10.255.0.1/24"></div>
+            <div class="form-line tun-field"><label>TUN Destination</label><input id="tunDestination" placeholder="10.255.0.2/24"></div>
+          </fieldset>
+        </div>
+        <div class="config-group">
+          <h3 class="card-title">Server</h3>
+          <div id="serverList"></div>
+        </div>
       </div>
-      <div class="basic-json-panel">
+      <div id="basicJsonPanel" class="basic-json-panel">
         <h3 class="card-title">Generated JSON</h3>
         <textarea id="clientConfig"></textarea>
       </div>
@@ -1795,7 +1927,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function api(path,opt={}){let timeoutMs=opt.timeoutMs||0;delete opt.timeoutMs;let timer=null,controller=null;if(timeoutMs){controller=new AbortController();opt.signal=controller.signal;timer=setTimeout(()=>controller.abort(),timeoutMs)}opt.headers=Object.assign({'x-admin-token':token()},opt.headers||{});try{let r=await fetch(path,opt);let j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}finally{if(timer)clearTimeout(timer)}}
     async function platform(){if(!servicePlatform)servicePlatform=await api('/api/sys/platform');return servicePlatform}
     function isWindowsService(){return servicePlatform&&servicePlatform.target_os==='windows'}
-    let activeTab='basic', activityTimer=null, activityPaused=false, recentDnsRows=[], restartInProgress=false, dhcpClients=[];
+    let activeTab='basic', activityTimer=null, activityPaused=false, recentDnsRows=[], restartInProgress=false, dhcpClients=[], lanAddresses=[];
     function updateNavIndicator(){
       let active=document.querySelector('nav button.active'), indicator=document.querySelector('.nav-indicator'), tabs=document.querySelector('.nav-tabs');
       if(!active||!indicator||!tabs)return;
@@ -1818,8 +1950,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function num(v,d){let n=parseInt(v,10);return Number.isFinite(n)?n:d}
     function firstLocal(protocol){return (currentRawConfig.locals||[]).find(l=>l.protocol===protocol&&!l.record_proxy_ip)||{}}
     function futuSocksLocal(){return (currentRawConfig.locals||[]).find(l=>l.protocol==='socks'&&l.record_proxy_ip)||{}}
-    const methodOptions=['aes-128-gcm','aes-256-gcm','chacha20-ietf-poly1305','2022-blake3-aes-128-gcm','2022-blake3-aes-256-gcm'];
-    function setSelect(id,value){let el=document.getElementById(id); if([...el.options].some(o=>o.value===value)){el.value=value}else{el.value=el.options[0].value}}
+    const bindSelectIds=['socksBind','futuSocksBind','httpBind','dnsBind','redirBind'];
+    function setSelect(id,value){let el=document.getElementById(id); if([...el.options].some(o=>o.value===value)){el.value=value}else{let opt=document.createElement('option');opt.value=value;opt.textContent=value;el.appendChild(opt);el.value=value}}
+    function renderBindAddressOptions(){
+      let values=['127.0.0.1','0.0.0.0','::',...lanAddresses.map(item=>String(item.address)).filter(Boolean)];
+      values=[...new Set(values)];
+      bindSelectIds.forEach(id=>{
+        let el=document.getElementById(id), current=el.value;
+        el.innerHTML=values.map(value=>`<option value="${esc(value)}">${esc(value)}</option>`).join('');
+        if(current)setSelect(id,current);
+      });
+    }
     function routeIpArray(v){return Array.isArray(v)?v.map(String).filter(Boolean):[]}
     function clientLabel(ip){
       let c=dhcpClients.find(x=>String(x.ip)===String(ip));
@@ -1875,14 +2016,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function selectedClientIps(cls){return [...document.querySelectorAll('input.'+cls+':checked')].map(el=>el.value)}
     function serverFormHtml(server,index){
       let method=server.method||'aes-256-gcm';
-      let opts=methodOptions.map(m=>`<option ${m===method?'selected':''}>${esc(m)}</option>`).join('');
       return `<fieldset class="server-block" data-index="${index}">
         <div class="server-head"><strong>Server ${index+1}</strong></div>
         <div class="form-line"><label>Enable</label><input class="server-enabled" type="checkbox" ${server.disabled===true?'':'checked'}></div>
         <div class="form-line"><label>Server Address</label><input class="server-host" value="${esc(server.server||'')}"></div>
         <div class="form-line"><label>Server Port</label><input class="server-port" type="number" min="1" max="65535" value="${esc(server.server_port||443)}"></div>
-        <div class="form-line"><label>Method</label><select class="server-method">${opts}</select></div>
-        <div class="form-line"><label>Password</label><input class="server-secret" name="ss-server-secret-${index}" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" data-lpignore="true" data-1p-ignore="true" value="${esc(server.password||'')}"></div>
+        <input class="server-method" type="hidden" value="${esc(method)}">
+        <input class="server-secret" name="ss-server-secret-${index}" type="hidden" autocomplete="off" autocapitalize="none" spellcheck="false" data-lpignore="true" data-1p-ignore="true" value="${esc(server.password||'')}">
         <div class="form-line"><label>Timeout Seconds</label><input class="server-timeout" type="number" min="1" value="${esc(server.timeout||300)}"></div>
         <div class="form-line"><label>Plugin Path</label><input class="server-plugin" value="${esc(server.plugin||'')}"></div>
         <div class="form-line"><label>Plugin Options</label><input class="server-plugin-opts" value="${esc(server.plugin_opts||'')}"></div>
@@ -1910,17 +2050,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
         return server;
       }).filter(server=>server.server);
     }
-    function addServerForm(){
-      let servers=readServerForms();
-      let base=servers[servers.length-1]||{};
-      servers.push({server:'',server_port:base.server_port||443,password:base.password||'',timeout:base.timeout||300,method:base.method||'aes-256-gcm',disabled:false,plugin:base.plugin||'',plugin_opts:base.plugin_opts||''});
-      currentRawConfig.servers=servers;
-      renderServerList();
-      updateClientJson();
-    }
     function renderBasic(){
       let socks=firstLocal('socks'), futu=futuSocksLocal(), http=firstLocal('http'), redir=firstLocal('redir'), tun=firstLocal('tun'), dns=firstLocal('dns');
       let routeRules=currentRawConfig.route_rules||{};
+      renderBindAddressOptions();
       setSelect('socksBind',socks.local_address||'127.0.0.1'); socksPort.value=socks.local_port||1080;
       setSelect('futuSocksBind',futu.local_address||socks.local_address||'0.0.0.0'); futuSocksPort.value=futu.local_port||1082;
       setSelect('httpBind',http.local_address||'127.0.0.1'); httpPort.value=http.local_port||1081;
@@ -1928,7 +2061,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       renderClientPolicyLists(routeRules);
       redirEnable.checked=!!(redir.protocol||tun.protocol)&&(redir.disabled!==true&&tun.disabled!==true);
       setSelect('redirBind',redir.local_address||'0.0.0.0'); redirPort.value=redir.local_port||12345;
-      setSelect('redirMode',redir.mode||tun.mode||'tcp_and_udp');
+      redirMode.value=redir.mode||tun.mode||'tcp_and_udp';
       tunName.value=tun.tun_interface_name||'shadowsocks-tun';
       tunAddress.value=tun.tun_interface_address||'10.255.0.1/24';
       tunDestination.value=tun.tun_interface_destination||'10.255.0.2/24';
@@ -2006,7 +2139,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       return {host:text.replace(/^\[|\]$/g,''),port:portDefault};
     }
-    function updateClientJson(){clientConfig.value=JSON.stringify(buildClientConfig(),null,2)}
+    function syncClientJsonHeight(){
+      let layout=document.querySelector('.basic-layout'), left=document.getElementById('basicFormPanel'), panel=document.getElementById('serverPanel'), jsonPanel=document.getElementById('basicJsonPanel');
+      if(!layout||!left||!panel||!jsonPanel)return;
+      if(Math.abs(left.getBoundingClientRect().top-panel.getBoundingClientRect().top)>2||Math.abs(left.getBoundingClientRect().top-jsonPanel.getBoundingClientRect().top)>2){
+        layout.style.removeProperty('--basic-sync-height');
+        return;
+      }
+      layout.style.setProperty('--basic-sync-height',Math.ceil(left.scrollHeight)+'px');
+    }
+    function updateClientJson(){clientConfig.value=JSON.stringify(buildClientConfig(),null,2);syncClientJsonHeight()}
     async function loadClientConfig(){
       await platform();
       setBinaryCommit();
@@ -2015,10 +2157,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       currentRawConfig.locals=currentRawConfig.locals||[];
       currentRawConfig.servers=currentRawConfig.servers||[];
       currentRawConfig.route_rules=currentRawConfig.route_rules||{};
+      try{lanAddresses=await api('/api/lan/addresses?cache='+Date.now(),{cache:'no-store'})}catch(e){lanAddresses=[]}
       try{dhcpClients=await api('/api/lan/dhcp-clients?cache='+Date.now(),{cache:'no-store'})}catch(e){dhcpClients=[]}
       renderBasic();
     }
-    function setBinaryCommit(){let el=document.getElementById('binaryCommit');if(el)el.textContent='build commit '+((servicePlatform&&servicePlatform.git_commit)||'unknown')}
+    function setBinaryCommit(){let el=document.getElementById('binaryCommit');if(el){let commit=(servicePlatform&&servicePlatform.git_commit)||'unknown',time=(servicePlatform&&servicePlatform.git_commit_time_bj)||'unknown';el.textContent='commit '+commit+' | '+time}}
     async function openNftRulesetModal(){
       nftModal.classList.add('open');
       await loadNftRuleset();
@@ -2069,9 +2212,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
         setRestartControls(false);
       }
     }
-    async function saveClientConfig(){if(restartInProgress)return;updateClientJson();setRestartControls(true);configPath.textContent='saving config...';try{await api('/api/client-config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:clientConfig.value})})}catch(e){configPath.textContent='save failed: '+e.message;setRestartControls(false);return}configPath.textContent='saved, restarting service...';await waitForRestartComplete(currentConfigPath+' saved and service restarted')}
+    async function saveClientConfig(){if(restartInProgress)return;updateClientJson();setRestartControls(true);configPath.textContent='saving config...';let r;try{r=await api('/api/client-config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:clientConfig.value})})}catch(e){configPath.textContent='save failed: '+e.message;setRestartControls(false);return}if(r.unchanged){configPath.textContent=currentConfigPath+' unchanged';alert('No config changes');setRestartControls(false);return}configPath.textContent='saved, restarting service...';await waitForRestartComplete(currentConfigPath+' saved and service restarted')}
     async function restartService(){if(restartInProgress)return;setRestartControls(true);configPath.textContent='restarting service...';try{await api('/api/restart',{method:'POST'})}catch(e){console.warn(e)}await waitForRestartComplete('service restarted')}
-    ['socksBind','socksPort','futuSocksBind','futuSocksPort','httpBind','httpPort','redirEnable','globalProxy','redirBind','redirPort','redirMode','tunName','tunAddress','tunDestination','dnsEnable','dnsBind','dnsPort','dnsDomestic','dnsForeign','dnsCacheCapacity','dnsCacheTtl','dnsCacheRefreshEnabled','dnsCacheRefreshBatch','dnsInterceptMode','dnsIpv4Only'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
+    ['socksBind','socksPort','futuSocksBind','futuSocksPort','httpBind','httpPort','redirEnable','globalProxy','redirBind','redirPort','tunName','tunAddress','tunDestination','dnsEnable','dnsBind','dnsPort','dnsDomestic','dnsForeign','dnsCacheCapacity','dnsCacheTtl','dnsCacheRefreshEnabled','dnsCacheRefreshBatch','dnsInterceptMode','dnsIpv4Only'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
     setTimeout(()=>{serverList.addEventListener('input',updateClientJson);serverList.addEventListener('change',updateClientJson)},0);
 
     async function loadRules(){
@@ -2160,7 +2303,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function renderDns(){recentDnsRows=await api('/api/activity/dns'+activitySourceParam());renderDnsTable()}
     async function renderRouteConflicts(){await renderConflicts('domainOut','/api/conflicts/domain');await renderConflicts('ipOut','/api/conflicts/ip')}
     function nftCountsHtml(s){let c=s.nft_set_counts||{};if(!c.checked)return '';if(c.error)return `<p><strong>nft set entries:</strong> <span class="status-warn">unavailable</span> <span class="hint">${esc(c.error)}</span></p>`;let rows=[{set:'direct4',entries:c.direct4},{set:'direct6',entries:c.direct6},{set:'proxy4',entries:c.proxy4},{set:'proxy6',entries:c.proxy6}];return `<p><strong>nft set entries:</strong> ${c.total??0} total, ${c.proxy_total??0} proxy, ${c.direct_total??0} direct</p>`+table(rows,[['Set',r=>r.set],['Entries',r=>r.entries??0]])}
-    async function renderSys(){let s=await api('/api/sys/status');let ip=(s.ip_conflicts||[]),domain=(s.domain_conflicts||[]);let uptime=`<p><strong>Process uptime:</strong> ${fmtDuration(s.process_uptime_seconds)}</p>`;let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=uptime+`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=uptime+`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p>${nftCountsHtml(s)}<p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body+`<h3 class="card-title">direct_ip.txt / proxy_ip.txt Conflicts</h3>${ip.length?'<pre>'+ip.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}<h3 class="card-title">direct_domain.txt / proxy_domain.txt Conflicts</h3>${domain.length?'<pre>'+domain.join('\\n')+'</pre>':'<p class="hint">No conflicts</p>'}`}
+    async function renderSys(){let s=await api('/api/sys/status');let uptime=`<p><strong>Process uptime:</strong> ${fmtDuration(s.process_uptime_seconds)}</p>`;let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=uptime+`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=uptime+`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p>${nftCountsHtml(s)}<p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body}
     async function debugUrlCheck(mode){let [input,out]=debugEls(mode);let url=input.value.trim();if(!url){out.innerHTML='<p class="hint">Enter a URL first</p>';return}out.innerHTML='<p class="hint">Running debug, timeout 6s...</p>';let r=await api('/api/sys/debug-url',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url,mode})});out.innerHTML=debugCommand(r)+table([r],debugUrlColumns(mode))}
     async function debugIpCheck(){let query=debugIp.value.trim();if(!query){debugIpOut.innerHTML='<p class="hint">Enter an IP or CIDR first</p>';return}let r=await api('/api/sys/debug-ip',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query})});debugIpOut.innerHTML=table([r],[['Query',x=>x.query],['Valid',x=>x.valid?'yes':'no'],['proxy_ip.txt',x=>x.proxy_file?'yes':'no'],['proxy Matches',x=>(x.proxy_file_matches||[]).join('<br>')||'-'],['NFT Checked',x=>x.nft_checked?'yes':'no'],['NFT proxy',x=>x.nft_proxy?'yes':'no'],['NFT Matches',x=>(x.nft_matches||[]).join('<br>')||'-'],['Error',x=>err(x.error||x.nft_error)]])}
     async function queryDnsCache(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheOut.innerHTML='<p class="hint">Enter a domain</p>';return}let rows=await api('/api/dns/cache/query?domain='+encodeURIComponent(domain));let type=dnsQueryType.value;rows=rows.filter(r=>!type||r.query_type===type);dnsCacheOut.innerHTML=table(rows,[['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Results',r=>(r.results||[]).join('<br>')],['Expires',r=>fmtTime(r.expires_at)]])}
@@ -2169,7 +2312,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function clearDnsAll(){let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';dnsCacheOut.innerHTML=''}
     async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='routeConfig')await reloadRouteTab();if(id==='sys')await renderSys();if(id==='connections'){updateActivityPauseButton();if(activityPaused)return;let s=await syncActivityRecordStatus();if(s.recording){await renderDns();await renderConnections()}}}catch(e){alert(e.message)}}
     document.querySelector("nav button[data-tab=\"basic\"]").classList.add('active');
-    window.addEventListener('resize',updateNavIndicator);
+    window.addEventListener('resize',()=>{updateNavIndicator();syncClientJsonHeight()});
     requestAnimationFrame(updateNavIndicator);
     refreshProcessUptime();
     setInterval(refreshProcessUptime,1000);
