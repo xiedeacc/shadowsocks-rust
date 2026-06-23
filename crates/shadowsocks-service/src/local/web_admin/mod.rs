@@ -1502,14 +1502,21 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .connections-layout{height:100%;min-height:0;flex:1;overflow:hidden;display:flex;flex-direction:column;gap:2px}
     .connections-layout .activity-toolbar{margin:0;flex:0 0 auto}
     .connections-layout .activity-grid{flex:0 0 clamp(360px,58vh,600px);grid-template-rows:minmax(0,1fr);min-height:360px}
-    .basic-layout{display:grid;grid-template-columns:minmax(340px,460px) minmax(0,1fr) minmax(0,1fr);gap:18px;align-items:stretch;height:calc(100% - 46px);min-height:0}
-    .basic-form-panel{overflow:auto;min-height:0}
+    .basic-layout{display:grid;grid-template-columns:minmax(330px,430px) minmax(330px,430px) minmax(0,1fr);gap:18px;align-items:stretch;height:calc(100% - 46px);min-height:0}
+    .basic-form-panel,.basic-side-panel{overflow:auto;min-height:0}
     .basic-json-panel{display:flex;flex-direction:column;min-height:0}
     .basic-json-panel textarea{flex:1}
-    .basic-nft-panel{display:flex;flex-direction:column;min-height:0}
-    .basic-nft-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
-    .basic-nft-head .card-title{margin:8px 0 5px}
-    .basic-nft-head button{margin:0}
+    .server-block{position:relative}
+    .server-head{display:flex;align-items:center;gap:8px;margin-bottom:5px}
+    .server-head strong{color:var(--brand2);font-size:13px}
+    .server-actions{display:flex;justify-content:flex-end}
+    .server-actions button{margin:0}
+    .modal-backdrop{display:none;position:fixed;inset:0;z-index:100;background:#10203399;padding:24px;box-sizing:border-box}
+    .modal-backdrop.open{display:flex;align-items:stretch;justify-content:center}
+    .modal-panel{display:flex;flex-direction:column;width:min(1200px,100%);min-height:0;background:var(--panel);border-radius:10px;border:1px solid var(--line);box-shadow:0 18px 40px #10203355;padding:12px}
+    .modal-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+    .modal-head .card-title{margin:0}
+    .modal-head button{margin:0}
     .nft-ruleset{flex:1;min-height:0;margin:0;overflow:auto;padding:9px;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:0 1px 2px #10203312;font-family:ui-monospace,monospace;font-size:12px;white-space:pre;color:var(--ink)}
     .basic-actions{margin-top:8px}
     .binary-commit{text-align:center;color:var(--muted);font-size:12px;margin-top:6px;font-family:ui-monospace,monospace}
@@ -1571,8 +1578,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     @media(max-width:1000px){.rules-workspace{grid-template-columns:1fr}}
     @media(max-width:1100px){.activity-grid,.route-rules-layout{grid-template-columns:1fr}.activity-grid{grid-template-rows:repeat(4,minmax(0,1fr))}.connections-layout .activity-grid{grid-template-rows:repeat(2,minmax(0,1fr))}}
     @media(max-width:700px){nav{justify-content:flex-start;gap:10px}.process-uptime{position:static;transform:none;margin-left:auto;min-width:0}}
-    @media(max-width:1200px){.basic-layout{grid-template-columns:minmax(320px,420px) minmax(0,1fr);grid-auto-rows:minmax(0,1fr)}.basic-nft-panel{grid-column:1 / -1}}
-    @media(max-width:900px){.basic-layout{grid-template-columns:1fr}#clientConfig{height:auto;max-height:none}.basic-nft-panel{grid-column:auto}}
+    @media(max-width:1200px){.basic-layout{grid-template-columns:minmax(320px,420px) minmax(0,1fr);grid-auto-rows:minmax(0,1fr)}.basic-json-panel{grid-column:1 / -1}}
+    @media(max-width:900px){.basic-layout{grid-template-columns:1fr}#clientConfig{height:auto;max-height:none}.basic-json-panel{grid-column:auto}}
   </style>
 </head>
 <body>
@@ -1593,38 +1600,23 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <div class="basic-form-panel">
         <h3 class="card-title">SOCKS Local</h3>
         <fieldset>
-          <div class="form-line"><label>Bind Address</label><select id="socksBind"><option>127.0.0.1</option><option>0.0.0.0</option></select></div>
+          <div class="form-line"><label>Bind Address</label><select id="socksBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
           <div class="form-line"><label>Port</label><input id="socksPort" type="number" min="1" max="65535"></div>
         </fieldset>
         <h3 class="card-title">Futu SOCKS Local</h3>
         <fieldset>
-          <div class="form-line"><label>Bind Address</label><select id="futuSocksBind"><option>127.0.0.1</option><option>0.0.0.0</option></select></div>
+          <div class="form-line"><label>Bind Address</label><select id="futuSocksBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
           <div class="form-line"><label>Port</label><input id="futuSocksPort" type="number" min="1" max="65535" value="1082"></div>
         </fieldset>
         <h3 class="card-title">HTTP Local</h3>
         <fieldset>
-          <div class="form-line"><label>Bind Address</label><select id="httpBind"><option>127.0.0.1</option><option>0.0.0.0</option></select></div>
+          <div class="form-line"><label>Bind Address</label><select id="httpBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
           <div class="form-line"><label>Port</label><input id="httpPort" type="number" min="1" max="65535"></div>
-        </fieldset>
-        <h3 class="card-title">Transparent Proxy</h3>
-        <fieldset>
-          <div class="form-line"><label>Enable Redir</label><input id="redirEnable" type="checkbox"></div>
-          <div class="form-line"><label>Global Proxy</label><input id="globalProxy" type="checkbox"></div>
-          <div class="form-line"><label>Global Proxy Client</label><div id="clientGlobalProxyList" class="client-list"></div></div>
-          <div class="form-line"><label>Direct Client</label><div id="clientDirectList" class="client-list"></div></div>
-          <div class="form-line"><label>Bind Address</label><select id="redirBind"><option>127.0.0.1</option><option>0.0.0.0</option></select></div>
-          <div class="form-line"><label>Port</label><input id="redirPort" type="number" min="1" max="65535"></div>
-          <div class="form-line"><label>Mode</label><select id="redirMode"><option>tcp_only</option><option>tcp_and_udp</option></select></div>
-          <div class="form-line"><label>TCP Redir</label><select id="tcpRedir"><option>redirect</option><option>tproxy</option></select></div>
-          <div class="form-line"><label>UDP Redir</label><select id="udpRedir"><option>tproxy</option></select></div>
-          <div class="form-line tun-field"><label>TUN Name</label><input id="tunName" placeholder="shadowsocks-tun"></div>
-          <div class="form-line tun-field"><label>TUN Address</label><input id="tunAddress" placeholder="10.255.0.1/24"></div>
-          <div class="form-line tun-field"><label>TUN Destination</label><input id="tunDestination" placeholder="10.255.0.2/24"></div>
         </fieldset>
         <h3 class="card-title">DNS Listener</h3>
         <fieldset>
           <div class="form-line"><label>Enable DNS</label><input id="dnsEnable" type="checkbox"></div>
-          <div class="form-line"><label>Bind Address</label><select id="dnsBind"><option>127.0.0.1</option><option>0.0.0.0</option></select></div>
+          <div class="form-line"><label>Bind Address</label><select id="dnsBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
           <div class="form-line"><label>Port</label><input id="dnsPort" type="number" min="1" max="65535"></div>
           <div class="form-line"><label>Domestic DNS</label><input id="dnsDomestic" placeholder="223.5.5.5:53"></div>
           <div class="form-line"><label>Foreign DNS</label><input id="dnsForeign" placeholder="8.8.8.8:53"></div>
@@ -1635,38 +1627,46 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="form-line"><label>Intercept Mode</label><select id="dnsInterceptMode"><option>off</option><option>firewall</option><option>tun</option><option>both</option></select></div>
           <div class="form-line"><label title="Strip AAAA records from DNS responses. Avoids browser happy-eyeballs delay on hosts without working public IPv6.">Address Family</label><select id="dnsIpv4Only"><option value="true">IPv4 only (recommended)</option><option value="false">IPv4 + IPv6</option></select></div>
         </fieldset>
-        <h3 class="card-title">Server</h3>
+      </div>
+      <div class="basic-side-panel">
+        <h3 class="card-title">Transparent Proxy</h3>
         <fieldset>
-          <div class="form-line"><label>Server Address</label><input id="serverHost"></div>
-          <div class="form-line"><label>Server Port</label><input id="serverPort" type="number" min="1" max="65535"></div>
-          <div class="form-line"><label>Method</label><select id="method">
-            <option>aes-128-gcm</option><option>aes-256-gcm</option><option>chacha20-ietf-poly1305</option>
-            <option>2022-blake3-aes-128-gcm</option><option>2022-blake3-aes-256-gcm</option>
-          </select></div>
-          <div class="form-line"><label>Password</label><input id="serverSecret" name="ss-server-secret" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" data-lpignore="true" data-1p-ignore="true"></div>
-          <div class="form-line"><label>Timeout Seconds</label><input id="timeout" type="number" min="1"></div>
-          <div class="form-line"><label>Plugin Path</label><input id="plugin"></div>
-          <div class="form-line"><label>Plugin Options</label><input id="pluginOpts"></div>
+          <div class="form-line"><label>Enable Redir</label><input id="redirEnable" type="checkbox"></div>
+          <div class="form-line"><label>Global Proxy</label><input id="globalProxy" type="checkbox"></div>
+          <div class="form-line"><label>Global Proxy Client</label><div id="clientGlobalProxyList" class="client-list"></div></div>
+          <div class="form-line"><label>Direct Client</label><div id="clientDirectList" class="client-list"></div></div>
+          <div class="form-line"><label>Bind Address</label><select id="redirBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
+          <div class="form-line"><label>Port</label><input id="redirPort" type="number" min="1" max="65535"></div>
+          <div class="form-line"><label>Mode</label><select id="redirMode"><option>tcp_only</option><option>tcp_and_udp</option></select></div>
+          <div class="form-line tun-field"><label>TUN Name</label><input id="tunName" placeholder="shadowsocks-tun"></div>
+          <div class="form-line tun-field"><label>TUN Address</label><input id="tunAddress" placeholder="10.255.0.1/24"></div>
+          <div class="form-line tun-field"><label>TUN Destination</label><input id="tunDestination" placeholder="10.255.0.2/24"></div>
         </fieldset>
+        <h3 class="card-title">Server</h3>
+        <div id="serverList"></div>
+        <div class="server-actions"><button type="button" onclick="addServerForm()">Add Server</button></div>
       </div>
       <div class="basic-json-panel">
         <h3 class="card-title">Generated JSON</h3>
         <textarea id="clientConfig"></textarea>
-      </div>
-      <div class="basic-nft-panel">
-        <div class="basic-nft-head">
-          <h3 class="card-title">nft list ruleset</h3>
-          <button type="button" id="nftRulesetRefresh" onclick="loadNftRuleset(true)">Refresh</button>
-        </div>
-        <pre id="nftRuleset" class="nft-ruleset"></pre>
       </div>
     </div>
     <div class="basic-actions">
       <button id="reloadButton" onclick="loadClientConfig()">Reload</button>
       <button id="saveButton" onclick="saveClientConfig()">Save</button>
       <button id="restartButton" onclick="restartService()">Restart</button>
+      <button id="nftRulesetRefresh" onclick="openNftRulesetModal()">nft table</button>
     </div>
     <div id="binaryCommit" class="binary-commit"></div>
+    <div id="nftModal" class="modal-backdrop" onclick="closeNftRulesetModal(event)">
+      <div class="modal-panel" onclick="event.stopPropagation()">
+        <div class="modal-head">
+          <h3 class="card-title">nft list ruleset</h3>
+          <button type="button" onclick="closeNftRulesetModal()">Close</button>
+        </div>
+        <pre id="nftRuleset" class="nft-ruleset"></pre>
+      </div>
+    </div>
   </section>
 
   <section id="connections" class="tab">
@@ -1818,7 +1818,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function num(v,d){let n=parseInt(v,10);return Number.isFinite(n)?n:d}
     function firstLocal(protocol){return (currentRawConfig.locals||[]).find(l=>l.protocol===protocol&&!l.record_proxy_ip)||{}}
     function futuSocksLocal(){return (currentRawConfig.locals||[]).find(l=>l.protocol==='socks'&&l.record_proxy_ip)||{}}
-    function firstServer(){return (currentRawConfig.servers||[])[0]||{}}
+    const methodOptions=['aes-128-gcm','aes-256-gcm','chacha20-ietf-poly1305','2022-blake3-aes-128-gcm','2022-blake3-aes-256-gcm'];
     function setSelect(id,value){let el=document.getElementById(id); if([...el.options].some(o=>o.value===value)){el.value=value}else{el.value=el.options[0].value}}
     function routeIpArray(v){return Array.isArray(v)?v.map(String).filter(Boolean):[]}
     function clientLabel(ip){
@@ -1873,8 +1873,53 @@ const INDEX_HTML: &str = r#"<!doctype html>
       updateClientJson();
     }
     function selectedClientIps(cls){return [...document.querySelectorAll('input.'+cls+':checked')].map(el=>el.value)}
+    function serverFormHtml(server,index){
+      let method=server.method||'aes-256-gcm';
+      let opts=methodOptions.map(m=>`<option ${m===method?'selected':''}>${esc(m)}</option>`).join('');
+      return `<fieldset class="server-block" data-index="${index}">
+        <div class="server-head"><strong>Server ${index+1}</strong></div>
+        <div class="form-line"><label>Enable</label><input class="server-enabled" type="checkbox" ${server.disabled===true?'':'checked'}></div>
+        <div class="form-line"><label>Server Address</label><input class="server-host" value="${esc(server.server||'')}"></div>
+        <div class="form-line"><label>Server Port</label><input class="server-port" type="number" min="1" max="65535" value="${esc(server.server_port||443)}"></div>
+        <div class="form-line"><label>Method</label><select class="server-method">${opts}</select></div>
+        <div class="form-line"><label>Password</label><input class="server-secret" name="ss-server-secret-${index}" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" data-lpignore="true" data-1p-ignore="true" value="${esc(server.password||'')}"></div>
+        <div class="form-line"><label>Timeout Seconds</label><input class="server-timeout" type="number" min="1" value="${esc(server.timeout||300)}"></div>
+        <div class="form-line"><label>Plugin Path</label><input class="server-plugin" value="${esc(server.plugin||'')}"></div>
+        <div class="form-line"><label>Plugin Options</label><input class="server-plugin-opts" value="${esc(server.plugin_opts||'')}"></div>
+      </fieldset>`;
+    }
+    function renderServerList(){
+      let servers=(currentRawConfig.servers||[]).length?currentRawConfig.servers:[{}];
+      serverList.innerHTML=servers.map((server,index)=>serverFormHtml(server,index)).join('');
+    }
+    function readServerForms(){
+      let blocks=[...document.querySelectorAll('.server-block')];
+      return blocks.map(block=>{
+        let server={
+          server:block.querySelector('.server-host').value.trim(),
+          server_port:num(block.querySelector('.server-port').value,443),
+          password:block.querySelector('.server-secret').value,
+          timeout:num(block.querySelector('.server-timeout').value,300),
+          method:block.querySelector('.server-method').value,
+          disabled:!block.querySelector('.server-enabled').checked
+        };
+        let plugin=block.querySelector('.server-plugin').value.trim();
+        let pluginOpts=block.querySelector('.server-plugin-opts').value.trim();
+        if(plugin)server.plugin=plugin;
+        if(pluginOpts)server.plugin_opts=pluginOpts;
+        return server;
+      }).filter(server=>server.server);
+    }
+    function addServerForm(){
+      let servers=readServerForms();
+      let base=servers[servers.length-1]||{};
+      servers.push({server:'',server_port:base.server_port||443,password:base.password||'',timeout:base.timeout||300,method:base.method||'aes-256-gcm',disabled:false,plugin:base.plugin||'',plugin_opts:base.plugin_opts||''});
+      currentRawConfig.servers=servers;
+      renderServerList();
+      updateClientJson();
+    }
     function renderBasic(){
-      let socks=firstLocal('socks'), futu=futuSocksLocal(), http=firstLocal('http'), redir=firstLocal('redir'), tun=firstLocal('tun'), dns=firstLocal('dns'), server=firstServer();
+      let socks=firstLocal('socks'), futu=futuSocksLocal(), http=firstLocal('http'), redir=firstLocal('redir'), tun=firstLocal('tun'), dns=firstLocal('dns');
       let routeRules=currentRawConfig.route_rules||{};
       setSelect('socksBind',socks.local_address||'127.0.0.1'); socksPort.value=socks.local_port||1080;
       setSelect('futuSocksBind',futu.local_address||socks.local_address||'0.0.0.0'); futuSocksPort.value=futu.local_port||1082;
@@ -1883,7 +1928,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       renderClientPolicyLists(routeRules);
       redirEnable.checked=!!(redir.protocol||tun.protocol)&&(redir.disabled!==true&&tun.disabled!==true);
       setSelect('redirBind',redir.local_address||'0.0.0.0'); redirPort.value=redir.local_port||12345;
-      setSelect('redirMode',redir.mode||tun.mode||'tcp_and_udp'); setSelect('tcpRedir',redir.tcp_redir||'redirect'); setSelect('udpRedir',redir.udp_redir||'tproxy');
+      setSelect('redirMode',redir.mode||tun.mode||'tcp_and_udp');
       tunName.value=tun.tun_interface_name||'shadowsocks-tun';
       tunAddress.value=tun.tun_interface_address||'10.255.0.1/24';
       tunDestination.value=tun.tun_interface_destination||'10.255.0.2/24';
@@ -1902,8 +1947,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       dnsCacheRefreshEnabled.checked=routeRules.dns_cache_refresh_enabled!==false;
       dnsCacheRefreshBatch.value=routeRules.dns_cache_refresh_batch_size||500;
       setSelect('dnsIpv4Only', (routeRules.dns_ipv4_only===false ? 'false' : 'true'));
-      serverHost.value=server.server||''; serverPort.value=server.server_port||443; setSelect('method',server.method||'aes-256-gcm');
-      serverSecret.value=server.password||''; timeout.value=server.timeout||300; plugin.value=server.plugin||''; pluginOpts.value=server.plugin_opts||'';
+      renderServerList();
       updateClientJson();
     }
     function buildClientConfig(){
@@ -1916,10 +1960,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
         {local_address:futuSocksBind.value,local_port:num(futuSocksPort.value,1082),protocol:'socks',record_proxy_ip:true},
         {local_address:httpBind.value,local_port:num(httpPort.value,1081),protocol:'http'}
       ];
+      const existingRedir=firstLocal('redir');
       if(isWindowsService()){
         locals.push({disabled:!wantsRedir,protocol:'tun',mode:redirMode.value,tun_interface_name:tunName.value.trim()||'shadowsocks-tun',tun_interface_address:tunAddress.value.trim()||'10.255.0.1/24',tun_interface_destination:tunDestination.value.trim()||'10.255.0.2/24'});
       }else{
-        locals.push({disabled:!wantsRedir,local_address:redirBind.value,local_port:num(redirPort.value,12345),protocol:'redir',mode:redirMode.value,tcp_redir:tcpRedir.value,udp_redir:udpRedir.value});
+        locals.push({disabled:!wantsRedir,local_address:redirBind.value,local_port:num(redirPort.value,12345),protocol:'redir',mode:redirMode.value,tcp_redir:existingRedir.tcp_redir||'redirect',udp_redir:existingRedir.udp_redir||'tproxy'});
       }
       const windowsTun=wantsRedir&&isWindowsService();
       let routeRules=Object.assign({},currentRawConfig.route_rules||{});
@@ -1941,16 +1986,21 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const dnsPortValue=windowsTun?53:num(dnsPort.value,1053);
       const dnsBindValue=windowsTun?'0.0.0.0':dnsBind.value;
       locals.push({disabled:!wantsDns,local_address:dnsBindValue,local_port:dnsPortValue,protocol:'dns',mode:'tcp_and_udp',local_dns_address:domestic.host,local_dns_port:domestic.port,remote_dns_address:foreign.host,remote_dns_port:foreign.port,client_cache_size:64});
-      let server={server:serverHost.value.trim(),server_port:num(serverPort.value,443),password:serverSecret.value,timeout:num(timeout.value,300),method:method.value};
-      if(plugin.value.trim())server.plugin=plugin.value.trim();
-      if(pluginOpts.value.trim())server.plugin_opts=pluginOpts.value.trim();
-      return Object.assign({},currentRawConfig,{locals,servers:[server],route_rules:routeRules});
+      let servers=readServerForms();
+      return Object.assign({},currentRawConfig,{locals,servers,route_rules:routeRules});
     }
     function parseHostPort(value,hostDefault,portDefault){
       let text=(value||'').trim();
       if(!text)return {host:hostDefault,port:portDefault};
+      if(text.startsWith('[')){
+        let end=text.indexOf(']');
+        if(end>0){
+          let port=text[end+1]===':'?parseInt(text.slice(end+2),10):NaN;
+          return {host:text.slice(1,end),port:Number.isFinite(port)?port:portDefault};
+        }
+      }
       let idx=text.lastIndexOf(':');
-      if(idx>0&&text.indexOf(']')<idx){
+      if(idx>0&&text.indexOf(':')===idx){
         let port=parseInt(text.slice(idx+1),10);
         if(Number.isFinite(port))return {host:text.slice(0,idx).replace(/^\[|\]$/g,''),port};
       }
@@ -1960,7 +2010,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function loadClientConfig(){
       await platform();
       setBinaryCommit();
-      let r=await api('/api/client-config'); currentConfigPath=r.path; configPath.textContent=r.path;
+      let r=await api('/api/client-config?cache='+Date.now(),{cache:'no-store'}); currentConfigPath=r.path; configPath.textContent=r.path;
       try{currentRawConfig=r.parsed||(r.content?JSON.parse(r.content):{})}catch(e){currentRawConfig={locals:[],servers:[]}}
       currentRawConfig.locals=currentRawConfig.locals||[];
       currentRawConfig.servers=currentRawConfig.servers||[];
@@ -1969,16 +2019,21 @@ const INDEX_HTML: &str = r#"<!doctype html>
       renderBasic();
     }
     function setBinaryCommit(){let el=document.getElementById('binaryCommit');if(el)el.textContent='build commit '+((servicePlatform&&servicePlatform.git_commit)||'unknown')}
-    let nftRulesetLoaded=false;
-    async function loadNftRuleset(force){
+    async function openNftRulesetModal(){
+      nftModal.classList.add('open');
+      await loadNftRuleset();
+    }
+    function closeNftRulesetModal(event){
+      if(event&&event.target!==nftModal)return;
+      nftModal.classList.remove('open');
+    }
+    async function loadNftRuleset(){
       let pre=document.getElementById('nftRuleset');if(!pre)return;
-      if(nftRulesetLoaded&&!force)return;
       let btn=document.getElementById('nftRulesetRefresh');if(btn)btn.disabled=true;
-      if(force||!pre.textContent)pre.textContent='loading...';
+      pre.textContent='loading...';
       try{
-        let r=await api('/api/nft/ruleset'+(force?'?refresh=1':''));
+        let r=await api('/api/nft/ruleset?refresh=1&cache='+Date.now(),{cache:'no-store'});
         pre.textContent=r.ruleset||r.error||'(empty)';
-        nftRulesetLoaded=true;
       }catch(e){pre.textContent='error: '+e.message}
       finally{if(btn)btn.disabled=false}
     }
@@ -2016,7 +2071,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function saveClientConfig(){if(restartInProgress)return;updateClientJson();setRestartControls(true);configPath.textContent='saving config...';try{await api('/api/client-config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:clientConfig.value})})}catch(e){configPath.textContent='save failed: '+e.message;setRestartControls(false);return}configPath.textContent='saved, restarting service...';await waitForRestartComplete(currentConfigPath+' saved and service restarted')}
     async function restartService(){if(restartInProgress)return;setRestartControls(true);configPath.textContent='restarting service...';try{await api('/api/restart',{method:'POST'})}catch(e){console.warn(e)}await waitForRestartComplete('service restarted')}
-    ['socksBind','socksPort','futuSocksBind','futuSocksPort','httpBind','httpPort','redirEnable','globalProxy','redirBind','redirPort','redirMode','tcpRedir','udpRedir','tunName','tunAddress','tunDestination','dnsEnable','dnsBind','dnsPort','dnsDomestic','dnsForeign','dnsCacheCapacity','dnsCacheTtl','dnsCacheRefreshEnabled','dnsCacheRefreshBatch','dnsInterceptMode','dnsIpv4Only','serverHost','serverPort','method','serverSecret','timeout','plugin','pluginOpts'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
+    ['socksBind','socksPort','futuSocksBind','futuSocksPort','httpBind','httpPort','redirEnable','globalProxy','redirBind','redirPort','redirMode','tunName','tunAddress','tunDestination','dnsEnable','dnsBind','dnsPort','dnsDomestic','dnsForeign','dnsCacheCapacity','dnsCacheTtl','dnsCacheRefreshEnabled','dnsCacheRefreshBatch','dnsInterceptMode','dnsIpv4Only'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
+    setTimeout(()=>{serverList.addEventListener('input',updateClientJson);serverList.addEventListener('change',updateClientJson)},0);
 
     async function loadRules(){
       let tmp=await api('/api/temp-rules');
@@ -2118,7 +2174,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
     refreshProcessUptime();
     setInterval(refreshProcessUptime,1000);
     loadClientConfig();
-    loadNftRuleset(false);
   </script>
 </body>
 </html>"#;
