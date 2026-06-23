@@ -1788,10 +1788,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .form-line{display:grid;grid-template-columns:150px 1fr;gap:5px;align-items:center;margin:4px 0}
     .form-line label{margin:0;font-size:13px}
     .form-line input[type=checkbox]{width:16px;height:16px;margin:0;justify-self:start}
-    .client-select{position:relative;min-height:32px}
+    .client-select{position:relative;min-height:32px;min-width:0;width:100%;max-width:100%}
     .client-select-button{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;margin:0;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:#f8fbfe;color:var(--ink);text-align:left}
     .client-select-button:hover{background:#eef6fd;color:var(--ink)}
-    .client-select-button span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .client-select-summary{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .client-select-caret{color:var(--muted);font-size:11px;flex:0 0 auto}
     .client-select-panel{display:none;position:absolute;z-index:30;top:calc(100% + 4px);left:0;right:0;max-height:220px;overflow:auto;border:1px solid var(--line);border-radius:7px;background:#fff;box-shadow:0 8px 22px #10203324;padding:5px}
     .client-select.open .client-select-panel{display:block}
@@ -2089,14 +2089,26 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return clientDisplay(c);
     }
     function clientIps(client){
-      let ips=Array.isArray(client&&client.ips)&&client.ips.length?client.ips:[client&&client.ip];
+      let ips=Array.isArray(client&&client.ips)?client.ips:[];
       ips=ips.map(String).filter(Boolean);
       return [...new Set(ips)].sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+    }
+    function clientPrimaryIp(ips){return ips.find(ip=>ip.includes('.'))||ips[0]||''}
+    function clientFirstIpv6(ips){return ips.find(ip=>ip.includes(':'))||''}
+    function compactIpv6(ip){
+      if(!ip)return '';
+      let parts=ip.split(':').filter(Boolean);
+      return parts.length>4?parts.slice(0,4).join(':')+':...':ip;
     }
     function clientKey(client){return clientIps(client).join('|')}
     function clientDisplay(client){
       let ips=clientIps(client), name=(client&&client.hostname)||'Unknown';
       return (name?name+' ':'')+ips.join(' ');
+    }
+    function clientSummary(client){
+      let ips=clientIps(client), name=(client&&client.hostname)||'Unknown', primary=clientPrimaryIp(ips), firstV6=clientFirstIpv6(ips);
+      let shown=[primary,compactIpv6(firstV6)].filter(Boolean), extra=Math.max(0,ips.length-shown.length);
+      return (name?name+' ':'')+shown.join(' ')+(extra?(' +'+extra):'');
     }
     function clientRowsForPolicy(selectedProxy,selectedDirect){
       let rows=[], knownIps=new Set();
@@ -2104,10 +2116,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
         let ips=clientIps(client);
         if(!ips.length)return;
         ips.forEach(ip=>knownIps.add(ip));
-        rows.push({key:clientKey(client)||('client-'+index),ips,label:clientDisplay(client)});
+        rows.push({key:clientKey(client)||('client-'+index),ips,label:clientDisplay(client),summary:clientSummary(client)});
       });
       [...selectedProxy,...selectedDirect].forEach(ip=>{
-        if(!knownIps.has(ip))rows.push({key:'offline-'+ip,ips:[ip],label:ip+' offline'});
+        if(!knownIps.has(ip))rows.push({key:'offline-'+ip,ips:[ip],label:ip+' offline',summary:ip+' offline'});
       });
       let seen=new Set();
       return rows.filter(row=>{
@@ -2132,7 +2144,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function renderClientPolicyList(id,rows,selected,cls){
       let box=document.getElementById(id);
       box.className='client-select';
-      let options=rows.length?rows.map(row=>`<label class="client-row"><input class="${cls}" type="checkbox" value="${esc(row.key)}" data-ips="${esc(row.ips.join(' '))}" ${row.ips.some(ip=>selected.has(ip))?'checked':''} onchange="onClientPolicyChange(this)"><span title="${esc(row.label)}">${esc(row.label)}</span></label>`).join(''):'<div class="hint" style="padding:6px 7px">No DHCP clients</div>';
+      let options=rows.length?rows.map(row=>`<label class="client-row"><input class="${cls}" type="checkbox" value="${esc(row.key)}" data-ips="${esc(row.ips.join(' '))}" data-summary="${esc(row.summary)}" ${row.ips.some(ip=>selected.has(ip))?'checked':''} onchange="onClientPolicyChange(this)"><span title="${esc(row.label)}">${esc(row.summary)}</span></label>`).join(''):'<div class="hint" style="padding:6px 7px">No DHCP clients</div>';
       box.innerHTML=`<button type="button" class="client-select-button" onclick="toggleClientSelect(event,'${id}')"><span class="client-select-summary"></span><span class="client-select-caret">v</span></button><div class="client-select-panel">${options}</div>`;
       updateClientSelectSummary(id);
     }
@@ -2149,7 +2161,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function updateClientSelectSummary(id){
       let box=document.getElementById(id), summary=box&&box.querySelector('.client-select-summary');
       if(!summary)return;
-      let labels=[...box.querySelectorAll('input[type=checkbox]:checked')].map(el=>el.closest('label').querySelector('span').textContent);
+      let labels=[...box.querySelectorAll('input[type=checkbox]:checked')].map(el=>el.dataset.summary||el.value);
       if(!labels.length){summary.textContent='None';return}
       summary.textContent=labels.length===1?labels[0]:(labels.length+' selected: '+labels.slice(0,2).join(', ')+(labels.length>2?' ...':''));
     }

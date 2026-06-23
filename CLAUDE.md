@@ -2,6 +2,10 @@
 
 This file is shared by Codex (`AGENTS.md`) and Claude Code (`CLAUDE.md`); keep the two identical.
 
+## Compatibility Policy
+
+- Do **not** preserve backward compatibility with older project-specific behavior, config shapes, UI data models, or deployment assumptions unless the user explicitly asks for it.
+
 ## Formatting (read before editing any `.rs`)
 
 The crates are **edition 2024**, `rustfmt.toml` enables **nightly-only** options, and the committed tree is **not** rustfmt-clean. Consequences:
