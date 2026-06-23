@@ -1362,7 +1362,8 @@ impl DnsClient {
             && query.query_type() != RecordType::PTR
         {
             let domain = query.name().to_ascii();
-            if let Some(decision) = routing_state.route_domain_for_source(&domain, source_ip).await {
+            if let Some(route) = routing_state.route_domain_for_source_detail(&domain, source_ip).await {
+                let decision = route.decision;
                 let query_type = query.query_type().to_string();
                 if let Some(cached) = routing_state.dns_cache_lookup(&domain, &query_type, decision).await {
                     let mut cached = cached;
@@ -1372,7 +1373,7 @@ impl DnsClient {
                         "dns route cache hit {} {:?}: resolver={:?}, results={:?}",
                         domain, query.query_type(), decision, ips
                     );
-                    if routing_state.dns_results_need_sync(decision, &ips).await {
+                    if route.update_route_sets && routing_state.dns_results_need_sync(decision, &ips).await {
                         let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
                     }
                     routing_state
@@ -1403,7 +1404,7 @@ impl DnsClient {
                     routing_state
                         .dns_cache_insert(&domain, &query_type, decision, msg.clone(), ips.clone())
                         .await;
-                    if !ips.is_empty() {
+                    if route.update_route_sets && !ips.is_empty() {
                         let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
                     }
                     routing_state

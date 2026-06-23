@@ -137,6 +137,12 @@ pub enum RouteDecision {
     Proxy,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceRouteDecision {
+    pub decision: RouteDecision,
+    pub update_route_sets: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RoutingSources {
     pub geoip_sources: Vec<String>,
@@ -1147,23 +1153,61 @@ impl RoutingState {
         route_domain_inner(&inner, domain)
     }
 
-    /// Resolver decision for a DNS query, honoring per-source overrides (req 2.3).
+    /// Resolver decision for a DNS query, honoring per-source overrides.
     ///
     /// A forced-direct source IP must ALWAYS resolve via the DOMESTIC resolver
     /// (`RouteDecision::Direct`), regardless of `proxy_domain` membership or
     /// `global_proxy`: its data-plane traffic is forced direct at the firewall
     /// (`saddr @client_direct … return`), so handing it foreign/proxy-only IPs
     /// — which it would then try to reach directly — is exactly the geo-split
-    /// mismatch req 2.3 exists to prevent. The check is a tiny linear scan over
-    /// the (usually 0–3 entry) `client_direct_ips` list.
+    /// mismatch req 2.3 exists to prevent.
+    ///
+    /// A forced-proxy source IP must resolve via the FOREIGN resolver when the
+    /// global proxy is not already enabled. Its data-plane traffic is forced
+    /// into redir/tproxy by source IP, so DNS must make the same decision even
+    /// when the domain is unknown or listed as direct.
     pub async fn route_domain_for_source(&self, domain: &str, source_ip: Option<IpAddr>) -> Option<RouteDecision> {
+        self.route_domain_for_source_detail(domain, source_ip)
+            .await
+            .map(|route| route.decision)
+    }
+
+    pub async fn route_domain_for_source_detail(
+        &self,
+        domain: &str,
+        source_ip: Option<IpAddr>,
+    ) -> Option<SourceRouteDecision> {
         let inner = self.inner.read().await;
+        Self::route_domain_for_source_inner(&inner, domain, source_ip)
+    }
+
+    fn route_domain_for_source_inner(
+        inner: &RoutingInner,
+        domain: &str,
+        source_ip: Option<IpAddr>,
+    ) -> Option<SourceRouteDecision> {
+        let base_decision = route_domain_inner(inner, domain);
         if let Some(ip) = source_ip
             && inner.sources.client_direct_ips.contains(&ip)
         {
-            return Some(RouteDecision::Direct);
+            return Some(SourceRouteDecision {
+                decision: RouteDecision::Direct,
+                update_route_sets: base_decision == Some(RouteDecision::Direct),
+            });
         }
-        route_domain_inner(&inner, domain)
+        if let Some(ip) = source_ip
+            && !inner.sources.global_proxy
+            && inner.sources.client_global_proxy_ips.contains(&ip)
+        {
+            return Some(SourceRouteDecision {
+                decision: RouteDecision::Proxy,
+                update_route_sets: base_decision == Some(RouteDecision::Proxy),
+            });
+        }
+        base_decision.map(|decision| SourceRouteDecision {
+            decision,
+            update_route_sets: true,
+        })
     }
 
     /// Whether `source_ip` is configured as a forced-direct client (req 2.3).

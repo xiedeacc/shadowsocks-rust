@@ -401,6 +401,108 @@
     }
 
     #[tokio::test]
+    async fn client_global_proxy_source_uses_proxy_resolver_even_for_direct_domain() {
+        let dir = temp_rules_dir("client-global-proxy-source-dns");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["direct.example".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &[]).unwrap();
+
+        let source_ip = "192.168.2.216".parse().unwrap();
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.client_global_proxy_ips = vec![source_ip];
+        let state = RoutingState::load(config).await.unwrap();
+
+        assert_eq!(
+            state.route_domain_for_source("direct.example", Some(source_ip)).await,
+            Some(RouteDecision::Proxy)
+        );
+        assert_eq!(
+            state.route_domain_for_source("unknown.example", Some(source_ip)).await,
+            Some(RouteDecision::Proxy)
+        );
+        assert_eq!(
+            state.route_domain_for_source("direct.example", None).await,
+            Some(RouteDecision::Direct)
+        );
+    }
+
+    #[tokio::test]
+    async fn global_proxy_still_honors_direct_client_source() {
+        let dir = temp_rules_dir("global-proxy-direct-client-source-dns");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["proxy.example".to_owned()]).unwrap();
+
+        let source_ip = "192.168.2.216".parse().unwrap();
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.global_proxy = true;
+        config.client_global_proxy_ips = vec![source_ip];
+        config.client_direct_ips = vec![source_ip];
+        let state = RoutingState::load(config).await.unwrap();
+
+        assert_eq!(
+            state.route_domain_for_source("proxy.example", Some(source_ip)).await,
+            Some(RouteDecision::Direct)
+        );
+        assert_eq!(
+            state.route_domain_for_source("unknown.example", Some(source_ip)).await,
+            Some(RouteDecision::Direct)
+        );
+        assert_eq!(
+            state.route_domain_for_source("unknown.example", None).await,
+            Some(RouteDecision::Proxy)
+        );
+    }
+
+    #[tokio::test]
+    async fn source_override_dns_results_do_not_update_global_route_sets() {
+        let dir = temp_rules_dir("source-override-dns-no-global-update");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &["direct.example".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(PROXY_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &["proxy.example".to_owned()]).unwrap();
+
+        let source_ip = "192.168.2.216".parse().unwrap();
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir;
+        config.client_global_proxy_ips = vec![source_ip];
+        let state = RoutingState::load(config).await.unwrap();
+
+        assert_eq!(
+            state.route_domain_for_source_detail("direct.example", Some(source_ip)).await,
+            Some(SourceRouteDecision {
+                decision: RouteDecision::Proxy,
+                update_route_sets: false,
+            })
+        );
+        assert_eq!(
+            state.route_domain_for_source_detail("unknown.example", Some(source_ip)).await,
+            Some(SourceRouteDecision {
+                decision: RouteDecision::Proxy,
+                update_route_sets: false,
+            })
+        );
+        assert_eq!(
+            state.route_domain_for_source_detail("proxy.example", Some(source_ip)).await,
+            Some(SourceRouteDecision {
+                decision: RouteDecision::Proxy,
+                update_route_sets: true,
+            })
+        );
+        assert_eq!(
+            state.route_domain_for_source_detail("proxy.example", None).await,
+            Some(SourceRouteDecision {
+                decision: RouteDecision::Proxy,
+                update_route_sets: true,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn global_proxy_does_not_learn_proxy_dns_result_ips() {
         let dir = temp_rules_dir("global-proxy-no-proxy-ip-learning");
         write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
