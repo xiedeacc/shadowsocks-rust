@@ -1318,6 +1318,12 @@ fn setup_tproxy_policy_routing() -> io::Result<()> {
     )?;
     if let Err(err) = command(
         "ip",
+        &["-6", "rule", "add", "fwmark", TPROXY_MARK, "table", TPROXY_TABLE, "priority", "100"],
+    ) {
+        warn!("failed to install IPv6 UDP tproxy policy rule: {}", err);
+    }
+    if let Err(err) = command(
+        "ip",
         &[
             "-6",
             "route",
@@ -1337,6 +1343,7 @@ fn setup_tproxy_policy_routing() -> io::Result<()> {
 
 fn cleanup_tproxy_policy_routing() {
     while command("ip", &["rule", "del", "fwmark", TPROXY_MARK, "table", TPROXY_TABLE]).is_ok() {}
+    while command("ip", &["-6", "rule", "del", "fwmark", TPROXY_MARK, "table", TPROXY_TABLE]).is_ok() {}
     let _ = command(
         "ip",
         &["route", "del", "local", "0.0.0.0/0", "dev", "lo", "table", TPROXY_TABLE],
