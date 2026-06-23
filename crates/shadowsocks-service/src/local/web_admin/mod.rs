@@ -1742,7 +1742,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .connections-layout{height:100%;min-height:0;flex:1;overflow:hidden;display:flex;flex-direction:column;gap:2px}
     .connections-layout .activity-toolbar{margin:0;flex:0 0 auto}
     .connections-layout .activity-grid{flex:0 0 clamp(360px,58vh,600px);grid-template-rows:minmax(0,1fr);min-height:360px}
-    .basic-layout{--basic-control-width:clamp(350px,calc(21vw + 20px),450px);display:grid;grid-template-columns:var(--basic-control-width) var(--basic-control-width) minmax(0,1fr);gap:18px;align-items:start;height:calc(100% - 46px);min-height:0}
+    .basic-layout{--basic-control-width:clamp(370px,calc(21vw + 40px),470px);display:grid;grid-template-columns:var(--basic-control-width) var(--basic-control-width) minmax(0,1fr);gap:18px;align-items:start;height:calc(100% - 46px);min-height:0}
     .basic-form-panel,.basic-side-panel{min-height:0;height:var(--basic-sync-height,auto);box-sizing:border-box}
     .basic-form-panel{overflow:visible}
     #serverPanel{display:flex;flex-direction:column;justify-content:space-between;overflow:visible}
@@ -1820,7 +1820,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     @media(max-width:1000px){.rules-workspace{grid-template-columns:1fr}}
     @media(max-width:1100px){.activity-grid,.route-rules-layout{grid-template-columns:1fr}.activity-grid{grid-template-rows:repeat(4,minmax(0,1fr))}.connections-layout .activity-grid{grid-template-rows:repeat(2,minmax(0,1fr))}}
     @media(max-width:700px){nav{justify-content:flex-start;gap:10px}.process-uptime{position:static;transform:none;margin-left:auto;min-width:0}}
-    @media(max-width:1200px){.basic-layout{--basic-control-width:minmax(340px,440px);grid-template-columns:var(--basic-control-width) var(--basic-control-width);grid-auto-rows:minmax(0,1fr)}.basic-json-panel{grid-column:1 / -1}}
+    @media(max-width:1200px){.basic-layout{--basic-control-width:minmax(360px,460px);grid-template-columns:var(--basic-control-width) var(--basic-control-width);grid-auto-rows:minmax(0,1fr)}.basic-json-panel{grid-column:1 / -1}}
     @media(max-width:900px){.basic-layout{grid-template-columns:1fr}#clientConfig{height:auto;max-height:none}.basic-json-panel{grid-column:auto}}
   </style>
 </head>
@@ -2136,10 +2136,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function renderClientPolicyLists(routeRules){
       let selectedProxy=new Set(routeIpArray(routeRules.client_global_proxy_ips));
       let selectedDirect=new Set(routeIpArray(routeRules.client_direct_ips));
+      selectedDirect.forEach(ip=>selectedProxy.delete(ip));
       let rows=clientRowsForPolicy(selectedProxy,selectedDirect);
       renderClientPolicyList('clientGlobalProxyList',rows,selectedProxy,'client-global-proxy');
       renderClientPolicyList('clientDirectList',rows,selectedDirect,'client-direct');
       renderDhcpDatalist();
+      syncClientPolicyExclusion();
+      updateClientSelectSummary('clientGlobalProxyList');
+      updateClientSelectSummary('clientDirectList');
     }
     function renderClientPolicyList(id,rows,selected,cls){
       let box=document.getElementById(id);
@@ -2165,9 +2169,28 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if(!labels.length){summary.textContent='None';return}
       summary.textContent=labels.length===1?labels[0]:(labels.length+' selected: '+labels.slice(0,2).join(', ')+(labels.length>2?' ...':''));
     }
+    function inputIps(input){return String(input.dataset.ips||input.value).split(/\s+/).filter(Boolean)}
+    function ipsOverlap(a,b){let s=new Set(a);return b.some(ip=>s.has(ip))}
+    function syncClientPolicyExclusion(){
+      let proxy=[...document.querySelectorAll('input.client-global-proxy')];
+      let direct=[...document.querySelectorAll('input.client-direct')];
+      let checkedProxy=proxy.filter(el=>el.checked).map(inputIps);
+      direct.forEach(el=>{
+        let disabled=checkedProxy.some(ips=>ipsOverlap(ips,inputIps(el)));
+        if(disabled)el.checked=false;
+        el.disabled=disabled;
+      });
+      let checkedDirect=direct.filter(el=>el.checked).map(inputIps);
+      proxy.forEach(el=>{
+        let disabled=checkedDirect.some(ips=>ipsOverlap(ips,inputIps(el)));
+        if(disabled)el.checked=false;
+        el.disabled=disabled;
+      });
+    }
     function onClientPolicyChange(input){
       let other=input.classList.contains('client-global-proxy')?'client-direct':'client-global-proxy';
-      if(input.checked)document.querySelectorAll('input.'+other).forEach(el=>{if(el.value===input.value)el.checked=false});
+      if(input.checked)document.querySelectorAll('input.'+other).forEach(el=>{if(ipsOverlap(inputIps(input),inputIps(el)))el.checked=false});
+      syncClientPolicyExclusion();
       updateClientSelectSummary('clientGlobalProxyList');
       updateClientSelectSummary('clientDirectList');
       updateClientJson();
