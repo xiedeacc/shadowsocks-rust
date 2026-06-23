@@ -22,6 +22,9 @@ cleanup_firewall() {
 		while ip rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null; do
 			:
 		done
+		while ip -6 rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null; do
+			:
+		done
 		ip route del local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" 2>/dev/null || true
 		ip -6 route del local ::/0 dev lo table "$TPROXY_TABLE" 2>/dev/null || true
 	fi
