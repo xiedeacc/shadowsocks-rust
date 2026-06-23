@@ -88,6 +88,9 @@ cleanup_remote_firewall() {
 			while ip rule del fwmark 0x1 table 100 2>/dev/null; do
 				echo '[cleanup] deleted tproxy ip rule fwmark 0x1 table 100'
 			done
+			while ip -6 rule del fwmark 0x1 table 100 2>/dev/null; do
+				echo '[cleanup] deleted tproxy ip -6 rule fwmark 0x1 table 100'
+			done
 			ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
 			ip -6 route del local ::/0 dev lo table 100 2>/dev/null || true
 		fi
