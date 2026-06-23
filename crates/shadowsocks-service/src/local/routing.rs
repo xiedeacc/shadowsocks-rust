@@ -1143,6 +1143,37 @@ impl RoutingState {
         Ok(temporary)
     }
 
+    pub async fn clear_persistent_proxy_ip(&self) -> io::Result<usize> {
+        self.refresh_rule_files_from_disk().await?;
+        let rules_dir = self.inner.read().await.rules_dir.clone();
+        write_lines_atomic(rules_dir.join(PROXY_IP_FILE), &[])?;
+        let proxy_ip_modified = file_modified(&rules_dir.join(PROXY_IP_FILE))?;
+        let cleared = {
+            let mut inner = self.inner.write().await;
+            let cleared = inner.persistent_raw.proxy_ip.len();
+            if cleared == 0 {
+                inner.proxy_ip_modified = proxy_ip_modified;
+                cleared
+            } else {
+                let mut raw = inner.persistent_raw.clone();
+                raw.proxy_ip.clear();
+                let persistent = compile_rules(&raw)?;
+                inner.persistent_raw = raw;
+                inner.persistent = persistent;
+                inner.proxy_ip_modified = proxy_ip_modified;
+                inner.proxy_ip_dirty = false;
+                inner.proxy_ip_persist_scheduled = false;
+                rebuild_conflicts(&mut inner);
+                cleared
+            }
+        };
+        #[cfg(all(target_os = "linux", feature = "local-dns"))]
+        if let Err(err) = self.sync_persistent_ip_rules_to_firewall().await {
+            warn!("failed to re-sync nft sets after clearing proxy_ip.txt: {}", err);
+        }
+        Ok(cleared)
+    }
+
     pub async fn route_ip(&self, ip: &IpAddr) -> Option<RouteDecision> {
         let inner = self.inner.read().await;
         route_ip_inner(&inner, ip)

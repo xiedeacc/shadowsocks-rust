@@ -289,6 +289,13 @@ impl WebAdminHandler {
                     &serde_json::json!({ "ok": true, "cleared": cleared }),
                 ))
             }
+            (Method::POST, "/api/proxy-ip/clear") => {
+                let cleared = self.routing_state.clear_persistent_proxy_ip().await?;
+                Ok(json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "ok": true, "cleared": cleared }),
+                ))
+            }
             (Method::PUT, "/api/dns") => {
                 // Hot-reload upstream resolvers chosen by the routing
                 // layer. Persists into the per-listener config slot
@@ -1812,7 +1819,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .inline-check{display:inline-flex;align-items:center;gap:4px;margin:0 0 0 10px;font-size:12px;font-weight:600;color:var(--muted)}
     .inline-check input{width:auto;margin:0}
     .record-countdown{min-width:38px;color:var(--brand2)}
-    .dns-cache-clean-title{font-size:12px;font-weight:600;margin-top:8px;color:var(--muted)}
     .progress-box{margin:8px auto 0;max-width:760px;max-height:120px;overflow:auto;text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;box-shadow:0 1px 2px #10203312}
     .progress-bar{height:10px;background:var(--soft);border-radius:999px;overflow:hidden;margin:8px 0}
     .progress-fill{height:100%;width:0;background:var(--brand)}
@@ -1910,6 +1916,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <button id="saveButton" onclick="saveClientConfig()">Save</button>
       <button id="restartButton" onclick="restartService()">Restart</button>
       <button id="nftRulesetRefresh" onclick="openNftRulesetModal()">nft table</button>
+      <button id="clearDnsCacheButton" onclick="clearDnsAll()">Clear DNS Cache</button>
+      <button id="clearProxyIpButton" onclick="clearProxyIp()">Clear Proxy IP</button>
     </div>
     <div id="binaryCommit" class="binary-commit"></div>
     <div id="nftModal" class="modal-backdrop" onclick="closeNftRulesetModal(event)">
@@ -1952,8 +1960,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <label>Record Type<select id="dnsQueryType"><option>A</option><option>AAAA</option></select></label>
           <button onclick="queryDnsCache()">Query Cache</button>
           <button onclick="clearDnsDomain()">Clear Domain Dns Cache</button>
-          <div class="dns-cache-clean-title">Dns Cache Clean</div>
-          <button onclick="clearDnsAll()">Clear All Dns Cache</button>
           <label>IP<input id="dnsQueryIp" placeholder="142.251.151.119"></label>
           <button onclick="queryDnsCacheIp()">Query Domain By IP</button>
           <p class="hint" id="dnsCacheMessage"></p>
@@ -2496,7 +2502,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function queryDnsCache(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheOut.innerHTML='<p class="hint">Enter a domain</p>';return}let rows=await api('/api/dns/cache/query?domain='+encodeURIComponent(domain));let type=dnsQueryType.value;rows=rows.filter(r=>!type||r.query_type===type);dnsCacheOut.innerHTML=table(rows,[['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Results',r=>(r.results||[]).join('<br>')],['Expires',r=>fmtTime(r.expires_at)]])}
     async function queryDnsCacheIp(){let ip=dnsQueryIp.value.trim();if(!ip){dnsCacheOut.innerHTML='<p class="hint">Enter an IP</p>';return}let rows=await api('/api/dns/cache/query-ip?ip='+encodeURIComponent(ip));dnsCacheOut.innerHTML=table(rows,[['IP',r=>r.ip],['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Expires',r=>fmtTime(r.expires_at)]])}
     async function clearDnsDomain(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheMessage.textContent='Enter a domain first';return}let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({domain})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';await queryDnsCache()}
-    async function clearDnsAll(){let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';dnsCacheOut.innerHTML=''}
+    async function clearDnsAll(){let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})});let msg='Cleared '+r.cleared+' DNS cache entries';if(window.dnsCacheMessage)dnsCacheMessage.textContent=msg;if(window.configPath)configPath.textContent=msg;if(window.dnsCacheOut)dnsCacheOut.innerHTML=''}
+    async function clearProxyIp(){let r=await api('/api/proxy-ip/clear',{method:'POST'});if(window.configPath)configPath.textContent='Cleared '+r.cleared+' proxy IP entries'}
     async function refresh(id){try{if(id==='basic')await loadClientConfig();if(id==='routeConfig')await reloadRouteTab();if(id==='sys')await renderSys();if(id==='connections'){updateActivityPauseButton();if(activityPaused)return;let s=await syncActivityRecordStatus();if(s.recording){await renderDns();await renderConnections()}}}catch(e){alert(e.message)}}
     document.querySelector("nav button[data-tab=\"basic\"]").classList.add('active');
     window.addEventListener('resize',()=>{updateNavIndicator();syncClientJsonHeight()});

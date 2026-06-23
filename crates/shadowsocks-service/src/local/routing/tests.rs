@@ -532,6 +532,33 @@
     }
 
     #[tokio::test]
+    async fn clear_persistent_proxy_ip_updates_file_and_memory() {
+        let dir = temp_rules_dir("clear-persistent-proxy-ip");
+        write_lines_atomic(dir.join(DIRECT_IP_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_IP_FILE), &["203.0.113.10 example.com".to_owned()]).unwrap();
+        write_lines_atomic(dir.join(DIRECT_DOMAIN_FILE), &[]).unwrap();
+        write_lines_atomic(dir.join(PROXY_DOMAIN_FILE), &[]).unwrap();
+
+        let mut config = RouteRulesConfig::default();
+        config.rules_dir = dir.clone();
+        config.geoip_sources.clear();
+        config.proxy_domain_sources.clear();
+        let state = RoutingState::load(config).await.unwrap();
+        let ip = "203.0.113.10".parse().unwrap();
+
+        assert_eq!(state.route_ip(&ip).await, Some(RouteDecision::Proxy));
+        assert_eq!(state.clear_persistent_proxy_ip().await.unwrap(), 1);
+        assert!(read_lines(dir.join(PROXY_IP_FILE)).unwrap().is_empty());
+        assert_eq!(state.route_ip(&ip).await, None);
+
+        let inner = state.inner.read().await;
+        assert!(inner.persistent_raw.proxy_ip.is_empty());
+        assert!(inner.persistent.proxy_ip_exact.is_empty());
+        assert!(!inner.proxy_ip_dirty);
+        assert!(!inner.proxy_ip_persist_scheduled);
+    }
+
+    #[tokio::test]
     async fn temporary_proxy_domain_matches_aws_console_subdomain_immediately() {
         let dir = temp_rules_dir("temporary-aws-domain");
         let mut config = RouteRulesConfig::default();
