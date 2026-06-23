@@ -1186,6 +1186,7 @@ impl RoutingState {
         domain: &str,
         source_ip: Option<IpAddr>,
     ) -> Option<SourceRouteDecision> {
+        let source_ip = source_ip.map(normalize_source_ip);
         let base_decision = route_domain_inner(inner, domain);
         if let Some(ip) = source_ip
             && inner.sources.client_direct_ips.contains(&ip)
@@ -1216,7 +1217,12 @@ impl RoutingState {
     /// enforces this in the kernel via the `saddr @client_direct … return`
     /// rule). Tiny linear scan over the (usually 0–3 entry) list.
     pub async fn source_is_forced_direct(&self, source_ip: IpAddr) -> bool {
-        self.inner.read().await.sources.client_direct_ips.contains(&source_ip)
+        self.inner
+            .read()
+            .await
+            .sources
+            .client_direct_ips
+            .contains(&normalize_source_ip(source_ip))
     }
 
     pub async fn route_address(&self, addr: &Address) -> Option<RouteDecision> {
@@ -2986,6 +2992,13 @@ fn route_domain_inner(inner: &RoutingInner, domain: &str) -> Option<RouteDecisio
         Some(RouteDecision::Proxy)
     } else {
         None
+    }
+}
+
+fn normalize_source_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(ip)),
+        IpAddr::V4(..) => ip,
     }
 }
 

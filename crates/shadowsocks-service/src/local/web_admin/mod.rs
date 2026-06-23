@@ -1,7 +1,7 @@
 //! Embedded web admin for routing rules and DNS split.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     fs, io,
     net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
@@ -707,6 +707,7 @@ struct ClientConfigPayload {
 #[derive(serde::Serialize)]
 struct DhcpClient {
     ip: IpAddr,
+    ips: Vec<IpAddr>,
     mac: String,
     hostname: String,
     expires_at: Option<u64>,
@@ -1008,7 +1009,18 @@ fn is_lan_admin_peer(ip: IpAddr) -> bool {
 }
 
 fn dhcp_clients() -> Vec<DhcpClient> {
-    read_dhcp_leases(Path::new("/tmp/dhcp.leases")).unwrap_or_default()
+    let mut clients = read_dhcp_leases(Path::new("/tmp/dhcp.leases")).unwrap_or_default();
+    add_ipv6_neighbors_to_clients(&mut clients);
+    for client in &mut clients {
+        sort_dedup_ips(&mut client.ips);
+    }
+    clients.sort_by(|a, b| {
+        a.hostname
+            .cmp(&b.hostname)
+            .then_with(|| a.ip.cmp(&b.ip))
+            .then_with(|| a.mac.cmp(&b.mac))
+    });
+    clients
 }
 
 fn lan_addresses() -> Vec<LanAddress> {
@@ -1130,6 +1142,7 @@ fn read_dhcp_leases(path: &Path) -> io::Result<Vec<DhcpClient>> {
         if seen.insert(ip) {
             clients.push(DhcpClient {
                 ip,
+                ips: vec![ip],
                 mac: mac.to_owned(),
                 hostname,
                 expires_at,
@@ -1139,6 +1152,114 @@ fn read_dhcp_leases(path: &Path) -> io::Result<Vec<DhcpClient>> {
     }
     clients.sort_by_key(|client| client.ip);
     Ok(clients)
+}
+
+fn add_ipv6_neighbors_to_clients(clients: &mut [DhcpClient]) {
+    let by_mac = clients
+        .iter()
+        .enumerate()
+        .map(|(idx, client)| (normalize_mac(&client.mac), idx))
+        .collect::<HashMap<_, _>>();
+    if by_mac.is_empty() {
+        return;
+    }
+    for neighbor in collect_lan_ipv6_neighbors() {
+        let Some(idx) = by_mac.get(&normalize_mac(&neighbor.mac)).copied() else {
+            continue;
+        };
+        clients[idx].ips.push(IpAddr::V6(neighbor.ip));
+    }
+}
+
+struct Ipv6Neighbor {
+    ip: std::net::Ipv6Addr,
+    mac: String,
+}
+
+fn collect_lan_ipv6_neighbors() -> Vec<Ipv6Neighbor> {
+    let mut seen = HashSet::new();
+    let mut neighbors = Vec::new();
+    for dev in ["br-lan", "lan"] {
+        collect_ipv6_neighbors_for_dev(Some(dev), &mut seen, &mut neighbors);
+    }
+    if neighbors.is_empty() {
+        collect_ipv6_neighbors_for_dev(None, &mut seen, &mut neighbors);
+    }
+    neighbors
+}
+
+fn collect_ipv6_neighbors_for_dev(
+    dev: Option<&str>,
+    seen: &mut HashSet<(std::net::Ipv6Addr, String)>,
+    neighbors: &mut Vec<Ipv6Neighbor>,
+) {
+    let mut args = vec!["-j", "-6", "neigh", "show"];
+    if let Some(dev) = dev {
+        args.extend(["dev", dev]);
+    }
+    let Ok(output) = Command::new("ip").args(args).output() else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let Ok(rows) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return;
+    };
+    let Some(rows) = rows.as_array() else {
+        return;
+    };
+    append_ipv6_neighbors_from_rows(rows, seen, neighbors);
+}
+
+fn append_ipv6_neighbors_from_rows(
+    rows: &[serde_json::Value],
+    seen: &mut HashSet<(std::net::Ipv6Addr, String)>,
+    neighbors: &mut Vec<Ipv6Neighbor>,
+) {
+    for row in rows {
+        if !ipv6_neighbor_state_is_usable(row) {
+            continue;
+        }
+        let Some(mac) = row.get("lladdr").and_then(|value| value.as_str()).map(normalize_mac) else {
+            continue;
+        };
+        let Some(ip) = row
+            .get("dst")
+            .and_then(|value| value.as_str())
+            .and_then(|value| value.parse::<std::net::Ipv6Addr>().ok())
+            .filter(|ip| is_client_ipv6_candidate(*ip))
+        else {
+            continue;
+        };
+        if seen.insert((ip, mac.clone())) {
+            neighbors.push(Ipv6Neighbor { ip, mac });
+        }
+    }
+}
+
+fn ipv6_neighbor_state_is_usable(row: &serde_json::Value) -> bool {
+    let states = row
+        .get("state")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .collect::<Vec<_>>();
+    !states.iter().any(|state| matches!(*state, "FAILED" | "INCOMPLETE"))
+}
+
+fn is_client_ipv6_candidate(ip: std::net::Ipv6Addr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() && (ip.segments()[0] & 0xffc0) != 0xfe80
+}
+
+fn normalize_mac(mac: &str) -> String {
+    mac.to_ascii_lowercase()
+}
+
+fn sort_dedup_ips(ips: &mut Vec<IpAddr>) {
+    ips.sort();
+    ips.dedup();
 }
 
 fn normalize_debug_url(url: &str) -> io::Result<String> {
@@ -1963,28 +2084,55 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     function routeIpArray(v){return Array.isArray(v)?v.map(String).filter(Boolean):[]}
     function clientLabel(ip){
-      let c=dhcpClients.find(x=>String(x.ip)===String(ip));
+      let c=dhcpClients.find(x=>clientIps(x).includes(String(ip)));
       if(!c)return ip+' offline';
-      return ip+(c.hostname?' '+c.hostname:'')+(c.mac?' '+c.mac:'');
+      return clientDisplay(c);
+    }
+    function clientIps(client){
+      let ips=Array.isArray(client&&client.ips)&&client.ips.length?client.ips:[client&&client.ip];
+      ips=ips.map(String).filter(Boolean);
+      return [...new Set(ips)].sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+    }
+    function clientKey(client){return clientIps(client).join('|')}
+    function clientDisplay(client){
+      let ips=clientIps(client), name=(client&&client.hostname)||'Unknown';
+      return (name?name+' ':'')+ips.join(' ');
+    }
+    function clientRowsForPolicy(selectedProxy,selectedDirect){
+      let rows=[], knownIps=new Set();
+      dhcpClients.forEach((client,index)=>{
+        let ips=clientIps(client);
+        if(!ips.length)return;
+        ips.forEach(ip=>knownIps.add(ip));
+        rows.push({key:clientKey(client)||('client-'+index),ips,label:clientDisplay(client)});
+      });
+      [...selectedProxy,...selectedDirect].forEach(ip=>{
+        if(!knownIps.has(ip))rows.push({key:'offline-'+ip,ips:[ip],label:ip+' offline'});
+      });
+      let seen=new Set();
+      return rows.filter(row=>{
+        if(seen.has(row.key))return false;
+        seen.add(row.key);
+        return true;
+      }).sort((a,b)=>a.label.localeCompare(b.label,undefined,{numeric:true}));
     }
     function renderDhcpDatalist(){
       let el=document.getElementById('dhcpClientIps');
       if(!el)return;
-      el.innerHTML=dhcpClients.map(c=>`<option value="${esc(c.ip)}">${esc(clientLabel(c.ip))}</option>`).join('');
+      el.innerHTML=dhcpClients.flatMap(c=>clientIps(c).map(ip=>`<option value="${esc(ip)}">${esc(clientDisplay(c))}</option>`)).join('');
     }
     function renderClientPolicyLists(routeRules){
       let selectedProxy=new Set(routeIpArray(routeRules.client_global_proxy_ips));
       let selectedDirect=new Set(routeIpArray(routeRules.client_direct_ips));
-      let ips=[...dhcpClients.map(c=>String(c.ip)),...selectedProxy,...selectedDirect].filter(Boolean);
-      ips=[...new Set(ips)].sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
-      renderClientPolicyList('clientGlobalProxyList',ips,selectedProxy,'client-global-proxy');
-      renderClientPolicyList('clientDirectList',ips,selectedDirect,'client-direct');
+      let rows=clientRowsForPolicy(selectedProxy,selectedDirect);
+      renderClientPolicyList('clientGlobalProxyList',rows,selectedProxy,'client-global-proxy');
+      renderClientPolicyList('clientDirectList',rows,selectedDirect,'client-direct');
       renderDhcpDatalist();
     }
-    function renderClientPolicyList(id,ips,selected,cls){
+    function renderClientPolicyList(id,rows,selected,cls){
       let box=document.getElementById(id);
       box.className='client-select';
-      let options=ips.length?ips.map(ip=>`<label class="client-row"><input class="${cls}" type="checkbox" value="${esc(ip)}" ${selected.has(ip)?'checked':''} onchange="onClientPolicyChange(this)"><span title="${esc(clientLabel(ip))}">${esc(clientLabel(ip))}</span></label>`).join(''):'<div class="hint" style="padding:6px 7px">No DHCP clients</div>';
+      let options=rows.length?rows.map(row=>`<label class="client-row"><input class="${cls}" type="checkbox" value="${esc(row.key)}" data-ips="${esc(row.ips.join(' '))}" ${row.ips.some(ip=>selected.has(ip))?'checked':''} onchange="onClientPolicyChange(this)"><span title="${esc(row.label)}">${esc(row.label)}</span></label>`).join(''):'<div class="hint" style="padding:6px 7px">No DHCP clients</div>';
       box.innerHTML=`<button type="button" class="client-select-button" onclick="toggleClientSelect(event,'${id}')"><span class="client-select-summary"></span><span class="client-select-caret">v</span></button><div class="client-select-panel">${options}</div>`;
       updateClientSelectSummary(id);
     }
@@ -2001,9 +2149,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function updateClientSelectSummary(id){
       let box=document.getElementById(id), summary=box&&box.querySelector('.client-select-summary');
       if(!summary)return;
-      let values=[...box.querySelectorAll('input[type=checkbox]:checked')].map(el=>el.value);
-      if(!values.length){summary.textContent='None';return}
-      let labels=values.map(clientLabel);
+      let labels=[...box.querySelectorAll('input[type=checkbox]:checked')].map(el=>el.closest('label').querySelector('span').textContent);
+      if(!labels.length){summary.textContent='None';return}
       summary.textContent=labels.length===1?labels[0]:(labels.length+' selected: '+labels.slice(0,2).join(', ')+(labels.length>2?' ...':''));
     }
     function onClientPolicyChange(input){
@@ -2013,7 +2160,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       updateClientSelectSummary('clientDirectList');
       updateClientJson();
     }
-    function selectedClientIps(cls){return [...document.querySelectorAll('input.'+cls+':checked')].map(el=>el.value)}
+    function selectedClientIps(cls){
+      let ips=[];
+      document.querySelectorAll('input.'+cls+':checked').forEach(el=>ips.push(...String(el.dataset.ips||el.value).split(/\s+/).filter(Boolean)));
+      return [...new Set(ips)].sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+    }
     function serverFormHtml(server,index){
       let method=server.method||'aes-256-gcm';
       return `<fieldset class="server-block" data-index="${index}">
@@ -2389,7 +2540,11 @@ where
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::proc_net_tcp_has_listener;
+    use std::collections::HashSet;
+
+    use serde_json::json;
+
+    use super::{Ipv6Neighbor, append_ipv6_neighbors_from_rows, proc_net_tcp_has_listener};
 
     #[test]
     fn proc_net_tcp_listener_detects_listen_state() {
@@ -2407,5 +2562,58 @@ mod tests {
    0: 0100007F:3039 0200007F:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 5600722";
 
         assert!(!proc_net_tcp_has_listener(content, 12345));
+    }
+
+    #[test]
+    fn ipv6_neighbor_rows_keep_multiple_public_addresses_for_same_mac() {
+        let rows = vec![
+            json!({
+                "dst": "2409:8d5a:e04:7ad4:2135:e989:ee18:c7aa",
+                "dev": "br-lan",
+                "lladdr": "5A:9E:98:45:AD:56",
+                "state": ["STALE"]
+            }),
+            json!({
+                "dst": "2409:8d5a:e04:7ad4:aaaa:bbbb:cccc:dddd",
+                "dev": "br-lan",
+                "lladdr": "5a:9e:98:45:ad:56",
+                "state": ["REACHABLE"]
+            }),
+            json!({
+                "dst": "fe80::8fc:8b41:7c5e:546c",
+                "dev": "br-lan",
+                "lladdr": "5a:9e:98:45:ad:56",
+                "state": ["STALE"]
+            }),
+            json!({
+                "dst": "2409:8d5a:e04:7ad4:d0d9:6f6d:e318:1019",
+                "dev": "br-lan",
+                "state": ["FAILED"]
+            }),
+            json!({
+                "dst": "2409:8d5a:e04:7ad4:691:62ff:feb4:3127",
+                "dev": "br-lan",
+                "state": ["INCOMPLETE"]
+            }),
+        ];
+        let mut seen = HashSet::new();
+        let mut neighbors: Vec<Ipv6Neighbor> = Vec::new();
+
+        append_ipv6_neighbors_from_rows(&rows, &mut seen, &mut neighbors);
+
+        assert_eq!(neighbors.len(), 2);
+        assert_eq!(neighbors[0].mac, "5a:9e:98:45:ad:56");
+        assert_eq!(
+            neighbors[0].ip,
+            "2409:8d5a:e04:7ad4:2135:e989:ee18:c7aa"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+        );
+        assert_eq!(
+            neighbors[1].ip,
+            "2409:8d5a:e04:7ad4:aaaa:bbbb:cccc:dddd"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+        );
     }
 }
