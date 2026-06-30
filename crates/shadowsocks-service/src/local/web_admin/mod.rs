@@ -1886,14 +1886,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       </div>
       <div id="serverPanel" class="basic-side-panel">
         <div class="config-group">
-          <h3 class="card-title">Transparent Proxy</h3>
+          <h3 id="proxyPanelTitle" class="card-title">Transparent Proxy</h3>
           <fieldset>
-            <div class="form-line"><label>Enable Redir</label><input id="redirEnable" type="checkbox"></div>
+            <div class="form-line"><label id="proxyEnableLabel">Enable Redir</label><input id="redirEnable" type="checkbox"></div>
             <div class="form-line"><label>Global Proxy</label><input id="globalProxy" type="checkbox"></div>
-            <div class="form-line"><label>Global Proxy Client</label><div id="clientGlobalProxyList" class="client-list"></div></div>
-            <div class="form-line"><label>Direct Client</label><div id="clientDirectList" class="client-list"></div></div>
-            <div class="form-line"><label>Bind Address</label><select id="redirBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
-            <div class="form-line"><label>Port</label><input id="redirPort" type="number" min="1" max="65535"></div>
+            <div class="form-line client-policy-field"><label>Global Proxy Client</label><div id="clientGlobalProxyList" class="client-list"></div></div>
+            <div class="form-line client-policy-field"><label>Direct Client</label><div id="clientDirectList" class="client-list"></div></div>
+            <div class="form-line redir-field"><label>Bind Address</label><select id="redirBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
+            <div class="form-line redir-field"><label>Port</label><input id="redirPort" type="number" min="1" max="65535"></div>
             <input id="redirMode" type="hidden">
             <div class="form-line tun-field"><label>TUN Name</label><input id="tunName" placeholder="shadowsocks-tun"></div>
             <div class="form-line tun-field"><label>TUN Address</label><input id="tunAddress" placeholder="10.255.0.1/24"></div>
@@ -2054,7 +2054,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function token(){return new URLSearchParams(location.search).get('token')||''}
     async function api(path,opt={}){let timeoutMs=opt.timeoutMs||0;delete opt.timeoutMs;let timer=null,controller=null;if(timeoutMs){controller=new AbortController();opt.signal=controller.signal;timer=setTimeout(()=>controller.abort(),timeoutMs)}opt.headers=Object.assign({'x-admin-token':token()},opt.headers||{});try{let r=await fetch(path,opt);let j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}finally{if(timer)clearTimeout(timer)}}
     async function platform(){if(!servicePlatform)servicePlatform=await api('/api/sys/platform');return servicePlatform}
-    function isWindowsService(){return servicePlatform&&servicePlatform.target_os==='windows'}
     let activeTab='basic', activityTimer=null, activityPaused=false, recentDnsRows=[], restartInProgress=false, dhcpClients=[], lanAddresses=[];
     function updateNavIndicator(){
       let active=document.querySelector('nav button.active'), indicator=document.querySelector('.nav-indicator'), tabs=document.querySelector('.nav-tabs');
@@ -2243,24 +2242,37 @@ const INDEX_HTML: &str = r#"<!doctype html>
         return server;
       }).filter(server=>server.server);
     }
+    function activeTunMode(){
+      const tun=firstLocal('tun');
+      return !!tun.protocol&&tun.disabled!==true;
+    }
+    function configureProxyPanel(useTun){
+      proxyPanelTitle.textContent=useTun?'TUN Proxy':'Transparent Proxy';
+      proxyEnableLabel.textContent=useTun?'Enable TUN':'Enable Redir';
+      document.querySelectorAll('.client-policy-field').forEach(e=>e.style.display=useTun?'none':'grid');
+      document.querySelectorAll('.redir-field').forEach(e=>e.style.display=useTun?'none':'grid');
+      document.querySelectorAll('.tun-field').forEach(e=>e.style.display=useTun?'grid':'none');
+    }
     function renderBasic(){
       let socks=firstLocal('socks'), futu=futuSocksLocal(), http=firstLocal('http'), redir=firstLocal('redir'), tun=firstLocal('tun'), dns=firstLocal('dns');
       let routeRules=currentRawConfig.route_rules||{};
+      const tunEnabled=!!tun.protocol&&tun.disabled!==true;
+      const redirEnabled=!!redir.protocol&&redir.disabled!==true;
       renderBindAddressOptions();
       setSelect('socksBind',socks.local_address||'127.0.0.1'); socksPort.value=socks.local_port||1080;
       setSelect('futuSocksBind',futu.local_address||socks.local_address||'0.0.0.0'); futuSocksPort.value=futu.local_port||1082;
       setSelect('httpBind',http.local_address||'127.0.0.1'); httpPort.value=http.local_port||1081;
       globalProxy.checked=!!routeRules.global_proxy;
       renderClientPolicyLists(routeRules);
-      redirEnable.checked=!!(redir.protocol||tun.protocol)&&(redir.disabled!==true&&tun.disabled!==true);
+      configureProxyPanel(tunEnabled);
+      redirEnable.checked=tunEnabled||redirEnabled;
       setSelect('redirBind',redir.local_address||'0.0.0.0'); redirPort.value=redir.local_port||12345;
       redirMode.value=redir.mode||tun.mode||'tcp_and_udp';
       tunName.value=tun.tun_interface_name||'shadowsocks-tun';
       tunAddress.value=tun.tun_interface_address||'10.255.0.1/24';
       tunDestination.value=tun.tun_interface_destination||'10.255.0.2/24';
-      document.querySelectorAll('.tun-field').forEach(e=>e.style.display=isWindowsService()?'grid':'none');
-      dnsEnable.checked=(!!dns.protocol&&dns.disabled!==true)||!!tun.protocol;
-      if(tun.protocol&&isWindowsService()){
+      dnsEnable.checked=(!!dns.protocol&&dns.disabled!==true)||tunEnabled;
+      if(tunEnabled){
         setSelect('dnsBind','0.0.0.0'); dnsPort.value=53; setSelect('dnsInterceptMode','tun');
       }else{
         setSelect('dnsBind',dns.local_address||'127.0.0.1'); dnsPort.value=dns.local_port||1053;
@@ -2277,22 +2289,26 @@ const INDEX_HTML: &str = r#"<!doctype html>
       updateClientJson();
     }
     function buildClientConfig(){
-      const wantsRedir=redirEnable.checked;
-      const wantsGlobalProxy=wantsRedir&&globalProxy.checked;
-      const wantsDns=dnsEnable.checked||wantsRedir;
-      const effectiveDnsInterceptMode=wantsRedir&&!isWindowsService()&&dnsInterceptMode.value==='off'?'both':dnsInterceptMode.value;
+      const useTun=activeTunMode();
+      const wantsProxy=redirEnable.checked;
+      const wantsGlobalProxy=wantsProxy&&globalProxy.checked;
+      const wantsDns=dnsEnable.checked||wantsProxy;
+      const effectiveDnsInterceptMode=wantsProxy&&!useTun&&dnsInterceptMode.value==='off'?'both':dnsInterceptMode.value;
       let locals=[
         {local_address:socksBind.value,local_port:num(socksPort.value,1080),protocol:'socks'},
         {local_address:futuSocksBind.value,local_port:num(futuSocksPort.value,1082),protocol:'socks',record_proxy_ip:true},
         {local_address:httpBind.value,local_port:num(httpPort.value,1081),protocol:'http'}
       ];
       const existingRedir=firstLocal('redir');
-      if(isWindowsService()){
-        locals.push({disabled:!wantsRedir,protocol:'tun',mode:redirMode.value,tun_interface_name:tunName.value.trim()||'shadowsocks-tun',tun_interface_address:tunAddress.value.trim()||'10.255.0.1/24',tun_interface_destination:tunDestination.value.trim()||'10.255.0.2/24'});
+      const existingTun=firstLocal('tun');
+      if(useTun){
+        if(existingRedir.protocol)locals.push(Object.assign({},existingRedir,{disabled:true}));
+        locals.push({disabled:!wantsProxy,protocol:'tun',mode:redirMode.value,tun_interface_name:tunName.value.trim()||'shadowsocks-tun',tun_interface_address:tunAddress.value.trim()||'10.255.0.1/24',tun_interface_destination:tunDestination.value.trim()||'10.255.0.2/24'});
       }else{
-        locals.push({disabled:!wantsRedir,local_address:redirBind.value,local_port:num(redirPort.value,12345),protocol:'redir',mode:redirMode.value,tcp_redir:existingRedir.tcp_redir||'redirect',udp_redir:existingRedir.udp_redir||'tproxy'});
+        locals.push({disabled:!wantsProxy,local_address:redirBind.value,local_port:num(redirPort.value,12345),protocol:'redir',mode:redirMode.value,tcp_redir:existingRedir.tcp_redir||'redirect',udp_redir:existingRedir.udp_redir||'tproxy'});
+        if(existingTun.protocol)locals.push(Object.assign({},existingTun,{disabled:true}));
       }
-      const windowsTun=wantsRedir&&isWindowsService();
+      const tunEnabled=useTun&&wantsProxy;
       let routeRules=Object.assign({},currentRawConfig.route_rules||{});
       if(!Array.isArray(routeRules.geoip_sources)||!routeRules.geoip_sources.length)routeRules.geoip_sources=defaultGeoipSources.slice();
       if(!Array.isArray(routeRules.proxy_domain_sources)||!routeRules.proxy_domain_sources.length)routeRules.proxy_domain_sources=defaultProxyDomainSources.slice();
@@ -2301,16 +2317,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
       routeRules.dns_cache_refresh_enabled=dnsCacheRefreshEnabled.checked;
       routeRules.dns_cache_refresh_batch_size=num(dnsCacheRefreshBatch.value,500);
       routeRules.global_proxy=wantsGlobalProxy;
-      routeRules.client_global_proxy_ips=selectedClientIps('client-global-proxy');
-      routeRules.client_direct_ips=selectedClientIps('client-direct');
-      routeRules.dns_intercept_mode=windowsTun?'tun':(wantsRedir?(isWindowsService()&&effectiveDnsInterceptMode==='firewall'?'tun':effectiveDnsInterceptMode):'off');
+      routeRules.client_global_proxy_ips=useTun?[]:selectedClientIps('client-global-proxy');
+      routeRules.client_direct_ips=useTun?[]:selectedClientIps('client-direct');
+      routeRules.dns_intercept_mode=tunEnabled?'tun':(wantsProxy?effectiveDnsInterceptMode:'off');
       routeRules.dns_ipv4_only=(dnsIpv4Only.value!=='false');
       let domesticEntry=dnsDomestic.value.trim()||'223.5.5.5:53';
       let foreignEntry=dnsForeign.value.trim()||'8.8.8.8:53';
       let domestic=parseHostPort(domesticEntry,'223.5.5.5',53);
       let foreign=parseHostPort(foreignEntry,'8.8.8.8',53);
-      const dnsPortValue=windowsTun?53:num(dnsPort.value,1053);
-      const dnsBindValue=windowsTun?'0.0.0.0':dnsBind.value;
+      const dnsPortValue=tunEnabled?53:num(dnsPort.value,1053);
+      const dnsBindValue=tunEnabled?'0.0.0.0':dnsBind.value;
       locals.push({disabled:!wantsDns,local_address:dnsBindValue,local_port:dnsPortValue,protocol:'dns',mode:'tcp_and_udp',local_dns_address:domestic.host,local_dns_port:domestic.port,remote_dns_address:foreign.host,remote_dns_port:foreign.port,client_cache_size:64});
       let servers=readServerForms();
       return Object.assign({},currentRawConfig,{locals,servers,route_rules:routeRules});

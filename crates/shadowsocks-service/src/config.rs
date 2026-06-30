@@ -3066,6 +3066,24 @@ impl Config {
                 }
             }
 
+            #[cfg(all(feature = "local-redir", feature = "local-tun"))]
+            {
+                let has_redir = self.local.iter().any(|local| {
+                    !local.config.disabled && matches!(local.config.protocol, ProtocolType::Redir)
+                });
+                let has_tun = self.local.iter().any(|local| {
+                    !local.config.disabled && matches!(local.config.protocol, ProtocolType::Tun)
+                });
+                if has_redir && has_tun {
+                    let err = Error::new(
+                        ErrorKind::Invalid,
+                        "enabled `redir` and `tun` locals are mutually exclusive",
+                        None,
+                    );
+                    return Err(err);
+                }
+            }
+
             // Balancer related checks
             if let Some(rtt) = self.balancer.max_server_rtt
                 && rtt.as_secs() == 0
@@ -3707,6 +3725,8 @@ pub fn read_variable_field_value(value: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "local-redir", feature = "local-tun"))]
+    use super::{Config, ConfigType};
     use super::OutboundProxy;
 
     #[test]
@@ -3726,5 +3746,57 @@ mod tests {
         let auth = proxy.auth.expect("auth");
         assert_eq!(auth.username, "user");
         assert_eq!(auth.password, "pass");
+    }
+
+    #[cfg(all(feature = "local-redir", feature = "local-tun"))]
+    #[test]
+    fn enabled_redir_and_tun_are_mutually_exclusive() {
+        let config = Config::load_from_json_str(
+            r#"{
+              "locals": [
+                {"protocol": "redir", "local_address": "127.0.0.1", "local_port": 12345},
+                {
+                  "protocol": "tun",
+                  "tun_interface_name": "shadowsocks-tun",
+                  "tun_interface_address": "10.255.0.1/24",
+                  "tun_interface_destination": "10.255.0.2/24"
+                }
+              ],
+              "servers": [
+                {"server": "127.0.0.1", "server_port": 8388, "method": "aes-256-gcm", "password": "password"}
+              ]
+            }"#,
+            ConfigType::Local,
+        )
+        .expect("config");
+
+        let err = config.check_integrity().expect_err("redir and tun must not both be enabled");
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[cfg(all(feature = "local-redir", feature = "local-tun"))]
+    #[test]
+    fn disabled_tun_does_not_conflict_with_redir() {
+        let config = Config::load_from_json_str(
+            r#"{
+              "locals": [
+                {"protocol": "redir", "local_address": "127.0.0.1", "local_port": 12345},
+                {
+                  "disabled": true,
+                  "protocol": "tun",
+                  "tun_interface_name": "shadowsocks-tun",
+                  "tun_interface_address": "10.255.0.1/24",
+                  "tun_interface_destination": "10.255.0.2/24"
+                }
+              ],
+              "servers": [
+                {"server": "127.0.0.1", "server_port": 8388, "method": "aes-256-gcm", "password": "password"}
+              ]
+            }"#,
+            ConfigType::Local,
+        )
+        .expect("config");
+
+        config.check_integrity().expect("disabled tun");
     }
 }
