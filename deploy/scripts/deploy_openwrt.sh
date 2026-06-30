@@ -270,13 +270,12 @@ if [[ "$REMOTE_HAS_XRAY_PLUGIN" = yes ]]; then
 elif [[ -x "$DEPLOY_BIN_DIR/xray-plugin" ]]; then
 	scp_cmd "$DEPLOY_BIN_DIR/xray-plugin" "$HOST:$REMOTE_TMP/xray-plugin"
 fi
-if [[ -s "$LOCAL_CLIENT_CONFIG" ]]; then
-	scp_cmd "$LOCAL_CLIENT_CONFIG" "$HOST:$REMOTE_TMP/shadowsocks-client.json"
+if [[ -d "$DEPLOY_CONF_DIR" ]]; then
+	tar -C "$DEPLOY_CONF_DIR" -cf - . | ssh_cmd "mkdir -p '$REMOTE_TMP/conf' && tar -C '$REMOTE_TMP/conf' -xf -"
 fi
-scp_cmd "$DEPLOY_CONF_DIR/shadowsocks-rust.init" "$HOST:$REMOTE_TMP/$SERVICE_NAME.init"
 
 if [[ -d "$DATA_SOURCE_DIR" ]]; then
-	tar -C "$DATA_SOURCE_DIR" -cf - . | ssh_cmd "tar -C '$REMOTE_TMP' -xf -"
+	tar -C "$DATA_SOURCE_DIR" -cf - . | ssh_cmd "mkdir -p '$REMOTE_TMP/data' && tar -C '$REMOTE_TMP/data' -xf -"
 fi
 
 ssh_cmd "cat > '$REMOTE_TMP/install.sh' <<'EOS'
@@ -286,6 +285,29 @@ SERVICE_NAME='$SERVICE_NAME'
 REMOTE_TMP='$REMOTE_TMP'
 DISABLE_LEGACY='$DISABLE_LEGACY'
 
+copy_missing_tree() {
+	src_dir="\$1"
+	dst_dir="\$2"
+	[ -d "\$src_dir" ] || return 0
+	mkdir -p "\$dst_dir"
+	find "\$src_dir" -type d | while IFS= read -r src_subdir; do
+		rel="\${src_subdir#\$src_dir}"
+		rel="\${rel#/}"
+		[ -n "\$rel" ] || continue
+		mkdir -p "\$dst_dir/\$rel"
+	done
+	find "\$src_dir" -type f | while IFS= read -r src_file; do
+		rel="\${src_file#\$src_dir}"
+		rel="\${rel#/}"
+		dst_file="\$dst_dir/\$rel"
+		if [ ! -e "\$dst_file" ]; then
+			dst_parent="\${dst_file%/*}"
+			mkdir -p "\$dst_parent"
+			cp -f "\$src_file" "\$dst_file"
+		fi
+	done
+}
+
 mkdir -p \"\$REMOTE_DIR/bin\" \"\$REMOTE_DIR/conf\" \"\$REMOTE_DIR/data\" \"\$REMOTE_DIR/data/temp\" \"\$REMOTE_DIR/logs\"
 cp -f \"\$REMOTE_TMP/sslocal\" \"\$REMOTE_DIR/bin/sslocal\"
 chmod 755 \"\$REMOTE_DIR/bin/sslocal\"
@@ -294,51 +316,15 @@ if [ -x \"\$REMOTE_TMP/xray-plugin\" ]; then
 	chmod 755 \"\$REMOTE_DIR/bin/xray-plugin\"
 fi
 rm -f \"\$REMOTE_DIR/bin/ssrust-watchdog.sh\"
-if [ ! -s \"\$REMOTE_DIR/conf/shadowsocks-client.json\" ] && [ -s \"\$REMOTE_TMP/shadowsocks-client.json\" ]; then
-	cp -f \"\$REMOTE_TMP/shadowsocks-client.json\" \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
-fi
+copy_missing_tree \"\$REMOTE_TMP/conf\" \"\$REMOTE_DIR/conf\"
 if [ -s \"\$REMOTE_DIR/conf/shadowsocks-client.json\" ]; then
 	chmod 644 \"\$REMOTE_DIR/conf/shadowsocks-client.json\"
 else
 	echo \"missing \$REMOTE_DIR/conf/shadowsocks-client.json\" >&2
 	exit 1
 fi
-find \"\$REMOTE_TMP\" -maxdepth 1 -type f \\
-	! -name sslocal \\
-	! -name shadowsocks-client.json \\
-	! -name \"\$SERVICE_NAME.init\" \\
-	! -name install.sh \\
-	! -name direct_ip.txt \\
-	! -name direct_domain.txt \\
-	! -name proxy_ip.txt \\
-	! -name proxy_domain.txt \\
-	! -name futu_ip.txt \\
-	! -name direct_ip.temp \\
-	! -name direct_domain.temp \\
-	! -name proxy_ip.temp \\
-	! -name proxy_domain.temp \\
-	! -name record.txt \\
-	-exec cp -f {} \"\$REMOTE_DIR/data/\" \\;
-for rule_file in direct_ip.txt direct_domain.txt proxy_ip.txt proxy_domain.txt futu_ip.txt \\
-	direct_ip.temp direct_domain.temp proxy_ip.temp proxy_domain.temp record.txt; do
-	if [ ! -e \"\$REMOTE_DIR/data/\$rule_file\" ] && [ -e \"\$REMOTE_TMP/\$rule_file\" ]; then
-		cp -f \"\$REMOTE_TMP/\$rule_file\" \"\$REMOTE_DIR/data/\$rule_file\"
-	fi
-done
-if [ -d \"\$REMOTE_TMP/temp\" ]; then
-	mkdir -p \"\$REMOTE_DIR/data/temp\"
-	find \"\$REMOTE_TMP/temp\" -maxdepth 1 -type f | while IFS= read -r temp_file; do
-		temp_name=\$(basename \"\$temp_file\")
-		if [ ! -e \"\$REMOTE_DIR/data/temp/\$temp_name\" ]; then
-			cp -f \"\$temp_file\" \"\$REMOTE_DIR/data/temp/\$temp_name\"
-		fi
-	done
-fi
-if [ -d \"\$REMOTE_TMP/source\" ]; then
-	mkdir -p \"\$REMOTE_DIR/data/source\"
-	cp -rf \"\$REMOTE_TMP/source/.\" \"\$REMOTE_DIR/data/source/\"
-fi
-cp -f \"\$REMOTE_TMP/\$SERVICE_NAME.init\" \"/etc/init.d/\$SERVICE_NAME\"
+copy_missing_tree \"\$REMOTE_TMP/data\" \"\$REMOTE_DIR/data\"
+cp -f \"\$REMOTE_TMP/conf/shadowsocks-rust.init\" \"/etc/init.d/\$SERVICE_NAME\"
 chmod 755 \"/etc/init.d/\$SERVICE_NAME\"
 
 for removed_service in sslocal-watch sslocal-probe; do

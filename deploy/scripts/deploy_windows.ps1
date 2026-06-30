@@ -233,6 +233,31 @@ function Remove-Record {
     Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
 }
 
+function Copy-MissingTree {
+    param(
+        [string]$Source,
+        [string]$Destination
+    )
+    if (-not (Test-Path -LiteralPath $Source -PathType Container)) { return }
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    $sourceRoot = (Get-Item -LiteralPath $Source).FullName.TrimEnd('\','/')
+    Get-ChildItem -LiteralPath $sourceRoot -Force -Recurse -Directory | ForEach-Object {
+        $rel = $_.FullName.Substring($sourceRoot.Length).TrimStart('\','/')
+        if ($rel) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $Destination $rel) | Out-Null
+        }
+    }
+    Get-ChildItem -LiteralPath $sourceRoot -Force -Recurse -File | ForEach-Object {
+        $rel = $_.FullName.Substring($sourceRoot.Length).TrimStart('\','/')
+        $dst = Join-Path $Destination $rel
+        if (-not (Test-Path -LiteralPath $dst)) {
+            $parent = Split-Path -Parent $dst
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+            Copy-Item -LiteralPath $_.FullName -Destination $dst
+        }
+    }
+}
+
 # ------------------------------------------------------------------
 # Network discovery helpers
 # ------------------------------------------------------------------
@@ -728,14 +753,9 @@ function Build-And-Stage {
     }
 
     $ConfigDest = Join-Path $Root "conf\shadowsocks-client.json"
-    $SharedConfig = Join-Path $SharedConfDir "shadowsocks-client.json"
-    if ((-not (Test-Path -LiteralPath $ConfigDest)) -and (Test-Path -LiteralPath $SharedConfig)) {
-        Copy-Item -Force -LiteralPath $SharedConfig -Destination $ConfigDest
-    }
+    Copy-MissingTree -Source $SharedConfDir -Destination (Join-Path $Root "conf")
     $DataDest = Join-Path $Root "data"
-    if ((Test-Path -LiteralPath $SharedDataDir) -and -not (Get-ChildItem -LiteralPath $DataDest -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
-        Get-ChildItem -LiteralPath $SharedDataDir -Force | Copy-Item -Force -Recurse -Destination $DataDest
-    }
+    Copy-MissingTree -Source $SharedDataDir -Destination $DataDest
     Write-Step "using existing config at $ConfigDest"
 
     return $ConfigDest

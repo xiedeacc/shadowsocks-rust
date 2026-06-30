@@ -96,6 +96,27 @@ install_if_missing() {
 	log "  installed $dst"
 }
 
+copy_missing_tree() {
+	local src_dir="$1" dst_dir="$2" mode="${3:-644}"
+	[[ -d "$src_dir" ]] || return 0
+	"${SUDO[@]}" mkdir -p "$dst_dir"
+	while IFS= read -r -d '' src_subdir; do
+		local rel="${src_subdir#$src_dir/}"
+		[[ "$rel" == "$src_subdir" ]] && continue
+		"${SUDO[@]}" mkdir -p "$dst_dir/$rel"
+	done < <(find "$src_dir" -type d -print0)
+	while IFS= read -r -d '' src_file; do
+		local rel="${src_file#$src_dir/}"
+		local dst_file="$dst_dir/$rel"
+		if ! "${SUDO[@]}" test -e "$dst_file"; then
+			"${SUDO[@]}" install -D -m "$mode" "$src_file" "$dst_file"
+			log "  installed $dst_file"
+		else
+			log "  keep $dst_file (already present)"
+		fi
+	done < <(find "$src_dir" -type f -print0)
+}
+
 # 1) Build sslocal.
 if [[ "$SKIP_BUILD" != 1 ]]; then
 	log "building sslocal (features: $FEATURES)"
@@ -130,7 +151,7 @@ log "installed $INSTALL_DIR/bin/sslocal ($("$STAGED_BINARY" --version 2>&1))"
 # 4) Everything else — install-if-missing only.
 log "syncing auxiliary files (install-if-missing)"
 install_if_missing "$DEPLOY_BIN_DIR/xray-plugin" "$INSTALL_DIR/bin/xray-plugin" 755
-install_if_missing "$DEPLOY_CONF_DIR/shadowsocks-client.json" "$INSTALL_DIR/conf/shadowsocks-client.json" 644
+copy_missing_tree "$DEPLOY_CONF_DIR" "$INSTALL_DIR/conf" 644
 
 # Conf is the source of truth — refuse to start without it.
 if [[ ! -s "$INSTALL_DIR/conf/shadowsocks-client.json" ]]; then
@@ -138,11 +159,8 @@ if [[ ! -s "$INSTALL_DIR/conf/shadowsocks-client.json" ]]; then
 	exit 1
 fi
 
-# Data dir — seed only if completely empty.
-if [[ -d "$DEPLOY_DATA_DIR" && -z "$(ls -A "$INSTALL_DIR/data" 2>/dev/null)" ]]; then
-	log "data dir empty — seeding from $DEPLOY_DATA_DIR"
-	tar -C "$DEPLOY_DATA_DIR" -cf - . | "${SUDO[@]}" tar -C "$INSTALL_DIR/data" -xf -
-fi
+# Data dir — recursively seed missing files only; never overwrite operator data.
+copy_missing_tree "$DEPLOY_DATA_DIR" "$INSTALL_DIR/data" 644
 
 # 5) Sysctl tuning — mirrors deploy/conf/shadowsocks-rust.init
 #    apply_network_tuning(). Volatile (no /etc/sysctl.d) on purpose:
