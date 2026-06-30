@@ -86,15 +86,6 @@
     }
 
     #[test]
-    fn proxy_local_output_defaults_off() {
-        let mut config = RouteRulesConfig::default();
-        assert!(!RoutingSources::from(&config).proxy_local_output);
-
-        config.proxy_local_output = true;
-        assert!(RoutingSources::from(&config).proxy_local_output);
-    }
-
-    #[test]
     fn fixed_direct_ip_matches_documented_ranges() {
         for ip in [
             "0.1.2.3",

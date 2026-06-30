@@ -697,6 +697,10 @@ function Build-And-Stage {
     )
 
     $ReleaseDir   = Join-Path $RepoRoot "target\release"
+    $DeployDir    = Join-Path $RepoRoot "deploy"
+    $SharedBinDir = Join-Path $DeployDir "bin"
+    $SharedConfDir = Join-Path $DeployDir "conf"
+    $SharedDataDir = Join-Path $DeployDir "data"
 
     if (-not $SkipBuild) {
         Write-Step "cargo build --release (features: $Features)"
@@ -705,13 +709,17 @@ function Build-And-Stage {
     }
 
     New-Item -ItemType Directory -Force -Path @(
+        $SharedBinDir,
         (Join-Path $Root "bin"),
         (Join-Path $Root "conf"),
+        (Join-Path $Root "data"),
         (Join-Path $Root "logs"),
         (Get-StateDir -Root $Root)
     ) | Out-Null
 
-    Copy-Item -Force -LiteralPath (Join-Path $ReleaseDir "sslocal.exe")      -Destination (Join-Path $Root "bin\sslocal.exe")
+    $StagedSslocal = Join-Path $SharedBinDir "sslocal_windows.exe"
+    Copy-Item -Force -LiteralPath (Join-Path $ReleaseDir "sslocal.exe") -Destination $StagedSslocal
+    Copy-Item -Force -LiteralPath $StagedSslocal -Destination (Join-Path $Root "bin\sslocal.exe")
     if (Test-Path -LiteralPath (Join-Path $ReleaseDir "sswinservice.exe")) {
         Copy-Item -Force -LiteralPath (Join-Path $ReleaseDir "sswinservice.exe") -Destination (Join-Path $Root "bin\sswinservice.exe")
     }
@@ -720,6 +728,14 @@ function Build-And-Stage {
     }
 
     $ConfigDest = Join-Path $Root "conf\shadowsocks-client.json"
+    $SharedConfig = Join-Path $SharedConfDir "shadowsocks-client.json"
+    if ((-not (Test-Path -LiteralPath $ConfigDest)) -and (Test-Path -LiteralPath $SharedConfig)) {
+        Copy-Item -Force -LiteralPath $SharedConfig -Destination $ConfigDest
+    }
+    $DataDest = Join-Path $Root "data"
+    if ((Test-Path -LiteralPath $SharedDataDir) -and -not (Get-ChildItem -LiteralPath $DataDest -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        Get-ChildItem -LiteralPath $SharedDataDir -Force | Copy-Item -Force -Recurse -Destination $DataDest
+    }
     Write-Step "using existing config at $ConfigDest"
 
     return $ConfigDest
@@ -963,6 +979,11 @@ function Invoke-RestartAction {
     }
 
     $ReleaseDir = Join-Path $RepoRoot "target\release"
+    $SharedBinDir = Join-Path (Join-Path $RepoRoot "deploy") "bin"
+    New-Item -ItemType Directory -Force -Path $SharedBinDir | Out-Null
+    if (Test-Path -LiteralPath (Join-Path $ReleaseDir "sslocal.exe")) {
+        Copy-Item -Force -LiteralPath (Join-Path $ReleaseDir "sslocal.exe") -Destination (Join-Path $SharedBinDir "sslocal_windows.exe")
+    }
     foreach ($exe in 'sslocal.exe','sswinservice.exe') {
         $src = Join-Path $ReleaseDir $exe
         $dst = Join-Path $Root "bin\$exe"

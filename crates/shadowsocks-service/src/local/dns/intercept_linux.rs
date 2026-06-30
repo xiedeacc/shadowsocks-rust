@@ -211,7 +211,6 @@ pub fn setup_firewall_redirect(
     dns_exempt_ips: &[IpAddr],
     proxy_exempt_endpoints: &[(IpAddr, u16)],
     global_proxy: bool,
-    proxy_local_output: bool,
     client_ip_rules: &ClientIpRules,
     local_output_exempt_mark: Option<u32>,
     dns_ipv4_only: bool,
@@ -222,7 +221,6 @@ pub fn setup_firewall_redirect(
         dns_exempt_ips,
         proxy_exempt_endpoints,
         global_proxy,
-        proxy_local_output,
         client_ip_rules,
         local_output_exempt_mark,
         dns_ipv4_only,
@@ -767,7 +765,6 @@ fn setup_nft(
     dns_exempt_ips: &[IpAddr],
     proxy_exempt_endpoints: &[(IpAddr, u16)],
     global_proxy: bool,
-    proxy_local_output: bool,
     client_ip_rules: &ClientIpRules,
     local_output_exempt_mark: Option<u32>,
     dns_ipv4_only: bool,
@@ -855,8 +852,7 @@ fn setup_nft(
             )?;
         }
         add_output_loopback_dns_redirect_rule(proto, port)?;
-        if proxy_local_output
-            && proto == "tcp"
+        if proto == "tcp"
             && let Some(redir_port) = redir_port
         {
             if let Some(mark) = local_output_exempt_mark {
@@ -894,7 +890,6 @@ fn setup_nft(
             redir_port,
             proxy_exempt_endpoints,
             global_proxy,
-            proxy_local_output,
             client_ip_rules,
             local_output_exempt_mark,
             dns_ipv4_only,
@@ -1103,16 +1098,13 @@ fn setup_nft_udp_tproxy(
     redir_port: u16,
     proxy_exempt_endpoints: &[(IpAddr, u16)],
     global_proxy: bool,
-    proxy_local_output: bool,
     client_ip_rules: &ClientIpRules,
     local_output_exempt_mark: Option<u32>,
     dns_ipv4_only: bool,
 ) -> io::Result<()> {
     setup_tproxy_policy_routing()?;
     add_nft_base_chain(TPROXY_PREROUTING_CHAIN, "filter", "prerouting", "mangle")?;
-    if proxy_local_output {
-        add_nft_base_chain(TPROXY_OUTPUT_CHAIN, "route", "output", "mangle")?;
-    }
+    add_nft_base_chain(TPROXY_OUTPUT_CHAIN, "route", "output", "mangle")?;
     if let Some(mark) = local_output_exempt_mark {
         let mark_arg = format!("{mark:#x}");
         command(
@@ -1152,36 +1144,34 @@ fn setup_nft_udp_tproxy(
             client_ip_rules,
         )?;
     }
-    if proxy_local_output {
+    command(
+        "nft",
+        &[
+            "add",
+            "rule",
+            "inet",
+            NFT_TABLE,
+            TPROXY_OUTPUT_CHAIN,
+            "meta",
+            "mark",
+            TPROXY_MARK,
+            "return",
+        ],
+    )?;
+    // H-5: also exempt sslocal's own marked outbound UDP from the output
+    // tproxy chain by identity, so the proxy transport can never self-loop.
+    if let Some(mark) = local_output_exempt_mark {
+        let mark_arg = format!("{mark:#x}");
         command(
             "nft",
-            &[
-                "add",
-                "rule",
-                "inet",
-                NFT_TABLE,
-                TPROXY_OUTPUT_CHAIN,
-                "meta",
-                "mark",
-                TPROXY_MARK,
-                "return",
-            ],
+            &["add", "rule", "inet", NFT_TABLE, TPROXY_OUTPUT_CHAIN, "meta", "mark", &mark_arg, "return"],
         )?;
-        // H-5: also exempt sslocal's own marked outbound UDP from the output
-        // tproxy chain by identity, so the proxy transport can never self-loop.
-        if let Some(mark) = local_output_exempt_mark {
-            let mark_arg = format!("{mark:#x}");
-            command(
-                "nft",
-                &["add", "rule", "inet", NFT_TABLE, TPROXY_OUTPUT_CHAIN, "meta", "mark", &mark_arg, "return"],
-            )?;
-        }
-        add_output_loopback_return_rule(TPROXY_OUTPUT_CHAIN)?;
-        add_proxy_endpoint_return_rules(TPROXY_OUTPUT_CHAIN, "udp", proxy_exempt_endpoints)?;
-        add_nft_udp_tproxy_output_rule("ip", "@proxy4", "@direct4", global_proxy)?;
-        if !dns_ipv4_only {
-            add_nft_udp_tproxy_output_rule("ip6", "@proxy6", "@direct6", global_proxy)?;
-        }
+    }
+    add_output_loopback_return_rule(TPROXY_OUTPUT_CHAIN)?;
+    add_proxy_endpoint_return_rules(TPROXY_OUTPUT_CHAIN, "udp", proxy_exempt_endpoints)?;
+    add_nft_udp_tproxy_output_rule("ip", "@proxy4", "@direct4", global_proxy)?;
+    if !dns_ipv4_only {
+        add_nft_udp_tproxy_output_rule("ip6", "@proxy6", "@direct6", global_proxy)?;
     }
     Ok(())
 }

@@ -177,8 +177,8 @@ impl Server {
         #[cfg(not(all(windows, feature = "local-tun")))]
         let outbound_bind_addr = config.outbound_bind_addr;
 
-        // H-5: when firewall transparent proxy also captures the router's OWN
-        // output (proxy_local_output), tag sslocal's outbound sockets with a
+        // H-5: firewall transparent proxy also captures the router's OWN
+        // output, so tag sslocal's outbound sockets with a
         // dedicated fwmark so the output redirect/tproxy chains can exempt them
         // by identity (`meta mark <mark> return`) — a loop guard that, unlike the
         // SS-server-IP `return` rule, cannot go stale for a domain-name server.
@@ -187,7 +187,7 @@ impl Server {
         let local_output_exempt_mark: Option<u32> = if matches!(
             config.route_rules.dns_intercept_mode.as_str(),
             "firewall" | "both"
-        ) && config.route_rules.proxy_local_output
+        )
         {
             Some(
                 config
@@ -858,7 +858,6 @@ impl Server {
                             &dns_intercept_exempt_ips,
                             &dns_intercept_proxy_exempt_endpoints,
                             global_proxy,
-                            config.route_rules.proxy_local_output,
                             &dns_intercept_client_ip_rules,
                             local_output_exempt_mark,
                             config.route_rules.dns_ipv4_only,

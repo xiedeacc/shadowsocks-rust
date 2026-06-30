@@ -637,8 +637,6 @@ struct SSRouteRulesConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     global_proxy: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    proxy_local_output: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     client_global_proxy_ips: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     client_direct_ips: Option<Vec<String>>,
@@ -1595,7 +1593,6 @@ pub struct RouteRulesConfig {
     pub geoip_sources: Vec<String>,
     pub proxy_domain_sources: Vec<String>,
     pub global_proxy: bool,
-    pub proxy_local_output: bool,
     pub client_global_proxy_ips: Vec<IpAddr>,
     pub client_direct_ips: Vec<IpAddr>,
     pub dns_cache_capacity: usize,
@@ -1618,7 +1615,6 @@ impl Default for RouteRulesConfig {
             geoip_sources: vec![DEFAULT_GEOIP_SOURCE.to_owned()],
             proxy_domain_sources: DEFAULT_PROXY_DOMAIN_SOURCES.iter().map(|s| (*s).to_owned()).collect(),
             global_proxy: false,
-            proxy_local_output: false,
             client_global_proxy_ips: Vec::new(),
             client_direct_ips: Vec::new(),
             dns_cache_capacity: 100_000,
@@ -2844,9 +2840,6 @@ impl Config {
                 if let Some(global_proxy) = route_rules.global_proxy {
                     parsed.global_proxy = global_proxy;
                 }
-                if let Some(proxy_local_output) = route_rules.proxy_local_output {
-                    parsed.proxy_local_output = proxy_local_output;
-                }
                 if let Some(ips) = route_rules.client_global_proxy_ips {
                     parsed.client_global_proxy_ips = parse_route_rule_ip_list("client_global_proxy_ips", ips)?;
                 }
@@ -3663,7 +3656,6 @@ impl fmt::Display for Config {
                 geoip_sources: Some(self.route_rules.geoip_sources.clone()),
                 proxy_domain_sources: Some(self.route_rules.proxy_domain_sources.clone()),
                 global_proxy: Some(self.route_rules.global_proxy),
-                proxy_local_output: Some(self.route_rules.proxy_local_output),
                 client_global_proxy_ips: Some(
                     self.route_rules
                         .client_global_proxy_ips

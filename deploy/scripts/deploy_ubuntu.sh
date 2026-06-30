@@ -19,7 +19,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-UBUNTU_DIR="$ROOT_DIR/deploy/ubuntu"
+DEPLOY_DIR="$ROOT_DIR/deploy"
+DEPLOY_BIN_DIR="$DEPLOY_DIR/bin"
+DEPLOY_CONF_DIR="$DEPLOY_DIR/conf"
+DEPLOY_DATA_DIR="$DEPLOY_DIR/data"
 
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/shadowsocks}"
 SERVICE_NAME="${SERVICE_NAME:-shadowsocks-client}"
@@ -103,11 +106,14 @@ if [[ "$SKIP_BUILD" != 1 ]]; then
 		--bin sslocal
 fi
 
-BINARY="$ROOT_DIR/target/release/sslocal"
-if [[ ! -x "$BINARY" ]]; then
-	log "ERROR: $BINARY not found; run without SKIP_BUILD=1 first" >&2
+mkdir -p "$DEPLOY_BIN_DIR"
+BUILD_BINARY="$ROOT_DIR/target/release/sslocal"
+STAGED_BINARY="$DEPLOY_BIN_DIR/sslocal_ubuntu"
+if [[ ! -x "$BUILD_BINARY" ]]; then
+	log "ERROR: $BUILD_BINARY not found; run without SKIP_BUILD=1 first" >&2
 	exit 1
 fi
+install -m 755 "$BUILD_BINARY" "$STAGED_BINARY"
 
 # 2) Layout — make dirs only.
 "${SUDO[@]}" mkdir -p \
@@ -118,27 +124,27 @@ fi
 	"$INSTALL_DIR/logs/dumps"
 
 # 3) sslocal binary — ALWAYS reinstall.
-"${SUDO[@]}" install -m 755 "$BINARY" "$INSTALL_DIR/bin/sslocal"
-log "installed $INSTALL_DIR/bin/sslocal ($("$BINARY" --version 2>&1))"
+"${SUDO[@]}" install -m 755 "$STAGED_BINARY" "$INSTALL_DIR/bin/sslocal"
+log "installed $INSTALL_DIR/bin/sslocal ($("$STAGED_BINARY" --version 2>&1))"
 
 # 4) Everything else — install-if-missing only.
 log "syncing auxiliary files (install-if-missing)"
-install_if_missing "$UBUNTU_DIR/bin/xray-plugin"          "$INSTALL_DIR/bin/xray-plugin"          755
-install_if_missing "$UBUNTU_DIR/conf/shadowsocks-client.json" "$INSTALL_DIR/conf/shadowsocks-client.json" 644
+install_if_missing "$DEPLOY_BIN_DIR/xray-plugin" "$INSTALL_DIR/bin/xray-plugin" 755
+install_if_missing "$DEPLOY_CONF_DIR/shadowsocks-client.json" "$INSTALL_DIR/conf/shadowsocks-client.json" 644
 
 # Conf is the source of truth — refuse to start without it.
 if [[ ! -s "$INSTALL_DIR/conf/shadowsocks-client.json" ]]; then
-	log "ERROR: $INSTALL_DIR/conf/shadowsocks-client.json missing and no template at $UBUNTU_DIR/conf/" >&2
+	log "ERROR: $INSTALL_DIR/conf/shadowsocks-client.json missing and no template at $DEPLOY_CONF_DIR/" >&2
 	exit 1
 fi
 
 # Data dir — seed only if completely empty.
-if [[ -d "$UBUNTU_DIR/data" && -z "$(ls -A "$INSTALL_DIR/data" 2>/dev/null)" ]]; then
-	log "data dir empty — seeding from $UBUNTU_DIR/data"
-	tar -C "$UBUNTU_DIR/data" -cf - . | "${SUDO[@]}" tar -C "$INSTALL_DIR/data" -xf -
+if [[ -d "$DEPLOY_DATA_DIR" && -z "$(ls -A "$INSTALL_DIR/data" 2>/dev/null)" ]]; then
+	log "data dir empty — seeding from $DEPLOY_DATA_DIR"
+	tar -C "$DEPLOY_DATA_DIR" -cf - . | "${SUDO[@]}" tar -C "$INSTALL_DIR/data" -xf -
 fi
 
-# 5) Sysctl tuning — mirrors deploy/openwrt/conf/shadowsocks-rust.init
+# 5) Sysctl tuning — mirrors deploy/conf/shadowsocks-rust.init
 #    apply_network_tuning(). Volatile (no /etc/sysctl.d) on purpose:
 #    this is a debugging workstation, not a permanent gateway.
 if [[ "$APPLY_SYSCTL" = 1 ]]; then

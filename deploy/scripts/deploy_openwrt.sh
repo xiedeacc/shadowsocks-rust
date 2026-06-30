@@ -2,8 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-OPENWRT_DIR="$ROOT_DIR/deploy/openwrt"
-UBUNTU_DATA_FALLBACK="$ROOT_DIR/deploy/ubuntu/arm64/data"
+DEPLOY_DIR="$ROOT_DIR/deploy"
+DEPLOY_BIN_DIR="$DEPLOY_DIR/bin"
+DEPLOY_CONF_DIR="$DEPLOY_DIR/conf"
+DEPLOY_DATA_DIR="$DEPLOY_DIR/data"
 
 HOST="${HOST:-root@openwrt}"
 SSH_PORT="${SSH_PORT:-}"
@@ -245,10 +247,10 @@ cargo build \
 	--features "$FEATURES" \
 	--bin sslocal
 
-mkdir -p "$OPENWRT_DIR/bin" "$OPENWRT_DIR/conf" "$OPENWRT_DIR/data" "$OPENWRT_DIR/logs"
-install -m 755 "$ROOT_DIR/target/$TARGET_TRIPLE/release/sslocal" "$OPENWRT_DIR/bin/sslocal"
+mkdir -p "$DEPLOY_BIN_DIR" "$DEPLOY_CONF_DIR" "$DEPLOY_DATA_DIR" "$DEPLOY_DIR/logs"
+install -m 755 "$ROOT_DIR/target/$TARGET_TRIPLE/release/sslocal" "$DEPLOY_BIN_DIR/sslocal_openwrt"
 
-LOCAL_CLIENT_CONFIG="$OPENWRT_DIR/conf/shadowsocks-client.json"
+LOCAL_CLIENT_CONFIG="$DEPLOY_CONF_DIR/shadowsocks-client.json"
 if [[ ! -s "$LOCAL_CLIENT_CONFIG" ]]; then
 	if ssh_cmd "test -s '$REMOTE_DIR/conf/shadowsocks-client.json'"; then
 		printf 'Local client config missing; keeping existing remote %s/conf/shadowsocks-client.json.\n' "$REMOTE_DIR"
@@ -258,23 +260,20 @@ if [[ ! -s "$LOCAL_CLIENT_CONFIG" ]]; then
 	fi
 fi
 
-DATA_SOURCE_DIR="$OPENWRT_DIR/data"
-if [[ -d "$UBUNTU_DATA_FALLBACK" ]] && ! find "$DATA_SOURCE_DIR" -type f -print -quit | grep -q .; then
-	DATA_SOURCE_DIR="$UBUNTU_DATA_FALLBACK"
-fi
+DATA_SOURCE_DIR="$DEPLOY_DATA_DIR"
 
 ssh_cmd "rm -rf '$REMOTE_TMP' && mkdir -p '$REMOTE_TMP' '$REMOTE_DIR/bin' '$REMOTE_DIR/conf' '$REMOTE_DIR/data' '$REMOTE_DIR/logs'"
-scp_cmd "$OPENWRT_DIR/bin/sslocal" "$HOST:$REMOTE_TMP/sslocal"
+scp_cmd "$DEPLOY_BIN_DIR/sslocal_openwrt" "$HOST:$REMOTE_TMP/sslocal"
 REMOTE_HAS_XRAY_PLUGIN="$(ssh_cmd "test -x '$REMOTE_DIR/bin/xray-plugin' && printf yes || printf no")"
 if [[ "$REMOTE_HAS_XRAY_PLUGIN" = yes ]]; then
 	printf 'Remote xray-plugin already exists at %s/bin/xray-plugin; skipping copy.\n' "$REMOTE_DIR"
-elif [[ -x "$OPENWRT_DIR/bin/xray-plugin" ]]; then
-	scp_cmd "$OPENWRT_DIR/bin/xray-plugin" "$HOST:$REMOTE_TMP/xray-plugin"
+elif [[ -x "$DEPLOY_BIN_DIR/xray-plugin" ]]; then
+	scp_cmd "$DEPLOY_BIN_DIR/xray-plugin" "$HOST:$REMOTE_TMP/xray-plugin"
 fi
 if [[ -s "$LOCAL_CLIENT_CONFIG" ]]; then
 	scp_cmd "$LOCAL_CLIENT_CONFIG" "$HOST:$REMOTE_TMP/shadowsocks-client.json"
 fi
-scp_cmd "$OPENWRT_DIR/conf/shadowsocks-rust.init" "$HOST:$REMOTE_TMP/$SERVICE_NAME.init"
+scp_cmd "$DEPLOY_CONF_DIR/shadowsocks-rust.init" "$HOST:$REMOTE_TMP/$SERVICE_NAME.init"
 
 if [[ -d "$DATA_SOURCE_DIR" ]]; then
 	tar -C "$DATA_SOURCE_DIR" -cf - . | ssh_cmd "tar -C '$REMOTE_TMP' -xf -"
