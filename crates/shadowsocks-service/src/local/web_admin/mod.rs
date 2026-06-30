@@ -2091,6 +2091,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <fieldset>
             <div class="form-line"><label>Bind Address</label><select id="futuSocksBind"><option>127.0.0.1</option><option>0.0.0.0</option><option>::</option></select></div>
             <div class="form-line"><label>Port</label><input id="futuSocksPort" type="number" min="1" max="65535" value="1082"></div>
+            <div class="form-line"><label>Record Proxy IP</label><input id="futuRecordProxyIp" type="checkbox"></div>
           </fieldset>
         </div>
         <div class="config-group">
@@ -2308,8 +2309,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function lines(v){return (v||'').split('\n').map(s=>s.trim()).filter(Boolean)}
     function setLines(id,arr){document.getElementById(id).value=(arr||[]).join('\n')}
     function num(v,d){let n=parseInt(v,10);return Number.isFinite(n)?n:d}
-    function firstLocal(protocol){return (currentRawConfig.locals||[]).find(l=>l.protocol===protocol&&!l.record_proxy_ip)||{}}
-    function futuSocksLocal(){return (currentRawConfig.locals||[]).find(l=>l.protocol==='socks'&&l.record_proxy_ip)||{}}
+    function socksLocals(){return (currentRawConfig.locals||[]).filter(l=>l.protocol==='socks')}
+    function firstLocal(protocol){return protocol==='socks'?(socksLocals()[0]||{}):((currentRawConfig.locals||[]).find(l=>l.protocol===protocol)||{})}
+    function futuSocksLocal(){let socks=socksLocals();return socks.find(l=>l.record_proxy_ip)||socks[1]||{}}
     const bindSelectIds=['socksBind','futuSocksBind','httpBind','dnsBind','redirBind'];
     function setSelect(id,value){let el=document.getElementById(id); if([...el.options].some(o=>o.value===value)){el.value=value}else{let opt=document.createElement('option');opt.value=value;opt.textContent=value;el.appendChild(opt);el.value=value}}
     function renderBindAddressOptions(){
@@ -2494,6 +2496,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       renderBindAddressOptions();
       setSelect('socksBind',socks.local_address||'127.0.0.1'); socksPort.value=socks.local_port||1080;
       setSelect('futuSocksBind',futu.local_address||socks.local_address||'0.0.0.0'); futuSocksPort.value=futu.local_port||1082;
+      futuRecordProxyIp.checked=futu.protocol?futu.record_proxy_ip===true:true;
       setSelect('httpBind',http.local_address||'127.0.0.1'); httpPort.value=http.local_port||1081;
       globalProxy.checked=!!routeRules.global_proxy;
       renderClientPolicyLists(routeRules);
@@ -2529,7 +2532,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const effectiveDnsInterceptMode=wantsProxy&&!useTun&&dnsInterceptMode.value==='off'?'both':dnsInterceptMode.value;
       let locals=[
         {local_address:socksBind.value,local_port:num(socksPort.value,1080),protocol:'socks'},
-        {local_address:futuSocksBind.value,local_port:num(futuSocksPort.value,1082),protocol:'socks',record_proxy_ip:true},
+        {local_address:futuSocksBind.value,local_port:num(futuSocksPort.value,1082),protocol:'socks',record_proxy_ip:futuRecordProxyIp.checked},
         {local_address:httpBind.value,local_port:num(httpPort.value,1081),protocol:'http'}
       ];
       const existingRedir=firstLocal('redir');
@@ -2656,7 +2659,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function saveClientConfig(){if(restartInProgress)return;updateClientJson();setRestartControls(true);configPath.textContent='saving config...';let r;try{r=await api('/api/client-config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:clientConfig.value})})}catch(e){configPath.textContent='save failed: '+e.message;setRestartControls(false);return}if(r.unchanged){configPath.textContent=currentConfigPath+' unchanged';alert('No config changes');setRestartControls(false);return}configPath.textContent='saved, restarting service...';await waitForRestartComplete(currentConfigPath+' saved and service restarted')}
     async function restartService(){if(restartInProgress)return;setRestartControls(true);configPath.textContent='restarting service...';try{await api('/api/restart',{method:'POST'})}catch(e){console.warn(e)}await waitForRestartComplete('service restarted')}
-    ['socksBind','socksPort','futuSocksBind','futuSocksPort','httpBind','httpPort','redirEnable','globalProxy','redirBind','redirPort','tunName','tunAddress','tunDestination','dnsEnable','dnsBind','dnsPort','dnsDomestic','dnsForeign','dnsCacheCapacity','dnsCacheTtl','dnsCacheRefreshEnabled','dnsCacheRefreshBatch','dnsInterceptMode','dnsIpv4Only'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
+    ['socksBind','socksPort','futuSocksBind','futuSocksPort','futuRecordProxyIp','httpBind','httpPort','redirEnable','globalProxy','redirBind','redirPort','tunName','tunAddress','tunDestination','dnsEnable','dnsBind','dnsPort','dnsDomestic','dnsForeign','dnsCacheCapacity','dnsCacheTtl','dnsCacheRefreshEnabled','dnsCacheRefreshBatch','dnsInterceptMode','dnsIpv4Only'].forEach(id=>setTimeout(()=>document.getElementById(id).addEventListener('input',updateClientJson),0));
     setTimeout(()=>{serverList.addEventListener('input',updateClientJson);serverList.addEventListener('change',updateClientJson)},0);
 
     async function loadRules(){
