@@ -1,0 +1,94 @@
+{
+  "locals": [
+    {
+      "local_address": "::",
+      "local_port": 1080,
+      "protocol": "socks"
+    },
+    {
+      "local_address": "::",
+      "local_port": 1082,
+      "protocol": "socks",
+      "record_proxy_ip": true
+    },
+    {
+      "local_address": "::",
+      "local_port": 1081,
+      "protocol": "http"
+    },
+    {
+      "disabled": false,
+      "local_address": "::",
+      "local_port": 12345,
+      "protocol": "redir",
+      "mode": "tcp_and_udp",
+      "tcp_redir": "redirect",
+      "udp_redir": "tproxy"
+    },
+    {
+      "disabled": false,
+      "local_address": "::",
+      "local_port": 1053,
+      "protocol": "dns",
+      "mode": "tcp_and_udp",
+      "local_dns_address": "223.5.5.5",
+      "local_dns_port": 53,
+      "remote_dns_address": "8.8.8.8",
+      "remote_dns_port": 53,
+      "client_cache_size": 64
+    },
+    {
+      "disabled": true,
+      "protocol": "tun",
+      "mode": "tcp_and_udp",
+      "tun_interface_name": "shadowsocks-tun",
+      "tun_interface_address": "10.255.0.1/24",
+      "tun_interface_destination": "10.255.0.2/24"
+    }
+  ],
+  "no_delay": true,
+  "nofile": 1048576,
+  "outbound_fwmark": 255,
+  "route_rules": {
+    "client_direct_ips": [],
+    "client_global_proxy_ips": [],
+    "dns_cache_capacity": 100000,
+    "dns_cache_refresh_batch_size": 500,
+    "dns_cache_refresh_enabled": true,
+    "dns_cache_ttl_seconds": 604800,
+    "dns_intercept_mode": "both",
+    "dns_ipv4_only": true,
+    "geoip_sources": [
+      "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+    ],
+    "global_proxy": false,
+    "proxy_domain_sources": [
+      "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt"
+    ]
+  },
+  "servers": [
+    {
+      "server": "xxx",
+      "server_port": 443,
+      "password": "xxx",
+      "timeout": 300,
+      "method": "aes-256-gcm",
+      "disabled": true,
+      "plugin": "/usr/local/shadowsocks/bin/xray-plugin",
+      "plugin_opts": "tls;host=xxx.xxx.com;path=/sspath"
+    },
+    {
+      "server": "xxx",
+      "server_port": 443,
+      "password": "xxx",
+      "timeout": 300,
+      "method": "aes-256-gcm",
+      "disabled": false,
+      "plugin": "/usr/local/shadowsocks/bin/xray-plugin",
+      "plugin_opts": "tls;host=xxx.xxx.com;path=/sspath"
+    }
+  ],
+  "web_admin": {
+    "listen": "192.168.2.1:9090"
+  }
+}

@@ -1,6 +1,6 @@
 /deploy/scripts/__pycache__/
 /deploy/openwrt/bin/__pycache__/
-/__pycache__/
+__pycache__/
 nohup.out
 target
 /build/release
