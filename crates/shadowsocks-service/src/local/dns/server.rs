@@ -1365,7 +1365,12 @@ impl DnsClient {
             if let Some(route) = routing_state.route_domain_for_source_detail(&domain, source_ip).await {
                 let decision = route.decision;
                 let query_type = query.query_type().to_string();
-                if let Some(cached) = routing_state.dns_cache_lookup(&domain, &query_type, decision).await {
+                let bypass_cache = routing_state
+                    .take_dns_cache_bypass(&domain, &query_type, source_ip)
+                    .await;
+                if !bypass_cache
+                    && let Some(cached) = routing_state.dns_cache_lookup(&domain, &query_type, decision).await
+                {
                     let mut cached = cached;
                     maybe_strip_proxy_ipv6_answers(&self.context, decision, &mut cached);
                     let ips = collect_answer_ips(&cached);
@@ -1401,9 +1406,11 @@ impl DnsClient {
                         decision,
                         ips
                     );
-                    routing_state
-                        .dns_cache_insert(&domain, &query_type, decision, msg.clone(), ips.clone())
-                        .await;
+                    if !bypass_cache {
+                        routing_state
+                            .dns_cache_insert(&domain, &query_type, decision, msg.clone(), ips.clone())
+                            .await;
+                    }
                     if route.update_route_sets && !ips.is_empty() {
                         let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
                     }
@@ -1416,7 +1423,12 @@ impl DnsClient {
             }
             let query_type = query.query_type().to_string();
             let decision = RouteDecision::Direct;
-            if let Some(cached) = routing_state.dns_cache_lookup(&domain, &query_type, decision).await {
+            let bypass_cache = routing_state
+                .take_dns_cache_bypass(&domain, &query_type, source_ip)
+                .await;
+            if !bypass_cache
+                && let Some(cached) = routing_state.dns_cache_lookup(&domain, &query_type, decision).await
+            {
                 let mut cached = cached;
                 maybe_strip_proxy_ipv6_answers(&self.context, decision, &mut cached);
                 let ips = collect_answer_ips(&cached);
@@ -1439,9 +1451,11 @@ impl DnsClient {
             if let Ok(mut msg) = response {
                 maybe_strip_proxy_ipv6_answers(&self.context, decision, &mut msg);
                 let ips = collect_answer_ips(&msg);
-                routing_state
-                    .dns_cache_insert(&domain, &query_type, decision, msg.clone(), ips.clone())
-                    .await;
+                if !bypass_cache {
+                    routing_state
+                        .dns_cache_insert(&domain, &query_type, decision, msg.clone(), ips.clone())
+                        .await;
+                }
                 if !ips.is_empty() {
                     let _ = routing_state.add_dns_results(decision, &domain, &ips).await;
                 }

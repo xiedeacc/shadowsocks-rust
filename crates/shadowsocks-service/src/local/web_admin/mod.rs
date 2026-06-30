@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     fs, io,
-    net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     pin::Pin,
     process::{Command, Stdio},
@@ -19,10 +19,19 @@ use std::{
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
+use hickory_resolver::proto::{
+    op::{Message, Query},
+    rr::{Name, RData, RecordType},
+    serialize::binary::{BinDecodable, BinEncodable},
+};
 use hyper::{Method, Request, Response, StatusCode, body::Incoming, server::conn::http1, service::service_fn};
 use log::{error, info, trace};
 use pin_project::pin_project;
-use tokio::{net::TcpListener, sync::Mutex, time};
+use tokio::{
+    net::{TcpListener, UdpSocket},
+    sync::Mutex,
+    time,
+};
 
 use crate::{
     config::{DEFAULT_DEPLOY_DIR, WebAdminConfig},
@@ -269,9 +278,10 @@ impl WebAdminHandler {
             )),
             (Method::GET, "/api/dns/cache/query") => {
                 let domain = query_param(req.uri().query(), "domain").unwrap_or_default();
+                let query_type = query_param(req.uri().query(), "type").unwrap_or_else(|| "A".to_owned());
                 Ok(json_response(
                     StatusCode::OK,
-                    &self.routing_state.dns_cache_query(&domain).await,
+                    &self.dns_cache_query_report(&domain, &query_type).await,
                 ))
             }
             (Method::GET, "/api/dns/cache/query-ip") => {
@@ -645,6 +655,103 @@ impl WebAdminHandler {
         }
         None
     }
+
+    async fn dns_cache_query_report(&self, domain: &str, query_type: &str) -> Vec<DnsCacheInspectRow> {
+        let query_type = query_type.trim().to_ascii_uppercase();
+        let mut rows = Vec::new();
+        for entry in self
+            .routing_state
+            .dns_cache_query(domain)
+            .await
+            .into_iter()
+            .filter(|entry| entry.query_type == query_type)
+        {
+            rows.push(DnsCacheInspectRow {
+                source: "cache",
+                domain: entry.domain,
+                query_type: entry.query_type,
+                resolver: Some(entry.resolver),
+                cache_hit: true,
+                results: entry.results.clone(),
+                ping_results: ping_dns_results(&entry.results).await,
+                expires_at: Some(entry.expires_at),
+                inserted_at: Some(entry.inserted_at),
+                refreshed_at: Some(entry.refreshed_at),
+                error: None,
+            });
+        }
+
+        rows.push(self.dns_live_uncached_row(domain, &query_type).await);
+        rows
+    }
+
+    async fn dns_live_uncached_row(&self, domain: &str, query_type: &str) -> DnsCacheInspectRow {
+        let normalized_domain = clean_dns_query_domain(domain);
+        let decision = self
+            .routing_state
+            .route_domain(&normalized_domain)
+            .await
+            .unwrap_or(RouteDecision::Direct);
+
+        match self.query_local_dns_uncached(&normalized_domain, query_type).await {
+            Ok(results) => DnsCacheInspectRow {
+                source: "live_uncached",
+                domain: normalized_domain,
+                query_type: query_type.to_owned(),
+                resolver: Some(decision),
+                cache_hit: false,
+                ping_results: ping_dns_results(&results).await,
+                results,
+                expires_at: None,
+                inserted_at: None,
+                refreshed_at: None,
+                error: None,
+            },
+            Err(err) => DnsCacheInspectRow {
+                source: "live_uncached",
+                domain: normalized_domain,
+                query_type: query_type.to_owned(),
+                resolver: Some(decision),
+                cache_hit: false,
+                results: Vec::new(),
+                ping_results: Vec::new(),
+                expires_at: None,
+                inserted_at: None,
+                refreshed_at: None,
+                error: Some(err.to_string()),
+            },
+        }
+    }
+
+    async fn query_local_dns_uncached(&self, domain: &str, query_type: &str) -> io::Result<Vec<IpAddr>> {
+        let record_type = dns_record_type(query_type)?;
+        let port = local_port_from_config_path(&self.config_path, "dns").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "dns local listener is not configured")
+        })?;
+        let source_ip = IpAddr::from([127, 0, 0, 1]);
+        self.routing_state
+            .bypass_next_dns_cache_query(domain, query_type, Some(source_ip))
+            .await;
+
+        let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        socket.connect(SocketAddr::from(([127, 0, 0, 1], port))).await?;
+
+        let mut message = Message::query();
+        message.metadata.id = (unix_now() & 0xffff) as u16;
+        message.metadata.recursion_desired = true;
+        let name = Name::from_ascii(dns_query_name(domain))
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        message.add_query(Query::query(name, record_type));
+        let bytes = message.to_vec().map_err(io::Error::other)?;
+        socket.send(&bytes).await?;
+
+        let mut response = vec![0u8; 4096];
+        let len = time::timeout(Duration::from_secs(6), socket.recv(&mut response))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dns query timed out"))??;
+        let response = Message::from_vec(&response[..len]).map_err(io::Error::other)?;
+        Ok(collect_dns_answer_ips(&response))
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -656,6 +763,28 @@ struct DnsPayload {
 #[derive(serde::Deserialize)]
 struct DnsCacheClearPayload {
     domain: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct DnsCacheInspectRow {
+    source: &'static str,
+    domain: String,
+    query_type: String,
+    resolver: Option<RouteDecision>,
+    cache_hit: bool,
+    results: Vec<IpAddr>,
+    ping_results: Vec<DnsPingResult>,
+    expires_at: Option<u64>,
+    inserted_at: Option<u64>,
+    refreshed_at: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct DnsPingResult {
+    ip: IpAddr,
+    reachable: bool,
+    error: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -849,6 +978,110 @@ fn query_has_refresh(query: &str) -> bool {
     query
         .split('&')
         .any(|pair| matches!(pair, "refresh=1" | "refresh=true" | "refresh"))
+}
+
+fn clean_dns_query_domain(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn dns_query_name(domain: &str) -> String {
+    let domain = clean_dns_query_domain(domain);
+    if domain.ends_with('.') {
+        domain
+    } else {
+        format!("{domain}.")
+    }
+}
+
+fn dns_record_type(query_type: &str) -> io::Result<RecordType> {
+    match query_type.trim().to_ascii_uppercase().as_str() {
+        "A" => Ok(RecordType::A),
+        "AAAA" => Ok(RecordType::AAAA),
+        "HTTPS" => Ok(RecordType::HTTPS),
+        value => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported DNS record type: {value}"),
+        )),
+    }
+}
+
+fn collect_dns_answer_ips(message: &Message) -> Vec<IpAddr> {
+    message
+        .answers
+        .iter()
+        .filter_map(|record| match record.data {
+            RData::A(ip) => Some(IpAddr::V4(Ipv4Addr::from(ip))),
+            RData::AAAA(ip) => Some(IpAddr::V6(Ipv6Addr::from(ip))),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn ping_dns_results(ips: &[IpAddr]) -> Vec<DnsPingResult> {
+    let mut results = Vec::with_capacity(ips.len());
+    for ip in ips {
+        let ip = *ip;
+        let result = tokio::task::spawn_blocking(move || ping_ip(ip))
+            .await
+            .unwrap_or_else(|err| DnsPingResult {
+                ip,
+                reachable: false,
+                error: Some(format!("ping task failed: {err}")),
+            });
+        results.push(result);
+    }
+    results
+}
+
+fn ping_ip(ip: IpAddr) -> DnsPingResult {
+    let ip_text = ip.to_string();
+    #[cfg(windows)]
+    let output = Command::new("ping")
+        .args(["-n", "1", "-w", "1000", &ip_text])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    #[cfg(all(not(windows), not(target_os = "linux")))]
+    let output = Command::new("ping")
+        .args(["-c", "1", &ip_text])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    #[cfg(target_os = "linux")]
+    let output = if ip.is_ipv6() {
+        Command::new("ping")
+            .args(["-6", "-c", "1", "-W", "1", &ip_text])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+    } else {
+        Command::new("ping")
+            .args(["-4", "-c", "1", "-W", "1", &ip_text])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+    };
+
+    match output {
+        Ok(output) if output.status.success() => DnsPingResult {
+            ip,
+            reachable: true,
+            error: None,
+        },
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            DnsPingResult {
+                ip,
+                reachable: false,
+                error: if stderr.is_empty() { Some(output.status.to_string()) } else { Some(stderr) },
+            }
+        }
+        Err(err) => DnsPingResult {
+            ip,
+            reachable: false,
+            error: Some(err.to_string()),
+        },
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1957,7 +2190,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <div class="panel dns-panel">
           <h3 class="card-title">Cache Management</h3>
           <label>Domain<input id="dnsQueryDomain" placeholder="example.com"></label>
-          <label>Record Type<select id="dnsQueryType"><option>A</option><option>AAAA</option></select></label>
+          <label>Record Type<select id="dnsQueryType"><option>A</option><option>AAAA</option><option>HTTPS</option></select></label>
           <button onclick="queryDnsCache()">Query Cache</button>
           <button onclick="clearDnsDomain()">Clear Domain Dns Cache</button>
           <label>IP<input id="dnsQueryIp" placeholder="142.251.151.119"></label>
@@ -2515,7 +2748,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     async function renderSys(){let s=await api('/api/sys/status');let uptime=`<p><strong>Process uptime:</strong> ${fmtDuration(s.process_uptime_seconds)}</p>`;let body='';if(s.platform==='windows'){let cls=s.service_installed?'status-ok':'status-warn';body=uptime+`<p><strong>Platform:</strong> Windows</p><p><strong>Transparent backend:</strong> TUN</p><p><strong>Service:</strong> <span class="${cls}">${s.service_installed?'installed':'missing'}</span> ${s.service_name||''}</p><p><strong>TUN Adapter:</strong> ${s.tun_adapter||'shadowsocks-tun'} (${s.tun_adapter_status||'not active'})</p><p><strong>Deploy command:</strong></p><pre>${s.install_command||''}</pre>`}else{let cls=s.nft_installed?'status-ok':'status-warn';let tableCls=s.dns_table_installed?'status-ok':'status-warn';body=uptime+`<p><strong>nftables:</strong> <span class="${cls}">${s.nft_installed?'installed':'missing'}</span></p><p><strong>Version:</strong> ${s.nft_version||'-'}</p><p><strong>DNS nft table:</strong> <span class="${tableCls}">${s.dns_table_installed?'installed':'missing'}</span></p>${nftCountsHtml(s)}<p><strong>Ubuntu install command:</strong></p><pre>${s.install_command||''}</pre>${s.error?'<p class="hint">Error: '+s.error+'</p>':''}`}sysStatusOut.innerHTML=body}
     async function debugUrlCheck(mode){let [input,out]=debugEls(mode);let url=input.value.trim();if(!url){out.innerHTML='<p class="hint">Enter a URL first</p>';return}out.innerHTML='<p class="hint">Running debug, timeout 6s...</p>';let r=await api('/api/sys/debug-url',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url,mode})});out.innerHTML=debugCommand(r)+table([r],debugUrlColumns(mode))}
     async function debugIpCheck(){let query=debugIp.value.trim();if(!query){debugIpOut.innerHTML='<p class="hint">Enter an IP or CIDR first</p>';return}let r=await api('/api/sys/debug-ip',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query})});debugIpOut.innerHTML=table([r],[['Query',x=>x.query],['Valid',x=>x.valid?'yes':'no'],['proxy_ip.txt',x=>x.proxy_file?'yes':'no'],['proxy Matches',x=>(x.proxy_file_matches||[]).join('<br>')||'-'],['NFT Checked',x=>x.nft_checked?'yes':'no'],['NFT proxy',x=>x.nft_proxy?'yes':'no'],['NFT Matches',x=>(x.nft_matches||[]).join('<br>')||'-'],['Error',x=>err(x.error||x.nft_error)]])}
-    async function queryDnsCache(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheOut.innerHTML='<p class="hint">Enter a domain</p>';return}let rows=await api('/api/dns/cache/query?domain='+encodeURIComponent(domain));let type=dnsQueryType.value;rows=rows.filter(r=>!type||r.query_type===type);dnsCacheOut.innerHTML=table(rows,[['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Results',r=>(r.results||[]).join('<br>')],['Expires',r=>fmtTime(r.expires_at)]])}
+    function pingSummary(r){let p=r.ping_results||[];if(!p.length)return '-';return p.map(x=>`${esc(x.ip)} ${x.reachable?'OK':'Fail'}${x.error?' '+esc(x.error):''}`).join('<br>')}
+    async function queryDnsCache(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheOut.innerHTML='<p class="hint">Enter a domain</p>';return}let type=dnsQueryType.value;let rows=await api('/api/dns/cache/query?domain='+encodeURIComponent(domain)+'&type='+encodeURIComponent(type));dnsCacheOut.innerHTML=table(rows,[['Source',r=>r.source==='live_uncached'?'Live uncached':'Cache'],['Cache Hit',r=>r.cache_hit?'hit':'miss'],['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver||'-'],['Results',r=>r.error?('Error: '+esc(r.error)):((r.results||[]).map(esc).join('<br>')||'-')],['Ping',pingSummary],['Expires',r=>r.expires_at?fmtTime(r.expires_at):'-']])}
     async function queryDnsCacheIp(){let ip=dnsQueryIp.value.trim();if(!ip){dnsCacheOut.innerHTML='<p class="hint">Enter an IP</p>';return}let rows=await api('/api/dns/cache/query-ip?ip='+encodeURIComponent(ip));dnsCacheOut.innerHTML=table(rows,[['IP',r=>r.ip],['Domain',r=>r.domain],['Type',r=>r.query_type],['Resolver',r=>r.resolver],['Expires',r=>fmtTime(r.expires_at)]])}
     async function clearDnsDomain(){let domain=dnsQueryDomain.value.trim();if(!domain){dnsCacheMessage.textContent='Enter a domain first';return}let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({domain})});dnsCacheMessage.textContent='Cleared '+r.cleared+' entries';await queryDnsCache()}
     async function clearDnsAll(){let r=await api('/api/dns/cache/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})});let msg='Cleared '+r.cleared+' DNS cache entries';if(window.dnsCacheMessage)dnsCacheMessage.textContent=msg;if(window.configPath)configPath.textContent=msg;if(window.dnsCacheOut)dnsCacheOut.innerHTML=''}

@@ -354,6 +354,13 @@ struct DnsCacheKey {
     resolver: RouteDecision,
 }
 
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+struct DnsCacheBypassKey {
+    domain: String,
+    query_type: String,
+    source_ip: Option<IpAddr>,
+}
+
 #[derive(Clone, Debug)]
 struct DnsCacheEntry {
     message: Message,
@@ -612,6 +619,7 @@ struct RoutingInner {
     reverse_domains: HashMap<IpAddr, String>,
     dns_cache: HashMap<DnsCacheKey, DnsCacheEntry>,
     dns_cache_expirations: BTreeMap<u64, HashSet<DnsCacheKey>>,
+    dns_cache_bypass_once: HashSet<DnsCacheBypassKey>,
     dns_cache_next_order: u64,
     last_dns_cache_prune_at: u64,
     last_dns_cache_persist_at: u64,
@@ -855,6 +863,7 @@ impl RoutingState {
             reverse_domains: HashMap::new(),
             dns_cache: loaded_dns_cache.cache,
             dns_cache_expirations: loaded_dns_cache.expirations,
+            dns_cache_bypass_once: HashSet::new(),
             dns_cache_next_order: loaded_dns_cache.next_order,
             last_dns_cache_prune_at: 0,
             last_dns_cache_persist_at: dns_cache_last_persist_at,
@@ -2500,6 +2509,16 @@ impl RoutingState {
         None
     }
 
+    pub async fn bypass_next_dns_cache_query(&self, domain: &str, query_type: &str, source_ip: Option<IpAddr>) {
+        let mut inner = self.inner.write().await;
+        inner.dns_cache_bypass_once.insert(dns_cache_bypass_key(domain, query_type, source_ip));
+    }
+
+    pub async fn take_dns_cache_bypass(&self, domain: &str, query_type: &str, source_ip: Option<IpAddr>) -> bool {
+        let mut inner = self.inner.write().await;
+        inner.dns_cache_bypass_once.remove(&dns_cache_bypass_key(domain, query_type, source_ip))
+    }
+
     pub async fn dns_cache_insert(
         &self,
         domain: &str,
@@ -3704,6 +3723,14 @@ fn dns_cache_key(domain: &str, query_type: &str, resolver: RouteDecision) -> Dns
         domain: normalize_dns_domain(domain),
         query_type: query_type.to_ascii_uppercase(),
         resolver,
+    }
+}
+
+fn dns_cache_bypass_key(domain: &str, query_type: &str, source_ip: Option<IpAddr>) -> DnsCacheBypassKey {
+    DnsCacheBypassKey {
+        domain: normalize_dns_domain(domain),
+        query_type: query_type.to_ascii_uppercase(),
+        source_ip: source_ip.map(normalize_source_ip),
     }
 }
 
